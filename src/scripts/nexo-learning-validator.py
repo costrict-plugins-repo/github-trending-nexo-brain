@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""
+NEXO Learning Validator — Cross-check findings against existing learnings.
+
+The wrapper collects the finding + current learnings from SQLite, then asks the
+configured automation backend whether the finding is already known, related, or
+genuinely new. If the backend is unavailable, it falls back to mechanical
+similarity matching.
+
+Usage as CLI:
+    python3 nexo-learning-validator.py "finding text to validate"
+    python3 nexo-learning-validator.py --category project "finding text"
+
+Usage as library:
+    from nexo_learning_validator import validate_finding
+    result = validate_finding("CRITICAL: message_id column is NULL")
+    if result["known"]:
+        print(f"Already known: {result['matching_learnings']}")
+
+Exit codes:
+    0 = Finding is NEW (not known)
+    1 = Finding is KNOWN (matches existing learning)
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+
+def _bootstrap_nexo_code(default_repo_src: Path) -> Path:
+    nexo_home = Path(os.environ.get("NEXO_HOME", str(Path.home() / ".nexo")))
+    raw_env = os.environ.get("NEXO_CODE", "")
+    candidates: list[Path] = []
+    if raw_env:
+        raw = Path(raw_env).expanduser()
+        candidates.extend([raw, raw / "core"])
+    candidates.extend([default_repo_src, nexo_home / "core", nexo_home])
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if (candidate / "paths.py").is_file() or (candidate / "server.py").is_file() or (candidate / "cli.py").is_file():
+            if str(candidate) not in sys.path:
+                sys.path.insert(0, str(candidate))
+            return candidate
+    fallback = candidates[0]
+    if str(fallback) not in sys.path:
+        sys.path.insert(0, str(fallback))
+    return fallback
+
+NEXO_HOME = Path(os.environ.get("NEXO_HOME", str(Path.home() / ".nexo")))
+NEXO_CODE = _bootstrap_nexo_code(Path(__file__).resolve().parents[1])
+
+from paths import data_dir
+DB_PATH = data_dir() / "nexo.db"
+
+from agent_runner import AutomationBackendUnavailableError, run_automation_prompt
+from core_prompts import render_core_prompt
+from learning_resolver import resolve_learning_candidate
+
+try:
+    from client_preferences import resolve_user_model as _resolve_user_model
+    _USER_MODEL = _resolve_user_model()
+except Exception:
+    _USER_MODEL = ""
+
+NEXO_DB = DB_PATH
+JSON_ONLY_SYSTEM_PROMPT = render_core_prompt("json-object-only")
+
+
+def get_all_learnings(category: str | None = None) -> list[dict]:
+    """Fetch all learnings from nexo.db."""
+    conn = sqlite3.connect(str(NEXO_DB), timeout=10)
+    conn.row_factory = sqlite3.Row
+    if category:
+        rows = conn.execute(
+            "SELECT id, category, title, content FROM learnings WHERE category = ? AND COALESCE(status, 'active') = 'active'",
+            (category,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, category, title, content FROM learnings WHERE COALESCE(status, 'active') = 'active'"
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def _extract_json(text: str) -> dict | None:
+    text = (text or "").strip()
+    if not text:
+        return None
+    if text.startswith("```"):
+        lines = text.splitlines()
+        end = len(lines)
+        for idx in range(len(lines) - 1, 0, -1):
+            if lines[idx].strip() == "```":
+                end = idx
+                break
+        text = "\n".join(lines[1:end]).strip()
+    brace_start = text.find("{")
+    if brace_start < 0:
+        return None
+    depth = 0
+    for idx in range(brace_start, len(text)):
+        if text[idx] == "{":
+            depth += 1
+        elif text[idx] == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[brace_start:idx + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
+def validate_finding(finding: str, category: str | None = None) -> dict:
+    """
+    Validate a finding against existing learnings.
+
+    Returns:
+        {
+            "known": bool,
+            "confidence": float (0-1),
+            "matching_learnings": [{"id": int, "title": str, "similarity": float}],
+            "recommendation": str
+        }
+    """
+    resolver = resolve_learning_candidate(
+        category=category or "process",
+        title=(finding or "Finding").strip()[:120] or "Finding",
+        content=finding or "",
+        source_authority="code_test_evidence" if any(token in (finding or "").lower() for token in ("test", "traceback", "stack", "verified", "evidence")) else "inference",
+    )
+    learnings = get_all_learnings(category)
+
+    if not learnings:
+        return {
+            "known": False,
+            "confidence": 0,
+            "matching_learnings": [],
+            "recommendation": "No learnings in DB — finding is new by default",
+            "resolver": resolver,
+        }
+
+    learnings_ref = [
+        {
+            "id": l["id"],
+            "cat": l["category"],
+            "title": l["title"],
+            "content": (l["content"] or "")[:300],
+        }
+        for l in learnings
+    ]
+
+    prompt = render_core_prompt(
+        "learning-validator",
+        finding=finding,
+        learnings_total=len(learnings_ref),
+        learnings_json=json.dumps(learnings_ref, indent=1, ensure_ascii=False),
+    )
+
+    try:
+        result = run_automation_prompt(
+            prompt,
+            caller="learning_validator",
+            timeout=60,
+            output_format="text",
+            append_system_prompt=JSON_ONLY_SYSTEM_PROMPT,
+        )
+        parsed = _extract_json(result.stdout)
+        if result.returncode == 0 and parsed:
+            parsed["resolver"] = resolver
+            return parsed
+    except AutomationBackendUnavailableError:
+        pass
+    except Exception:
+        pass
+
+    result = _mechanical_validate(finding, learnings)
+    result["resolver"] = resolver
+    if resolver.get("action") in {"merge", "supersede", "conflict_review"}:
+        result["known"] = True
+        result["confidence"] = max(float(result.get("confidence") or 0), float(resolver.get("similarity") or 0.7))
+        result["matching_learnings"] = result.get("matching_learnings") or [{
+            "id": resolver.get("target_id"),
+            "category": category or "process",
+            "title": resolver.get("target_title"),
+            "similarity": resolver.get("similarity"),
+        }]
+        result["recommendation"] = f"Resolver action: {resolver.get('action')} ({resolver.get('reason')})"
+    return result
+
+
+def _mechanical_validate(finding: str, learnings: list[dict]) -> dict:
+    """Fallback validation using SequenceMatcher when backend is unavailable."""
+    from difflib import SequenceMatcher
+
+    threshold = 0.45
+    finding_kw = _extract_keywords(finding)
+    matches = []
+
+    for learning in learnings:
+        title_sim = SequenceMatcher(None, finding.lower(), learning["title"].lower()).ratio()
+        content_sim = SequenceMatcher(None, finding.lower(), (learning["content"] or "").lower()).ratio()
+
+        learning_text = f"{learning['title']} {learning['content'] or ''}"
+        learning_kw = _extract_keywords(learning_text)
+        kw_overlap = len(finding_kw & learning_kw) / len(finding_kw) if finding_kw and learning_kw else 0
+
+        combined = max(title_sim, content_sim) * 0.6 + kw_overlap * 0.4
+
+        if combined >= threshold:
+            matches.append({
+                "id": learning["id"],
+                "category": learning["category"],
+                "title": learning["title"],
+                "similarity": round(combined, 3),
+            })
+
+    matches.sort(key=lambda x: x["similarity"], reverse=True)
+    top = matches[:5]
+
+    if not top:
+        return {"known": False, "confidence": 0, "matching_learnings": [], "recommendation": "NEW finding"}
+
+    best = top[0]["similarity"]
+    if best >= 0.7:
+        return {"known": True, "confidence": best, "matching_learnings": top,
+                "recommendation": f"KNOWN issue (learning #{top[0]['id']})"}
+    if best >= 0.55:
+        return {"known": True, "confidence": best, "matching_learnings": top,
+                "recommendation": f"LIKELY KNOWN (learning #{top[0]['id']})"}
+    return {"known": False, "confidence": best, "matching_learnings": top,
+            "recommendation": "POSSIBLY RELATED but different enough to report"}
+
+
+def _extract_keywords(text: str) -> set:
+    """Extract meaningful keywords from text."""
+    stop_words = {
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "could",
+        "should", "may", "might", "must", "shall", "can", "need", "dare",
+        "to", "of", "in", "for", "on", "with", "at", "by", "from", "as",
+        "and", "but", "or", "nor", "not", "so", "yet", "both", "either",
+        "error", "critical", "warning", "bug", "issue", "problem", "fix",
+        "el", "la", "los", "las", "un", "una", "de", "en", "que", "por",
+    }
+    words = set()
+    for word in text.lower().split():
+        clean = "".join(c for c in word if c.isalnum() or c == "_")
+        if clean and len(clean) > 2 and clean not in stop_words:
+            words.add(clean)
+    return words
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Validate findings against existing NEXO learnings")
+    parser.add_argument("finding", help="The finding text to validate")
+    parser.add_argument("--category", "-c", help="Filter learnings by category")
+    parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
+    args = parser.parse_args()
+
+    result = validate_finding(args.finding, args.category)
+
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        status = "KNOWN" if result["known"] else "NEW"
+        print(f"Status: {status} (confidence: {result['confidence']:.0%})")
+        print(f"Recommendation: {result['recommendation']}")
+        if result["matching_learnings"]:
+            print("Related learnings:")
+            for match in result["matching_learnings"]:
+                cat = match.get("category", "?")
+                print(f"  #{match['id']} [{cat}] {match['title']} ({match['similarity']:.0%})")
+
+    sys.exit(1 if result["known"] else 0)
+
+
+if __name__ == "__main__":
+    main()

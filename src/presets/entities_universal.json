@@ -1,0 +1,336 @@
+{
+  "$schema": "https://nexo-brain.com/schemas/entities-preset-v1.json",
+  "version": "1.0.0",
+  "description": "Universal preset of entities loaded at `nexo init`. Provides the Guardian with a baseline of destructive commands, legacy runtime paths, and artifact classes so the pre-edit / pre-Bash rules have something to match against on day 0, before the user has trained any observational learning via cognitive_quarantine.",
+  "source": "preset",
+  "confidence": 1.0,
+  "entities": [
+    {
+      "type": "destructive_command",
+      "name": "rm",
+      "aliases": [
+        "remove",
+        "rm -f",
+        "rm -rf"
+      ],
+      "metadata": {
+        "shell": "posix",
+        "severity": "high",
+        "pattern": "^rm\\b"
+      }
+    },
+    {
+      "type": "destructive_command",
+      "name": "mv_overwrite",
+      "aliases": [
+        "mv"
+      ],
+      "metadata": {
+        "shell": "posix",
+        "severity": "medium",
+        "pattern": "^mv\\b",
+        "note": "mv can silently overwrite when target exists; treat as destructive"
+      }
+    },
+    {
+      "type": "destructive_command",
+      "name": "sed_in_place",
+      "aliases": [
+        "sed -i",
+        "sed --in-place",
+        "gsed -i"
+      ],
+      "metadata": {
+        "shell": "posix",
+        "severity": "medium",
+        "pattern": "\\bsed\\b.*-i(\\s|=|$)",
+        "note": "In-place edits bypass normal review"
+      }
+    },
+    {
+      "type": "destructive_command",
+      "name": "redirect_overwrite",
+      "aliases": [
+        ">"
+      ],
+      "metadata": {
+        "shell": "posix",
+        "severity": "medium",
+        "pattern": "(?<![0-9&])>(?!>|&)",
+        "note": "Single > overwrites target; >> appends and is safer"
+      }
+    },
+    {
+      "type": "destructive_command",
+      "name": "shred_dd",
+      "aliases": [
+        "shred",
+        "dd"
+      ],
+      "metadata": {
+        "shell": "posix",
+        "severity": "critical",
+        "pattern": "^(shred|dd)\\b"
+      }
+    },
+    {
+      "type": "destructive_command",
+      "name": "sql_drop",
+      "aliases": [
+        "DROP TABLE",
+        "TRUNCATE",
+        "DELETE FROM"
+      ],
+      "metadata": {
+        "shell": "sql",
+        "severity": "critical",
+        "pattern": "\\b(DROP\\s+TABLE|TRUNCATE|DELETE\\s+FROM\\s+\\w+\\s*;?\\s*$)",
+        "note": "DELETE FROM without WHERE matches bare statement form"
+      }
+    },
+    {
+      "type": "destructive_command",
+      "name": "git_destructive",
+      "aliases": [
+        "git reset --hard",
+        "git push --force",
+        "git push -f",
+        "git clean -fdx"
+      ],
+      "metadata": {
+        "shell": "git",
+        "severity": "high",
+        "pattern": "git\\s+(reset\\s+--hard|push\\s+(-f|--force)|clean\\s+-fd?x?)"
+      }
+    },
+    {
+      "type": "destructive_command",
+      "name": "curl_pipe_shell",
+      "aliases": [
+        "curl | bash",
+        "curl | sh",
+        "wget | bash",
+        "wget | sh"
+      ],
+      "metadata": {
+        "shell": "posix",
+        "severity": "critical",
+        "pattern": "(curl|wget)[^|]*\\|\\s*(sudo\\s+)?(bash|sh|zsh)\\b",
+        "note": "Piping network content straight to shell executes unreviewed code"
+      }
+    },
+    {
+      "type": "destructive_command",
+      "name": "dd_to_device",
+      "aliases": [
+        "dd of=/dev/"
+      ],
+      "metadata": {
+        "shell": "posix",
+        "severity": "critical",
+        "pattern": "\\bdd\\s+.*?\\bof=/dev/\\S+",
+        "note": "dd writing to a block device wipes whatever is there"
+      }
+    },
+    {
+      "type": "destructive_command",
+      "name": "chmod_recursive_wide_open",
+      "aliases": [
+        "chmod -R 777",
+        "chmod -R 666",
+        "chmod -R a+rw"
+      ],
+      "metadata": {
+        "shell": "posix",
+        "severity": "high",
+        "pattern": "\\bchmod\\s+-R\\s+(777|666|a\\+rw)\\b",
+        "note": "Recursive world-writable is almost never intended"
+      }
+    },
+    {
+      "type": "destructive_command",
+      "name": "ssh_remote_overwrite",
+      "aliases": [
+        "ssh host \"cat > file\"",
+        "ssh host \"tee file\"",
+        "ssh host \"sed -i ...\"",
+        "ssh host \"echo ... > file\""
+      ],
+      "metadata": {
+        "shell": "ssh",
+        "severity": "high",
+        "pattern": "\\bssh\\b[^'\"`]*?(?:['\"`])(?:[^'\"`]*?)(?:cat\\s*>>?\\s|tee\\s|sed\\s+-i\\b|echo\\s.*\\s>>?\\s|rm\\s+-\\S*[rRfF])",
+        "note": "Remote-write patterns routed through ssh bypass the local destructive gate"
+      }
+    },
+    {
+      "type": "destructive_command",
+      "name": "scp_rsync_upload",
+      "aliases": [
+        "scp local host:path",
+        "rsync local host:path"
+      ],
+      "metadata": {
+        "shell": "ssh",
+        "severity": "medium",
+        "pattern": "\\b(scp|rsync)\\b[^|&;]*?\\s\\S+\\s+[^:\\s]+:[^\\s]+",
+        "note": "Upload direction mutates remote filesystem"
+      }
+    },
+    {
+      "type": "legacy_path",
+      "name": "claude_hooks_to_nexo",
+      "aliases": [],
+      "metadata": {
+        "old": "~/claude/hooks",
+        "canonical": "~/.nexo/personal/hooks",
+        "note": "Pre-v6 runtime lived under ~/claude/*; operator-owned hooks now live under ~/.nexo/personal/*."
+      }
+    },
+    {
+      "type": "legacy_path",
+      "name": "claude_scripts_to_nexo",
+      "aliases": [],
+      "metadata": {
+        "old": "~/claude/scripts",
+        "canonical": "~/.nexo/personal/scripts"
+      }
+    },
+    {
+      "type": "legacy_path",
+      "name": "claude_brain_to_nexo",
+      "aliases": [],
+      "metadata": {
+        "old": "~/claude/brain",
+        "canonical": "~/.nexo/personal/brain"
+      }
+    },
+    {
+      "type": "legacy_path",
+      "name": "flat_nexo_scripts_to_personal",
+      "aliases": [],
+      "metadata": {
+        "old": "~/.nexo/scripts",
+        "canonical": "~/.nexo/personal/scripts"
+      }
+    },
+    {
+      "type": "legacy_path",
+      "name": "flat_nexo_brain_to_personal",
+      "aliases": [],
+      "metadata": {
+        "old": "~/.nexo/brain",
+        "canonical": "~/.nexo/personal/brain"
+      }
+    },
+    {
+      "type": "legacy_path",
+      "name": "flat_nexo_config_to_personal",
+      "aliases": [],
+      "metadata": {
+        "old": "~/.nexo/config",
+        "canonical": "~/.nexo/personal/config"
+      }
+    },
+    {
+      "type": "legacy_path",
+      "name": "flat_nexo_data_to_runtime",
+      "aliases": [],
+      "metadata": {
+        "old": "~/.nexo/data",
+        "canonical": "~/.nexo/runtime/data"
+      }
+    },
+    {
+      "type": "legacy_path",
+      "name": "flat_nexo_logs_to_runtime",
+      "aliases": [],
+      "metadata": {
+        "old": "~/.nexo/logs",
+        "canonical": "~/.nexo/runtime/logs"
+      }
+    },
+    {
+      "type": "legacy_path",
+      "name": "flat_nexo_operations_to_runtime",
+      "aliases": [],
+      "metadata": {
+        "old": "~/.nexo/operations",
+        "canonical": "~/.nexo/runtime/operations"
+      }
+    },
+    {
+      "type": "legacy_path",
+      "name": "flat_nexo_exports_to_runtime",
+      "aliases": [],
+      "metadata": {
+        "old": "~/.nexo/exports",
+        "canonical": "~/.nexo/runtime/exports"
+      }
+    },
+    {
+      "type": "artifact_class",
+      "name": "github_issue",
+      "aliases": [],
+      "metadata": {
+        "tool": "gh issue create",
+        "when": "followup classified as core/product escalation needs an issue instead of local state",
+        "reference_skill": "SK-NEXO-REPO-AUDIT-TO-EXEC-PACK"
+      }
+    },
+    {
+      "type": "artifact_class",
+      "name": "nexo_release",
+      "aliases": [],
+      "metadata": {
+        "flow": "sync_release_artifacts.py + verify_release_readiness.py",
+        "reference_skill": "nexo-release"
+      }
+    },
+    {
+      "type": "artifact_class",
+      "name": "email_to_operator_contact",
+      "aliases": [
+        "operator_email",
+        "client_message"
+      ],
+      "metadata": {
+        "tool": "nexo_email_send",
+        "required_from": "info@<operator-domain>",
+        "when": "reply / outreach to an operator's external contact (client, vendor, counterparty)",
+        "anti_example": "sending from the NEXO default mailbox on behalf of an operator's external tenant",
+        "reference_learning": "feedback_no_email_followup_completados"
+      }
+    },
+    {
+      "type": "artifact_class",
+      "name": "changelog_entry",
+      "aliases": [
+        "CHANGELOG.md append"
+      ],
+      "metadata": {
+        "required_on": "every npm/DMG release",
+        "format": "'## <version> — <date>\\n\\n- ...'",
+        "reference_script": "scripts/verify_release_readiness.py"
+      }
+    },
+    {
+      "type": "vhost_mapping",
+      "name": "nexo_brain",
+      "metadata": {
+        "domain": "nexo-brain.com",
+        "host": "github-pages",
+        "docroot": "public/",
+        "note": "Public product site. Safe to ship in the universal preset."
+      }
+    }
+  ],
+  "local_overrides_note": "Operator-specific vhost_mapping entries (private domains, IPs, hostnames, tenant names) live in ~/.nexo/brain/presets/entities_local.json — copy from src/presets/entities_local.sample.json. The installer merges local entries on top of this universal preset at `nexo init`. Never commit operator data to entities_universal.json — v6.3.0 accidentally shipped seven such entries and was patched in v6.3.1.",
+  "ssh_config_import": {
+    "enabled_default": true,
+    "source": "~/.ssh/config",
+    "imported_as_type": "host",
+    "default_access_mode": "unknown",
+    "note": "Hosts imported from ssh config are tagged access_mode=unknown until user confirms; Guardian R23/R25 treat unknown as requiring confirmation for destructive verbs."
+  }
+}

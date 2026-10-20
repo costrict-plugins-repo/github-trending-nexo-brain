@@ -1,0 +1,288 @@
+#!/bin/bash
+# NEXO PreCompact Hook — Save checkpoint + inject preservation instructions
+# This runs BEFORE Claude Code compacts. It:
+# 1. Enriches the session checkpoint in SQLite with latest diary draft data
+# 2. Injects a systemMessage telling the operator to save any WIP via MCP tools
+set -uo pipefail
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+NEXO_HOME="${NEXO_HOME:-$HOME/.nexo}"
+DATA_DIR="$NEXO_HOME/runtime/data"
+if [ ! -d "$DATA_DIR" ] && [ -d "$NEXO_HOME/data" ]; then
+    DATA_DIR="$NEXO_HOME/data"
+fi
+OPERATIONS_DIR="$NEXO_HOME/runtime/operations"
+if [ ! -d "$OPERATIONS_DIR" ] && [ -d "$NEXO_HOME/operations" ]; then
+    OPERATIONS_DIR="$NEXO_HOME/operations"
+fi
+NEXO_DB="$DATA_DIR/nexo.db"
+mkdir -p "$DATA_DIR" "$OPERATIONS_DIR"
+TODAY=$(date +%Y-%m-%d)
+LOG_FILE="$OPERATIONS_DIR/tool-logs/${TODAY}.jsonl"
+LOG_LINES=0
+if [ -f "$LOG_FILE" ]; then
+    LOG_LINES=$(wc -l < "$LOG_FILE" | tr -d ' ')
+fi
+
+# v7.8 — Exact session targeting. Claude Code passes the external
+# session token through CLAUDE_SESSION_ID to every hook. We resolve
+# THAT token to the NEXO SID via session_claude_aliases (or direct
+# match on sessions.claude_session_id). LATEST_SID fallback is gone —
+# multi-conversation Desktop made it actively wrong, because the
+# "latest active" session frequently belongs to a different conv than
+# the one Claude Code is compacting in this hook invocation.
+TARGET_SID=""
+if [ -f "$NEXO_DB" ] && [ -n "${CLAUDE_SESSION_ID:-}" ]; then
+    TARGET_SID=$(sqlite3 "$NEXO_DB" "
+        SELECT sid FROM sessions WHERE claude_session_id = '$CLAUDE_SESSION_ID' LIMIT 1
+    " 2>/dev/null || echo "")
+    if [ -z "$TARGET_SID" ]; then
+        TARGET_SID=$(sqlite3 "$NEXO_DB" "
+            SELECT sid FROM session_claude_aliases WHERE claude_session_id = '$CLAUDE_SESSION_ID' ORDER BY last_seen DESC LIMIT 1
+        " 2>/dev/null || echo "")
+    fi
+fi
+
+if [ -f "$NEXO_DB" ] && [ -n "$TARGET_SID" ] && [[ "$TARGET_SID" =~ ^nexo-[0-9]+-[0-9]+$ ]]; then
+    # v7.8.1 (Francisco correction): the sidecar is per-conversation now.
+    # A single global `compacting-sid.txt` let two near-concurrent
+    # compactions on two different conversations clobber each other's
+    # state. We key the sidecar by the Claude session token that fired
+    # this hook (unique per conversation in Desktop). If the env token
+    # is unset we keep writing the legacy global file so single-conv
+    # callers are unaffected.
+    mkdir -p "$DATA_DIR/compacting" 2>/dev/null || true
+    if [ -n "${CLAUDE_SESSION_ID:-}" ]; then
+        # Sanitise to a filesystem-safe token without paying a subshell
+        # per hook invocation.
+        SAFE_CLAUDE_ID="${CLAUDE_SESSION_ID//[^a-zA-Z0-9._-]/_}"
+        COMPACT_STATE="$DATA_DIR/compacting/$SAFE_CLAUDE_ID.txt"
+    else
+        COMPACT_STATE="$DATA_DIR/compacting-sid.txt"
+    fi
+    printf '%s\n' "$TARGET_SID" > "$COMPACT_STATE"
+
+    # Pull diary draft data into checkpoint for the EXACT session.
+    sqlite3 "$NEXO_DB" "
+        INSERT INTO session_checkpoints (sid, task, current_goal, updated_at)
+        SELECT s.sid, s.task, COALESCE(d.last_context_hint, s.task), datetime('now')
+        FROM sessions s
+        LEFT JOIN session_diary_draft d ON d.sid = s.sid
+        WHERE s.sid = '$TARGET_SID'
+        ON CONFLICT(sid) DO UPDATE SET
+            task = excluded.task,
+            current_goal = CASE
+                WHEN excluded.current_goal != '' THEN excluded.current_goal
+                ELSE session_checkpoints.current_goal
+            END,
+            updated_at = datetime('now')
+    " 2>/dev/null || true
+
+    # Flush the richer durable checkpoint state if milestone data exists.
+    NEXO_PRECOMPACT_SID="$TARGET_SID" HOOK_DIR="$HOOK_DIR" python3 -c "
+import os, sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.environ['HOOK_DIR'], '..')))
+try:
+    import checkpoint_policy
+    checkpoint_policy.force_runtime_checkpoint(
+        os.environ['NEXO_PRECOMPACT_SID'],
+        reason='pre-compact-hook',
+    )
+except Exception:
+    pass
+" 2>/dev/null || true
+
+    # v7.8 — enqueue a `pre_compaction` event for the live engine to
+    # consume on the next tool call, so the map's on_event rule fires
+    # from the real stream instead of only via tests.
+    PENDING_EVENTS="$DATA_DIR/pending_enforcer_events.ndjson"
+    python3 -c "
+import json, os, sys, time
+target = os.environ.get('NEXO_PRECOMPACT_SID', '')
+pending = os.environ.get('PENDING_EVENTS', '')
+if not (target and pending):
+    sys.exit(0)
+row = {
+    'event': 'pre_compaction',
+    'session_id': target,
+    'claude_session_id': os.environ.get('CLAUDE_SESSION_ID', ''),
+    'timestamp': time.time(),
+}
+try:
+    with open(pending, 'a', encoding='utf-8') as fh:
+        fh.write(json.dumps(row, ensure_ascii=False) + '\n')
+except Exception:
+    pass
+" NEXO_PRECOMPACT_SID="$TARGET_SID" PENDING_EVENTS="$PENDING_EVENTS" CLAUDE_SESSION_ID="${CLAUDE_SESSION_ID:-}" >/dev/null 2>&1 || true
+fi
+
+# ── Layer 2: Emergency auto-diary before compaction ──────────────────
+# Write an actual session_diary entry (not draft) with mechanical summary.
+# This is the parachute — if the LLM never wrote a diary, at least this exists.
+#
+# v7.8.1 hotfix: must target the EXACT session compacting. Pre-v7.8.1 used
+# "latest active session" (ORDER BY last_update_epoch DESC LIMIT 1) which in
+# multi-conversation Desktop routinely wrote the diary onto the wrong conv.
+# Now we read TARGET_SID resolved from CLAUDE_SESSION_ID above. If it is
+# missing or does not exist in sessions, we fail-closed: no emergency diary
+# > wrong emergency diary. Layer 3 auto_flush is wired to the same SID.
+if [ -f "$NEXO_DB" ] && [ -n "$TARGET_SID" ] && [[ "$TARGET_SID" =~ ^nexo-[0-9]+-[0-9]+$ ]]; then
+    NEXO_PRECOMPACT_SID="$TARGET_SID" python3 -c "
+import json, sqlite3, os, sys
+from datetime import datetime
+
+db_path = '$NEXO_DB'
+log_file = '$LOG_FILE'
+
+conn = sqlite3.connect(db_path, timeout=3)
+conn.row_factory = sqlite3.Row
+
+# v7.8.1 — use the EXACT SID resolved by Layer 1 (from CLAUDE_SESSION_ID),
+# not the pre-v7.8 latest-active row which routinely belongs to a
+# different conversation.
+sid = os.environ.get('NEXO_PRECOMPACT_SID', '')
+if not sid:
+    conn.close()
+    sys.exit(0)
+row = conn.execute(
+    'SELECT sid, task FROM sessions WHERE sid = ? LIMIT 1', (sid,)
+).fetchone()
+if not row:
+    # SID not present — fail-closed, better skip than write against the
+    # wrong session.
+    conn.close()
+    sys.exit(0)
+task = row['task'] or 'unknown'
+
+# Check if a real diary already exists for this session
+has_diary = conn.execute(
+    'SELECT id FROM session_diary WHERE session_id = ? LIMIT 1', (sid,)
+).fetchone()
+if has_diary:
+    conn.close()
+    sys.exit(0)  # LLM already wrote one, no need for emergency diary
+
+# v7.8.1 — last_diary_ts must be scoped to THIS session too. Otherwise
+# a recent diary of another conversation would truncate this conv's
+# mechanical summary window.
+last_diary = conn.execute(
+    'SELECT created_at FROM session_diary WHERE session_id = ? ORDER BY created_at DESC LIMIT 1',
+    (sid,),
+).fetchone()
+last_diary_ts = last_diary['created_at'] if last_diary else '1970-01-01T00:00:00Z'
+
+# Read tool log entries since last diary
+entries = []
+modified_files = []
+git_actions = []
+if os.path.isfile(log_file):
+    with open(log_file, 'r') as f:
+        for line in f:
+            try:
+                e = json.loads(line.strip())
+                ts = e.get('timestamp', '')
+                if ts < last_diary_ts:
+                    continue
+                name = e.get('tool_name', '?')
+                inp = e.get('tool_input', {}) or {}
+                brief = ''
+                if isinstance(inp, dict):
+                    for k, v in list(inp.items())[:1]:
+                        brief = str(v)[:80]
+                entries.append(f'{name}({brief})')
+                # Extract decisions from tool calls
+                if name in ('Edit', 'Write'):
+                    fp = inp.get('file_path', inp.get('path', ''))
+                    if fp:
+                        modified_files.append(fp.split('/')[-1])
+                if name == 'Bash':
+                    cmd = str(inp.get('command', ''))
+                    if 'git commit' in cmd or 'git push' in cmd:
+                        git_actions.append(cmd[:80])
+            except Exception:
+                pass
+
+if not entries:
+    conn.close()
+    sys.exit(0)
+
+# Build mechanical diary
+tools_summary = ', '.join(entries[-30:])[:500]
+summary = f'[EMERGENCY PRE-COMPACT] {len(entries)} tool calls since last diary. Tools: {tools_summary}'
+
+decisions = ''
+if modified_files:
+    decisions = 'Modified: ' + ', '.join(set(modified_files))[:300]
+if git_actions:
+    decisions += (' | Git: ' + ', '.join(git_actions))[:200]
+if not decisions:
+    decisions = 'No file modifications detected in tool logs'
+
+pending = f'Current task: {task[:200]}'
+context_next = 'COMPACTION HAPPENED. Read this diary to continue. Check session_checkpoints and tool-logs for full context.'
+
+# Write actual session_diary entry
+conn.execute('''
+    INSERT INTO session_diary
+        (session_id, decisions, discarded, pending, context_next,
+         mental_state, domain, user_signals, summary, source)
+    VALUES (?, ?, '', ?, ?, 'auto-generated', 'auto', '', ?, 'pre-compact-hook')
+''', (sid, decisions, pending, context_next, summary))
+conn.commit()
+
+conn.close()
+" 2>/dev/null || true
+
+    # Layer 3: structured auto-flush is useful but non-critical. Keep it
+    # best-effort in the background so pre-compaction never blocks on heavy
+    # imports, vector backends, or ingestion latency after the emergency diary
+    # has already been committed.
+    (
+        NEXO_PRECOMPACT_SID="$TARGET_SID" \
+        NEXO_PRECOMPACT_LOG_FILE="$LOG_FILE" \
+        HOOK_DIR="$HOOK_DIR" \
+        python3 - <<'PY'
+import os
+import sqlite3
+import sys
+
+sid = os.environ.get("NEXO_PRECOMPACT_SID", "")
+log_file = os.environ.get("NEXO_PRECOMPACT_LOG_FILE", "")
+hook_dir = os.environ.get("HOOK_DIR", "")
+if not sid or not hook_dir:
+    sys.exit(0)
+
+sys.path.insert(0, os.path.abspath(os.path.join(hook_dir, "..")))
+try:
+    import paths
+
+    task = ""
+    try:
+        conn = sqlite3.connect(str(paths.db_path()), timeout=3)
+        row = conn.execute("SELECT task FROM sessions WHERE sid = ? LIMIT 1", (sid,)).fetchone()
+        task = (row[0] if row else "") or ""
+        conn.close()
+    except Exception:
+        task = ""
+
+    import compaction_memory
+
+    compaction_memory.record_auto_flush(
+        session_id=sid,
+        task=task,
+        current_goal="",
+        log_file=log_file,
+        last_diary_ts="",
+        source="pre-compact-hook",
+    )
+except Exception:
+    pass
+PY
+    ) >/dev/null 2>&1 &
+fi
+
+cat << HOOKEOF
+{
+  "systemMessage": "CONTEXT IS ABOUT TO BE COMPRESSED.\n\nOBLIGATORY ACTIONS BEFORE COMPACTION:\n1. Save critical state via MCP: nexo_checkpoint_save with current task, active files, decisions, errors, next step, and reasoning thread.\n2. If there is work in progress without a commit, save data via nexo_entity_create, nexo_preference_set, nexo_learning_add, nexo_followup_create.\n3. PERSISTENT TOOL LOGS: ${OPERATIONS_DIR}/tool-logs/${TODAY}.jsonl has ${LOG_LINES} entries.\n4. After compaction, the PostCompact hook will re-inject a Core Memory Block with the checkpoint.\n5. MCP tools (nexo_*) preserve all state — use them to recover context.\n6. EMERGENCY DIARY: An automatic diary was written by the pre-compact hook. The LLM can still write a better one via nexo_session_diary_write."
+}
+HOOKEOF

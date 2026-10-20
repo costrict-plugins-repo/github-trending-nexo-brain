@@ -1,0 +1,1007 @@
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from unittest import mock
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_SRC = REPO_ROOT / "src"
+
+if str(REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(REPO_SRC))
+
+
+def _node_available() -> bool:
+    return shutil.which("node") is not None
+
+
+@pytest.fixture(autouse=True)
+def _disable_live_db_wipe_guard(monkeypatch):
+    """This file validates packaged-update flow, not live DB wipe detection."""
+    monkeypatch.setenv("NEXO_SKIP_WIPE_GUARD", "1")
+
+
+def test_backup_code_tree_includes_skills_runtime_and_templates(tmp_path, monkeypatch):
+    from plugins import update
+
+    runtime_home = tmp_path / "runtime"
+    backup_base = tmp_path / "backups"
+    runtime_home.mkdir()
+    backup_base.mkdir()
+
+    (runtime_home / "skills" / "personal-skill").mkdir(parents=True)
+    (runtime_home / "skills-core" / "core-skill").mkdir(parents=True)
+    (runtime_home / "skills-runtime" / "sk-runner").mkdir(parents=True)
+    (runtime_home / "templates").mkdir()
+    (runtime_home / "bin").mkdir()
+    (runtime_home / "local_context").mkdir()
+    (runtime_home / "product_knowledge").mkdir()
+
+    (runtime_home / "skills" / "personal-skill" / "skill.json").write_text("{}\n")
+    (runtime_home / "skills-core" / "core-skill" / "skill.json").write_text("{}\n")
+    (runtime_home / "skills-runtime" / "sk-runner" / "script.py").write_text("print('ok')\n")
+    (runtime_home / "templates" / "skill-template.md").write_text("# template\n")
+    (runtime_home / "bin" / "nexo").write_text("#!/bin/bash\n")
+    (runtime_home / "local_context" / "__init__.py").write_text("# local context\n")
+    (runtime_home / "product_knowledge" / "__init__.py").write_text("# product knowledge\n")
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+    monkeypatch.setattr(update, "NEXO_HOME", runtime_home)
+    monkeypatch.setattr(update, "BACKUP_BASE", backup_base)
+
+    backup_dir, err = update._backup_code_tree()
+
+    assert err is None
+    backup_path = Path(backup_dir)
+    assert (backup_path / "skills" / "personal-skill" / "skill.json").is_file()
+    assert (backup_path / "skills-core" / "core-skill" / "skill.json").is_file()
+    assert (backup_path / "skills-runtime" / "sk-runner" / "script.py").is_file()
+    assert (backup_path / "templates" / "skill-template.md").is_file()
+    assert (backup_path / "bin" / "nexo").is_file()
+    assert (backup_path / "local_context" / "__init__.py").is_file()
+    assert (backup_path / "product_knowledge" / "__init__.py").is_file()
+
+
+def test_restore_code_tree_replaces_directory_symlink(tmp_path, monkeypatch):
+    from plugins import update
+
+    runtime_home = tmp_path / "runtime"
+    backup_base = tmp_path / "backups"
+    backup_dir = backup_base / "code-tree-demo"
+    runtime_home.mkdir()
+    backup_dir.mkdir(parents=True)
+
+    (runtime_home / "core" / "cognitive").mkdir(parents=True)
+    (runtime_home / "cognitive").symlink_to("core/cognitive", target_is_directory=True)
+    (backup_dir / "cognitive").mkdir()
+    (backup_dir / "cognitive" / "__init__.py").write_text("# restored\n")
+
+    monkeypatch.setattr(update, "NEXO_HOME", runtime_home)
+
+    err = update._restore_code_tree(str(backup_dir))
+
+    assert err is None
+    assert not (runtime_home / "cognitive").is_symlink()
+    assert (runtime_home / "cognitive" / "__init__.py").read_text() == "# restored\n"
+
+
+def test_sync_packaged_clients_normalizes_preferences_and_targets_runtime_home(tmp_path, monkeypatch):
+    from plugins import update
+    import client_sync
+
+    runtime_home = tmp_path / "runtime"
+    (runtime_home / "core").mkdir(parents=True)
+    (runtime_home / "core" / "server.py").write_text("print('server')\n")
+    config_dir = runtime_home / "config"
+    config_dir.mkdir(parents=True)
+    schedule_path = config_dir / "schedule.json"
+    schedule_path.write_text(json.dumps({"default_terminal_client": "codex"}))
+
+    captured = {}
+
+    def fake_sync_all_clients(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True, "clients": {}}
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+    monkeypatch.setattr(update, "NEXO_HOME", runtime_home)
+    monkeypatch.setattr(client_sync, "sync_all_clients", fake_sync_all_clients)
+
+    ok, err = update._sync_packaged_clients()
+
+    assert ok is True
+    assert err is None
+    assert captured["nexo_home"] == runtime_home
+    assert captured["runtime_root"] == runtime_home / "core"
+    assert captured["auto_install_missing_claude"] is True
+    updated_schedule = json.loads(schedule_path.read_text())
+    assert "interactive_clients" in updated_schedule
+    assert "automation_enabled" in updated_schedule
+
+
+def test_refresh_installed_manifest_writes_runtime_core_artifacts(tmp_path, monkeypatch):
+    from plugins import update
+
+    runtime_home = tmp_path / "runtime"
+    src_dir = tmp_path / "src"
+    (src_dir / "crons").mkdir(parents=True)
+    (src_dir / "scripts").mkdir()
+    (src_dir / "hooks").mkdir()
+    (src_dir / "crons" / "manifest.json").write_text('{"crons":[]}\n')
+    (src_dir / "scripts" / "nexo-catchup.py").write_text("print('ok')\n")
+    (src_dir / "scripts" / "nexo-catchup 2.py").write_text("print('old')\n")
+    (src_dir / "hooks" / "capture-tool-logs.sh").write_text("#!/bin/bash\necho ok\n")
+    (src_dir / "hooks" / "capture-tool-logs 2.sh").write_text("#!/bin/bash\necho old\n")
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+    monkeypatch.setattr(update, "NEXO_HOME", runtime_home)
+    monkeypatch.setattr(update, "SRC_DIR", src_dir)
+
+    update._refresh_installed_manifest()
+
+    manifest_path = runtime_home / "personal" / "config" / "runtime-core-artifacts.json"
+    if not manifest_path.is_file():
+        manifest_path = runtime_home / "config" / "runtime-core-artifacts.json"
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["script_names"] == ["nexo-catchup.py"]
+    assert manifest["hook_names"] == ["capture-tool-logs.sh"]
+    _crons_old = runtime_home / "crons" / "manifest.json"
+    _crons_new = runtime_home / "runtime" / "crons" / "manifest.json"
+    assert _crons_old.is_file() or _crons_new.is_file(), f"manifest at neither {_crons_old} nor {_crons_new}"
+
+
+def test_resolve_sync_source_reads_recorded_source_from_core_version_metadata(tmp_path, monkeypatch):
+    import auto_update
+
+    runtime_home = tmp_path / "runtime"
+    repo_root = tmp_path / "repo"
+    (runtime_home / "core").mkdir(parents=True)
+    (repo_root / "src").mkdir(parents=True)
+    (repo_root / "package.json").write_text('{"name":"nexo-brain"}\n')
+    (runtime_home / "core" / "version.json").write_text(
+        json.dumps({"version": "7.9.6", "source": str(repo_root)})
+    )
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+    monkeypatch.setattr(auto_update, "NEXO_HOME", runtime_home)
+    monkeypatch.setattr(auto_update, "NEXO_CODE", runtime_home / "core")
+
+    src_dir, resolved_repo = auto_update._resolve_sync_source()
+
+    assert src_dir == repo_root / "src"
+    assert resolved_repo == repo_root
+
+
+def test_refresh_installed_manifest_packaged_mode_uses_npm_src_for_core_artifacts(tmp_path, monkeypatch):
+    from plugins import update
+
+    runtime_home = tmp_path / "runtime"
+    npm_src = tmp_path / "npm-src"
+    (runtime_home / "scripts").mkdir(parents=True)
+    (npm_src / "crons").mkdir(parents=True)
+    (npm_src / "scripts").mkdir()
+    (npm_src / "hooks").mkdir()
+
+    (runtime_home / "scripts" / "daily-report.py").write_text("print('personal')\n")
+    (npm_src / "crons" / "manifest.json").write_text('{"crons":[]}\n')
+    (npm_src / "scripts" / "nexo-catchup.py").write_text("print('core')\n")
+    (npm_src / "hooks" / "capture-tool-logs.sh").write_text("#!/bin/bash\necho ok\n")
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+    monkeypatch.setattr(update, "NEXO_HOME", runtime_home)
+    monkeypatch.setattr(update, "SRC_DIR", runtime_home)
+    # B10 mini-refactor: callsites moved from the _PACKAGED_INSTALL constant
+    # to the _is_packaged_install() helper, so monkey-patch the helper too.
+    monkeypatch.setattr(update, "_PACKAGED_INSTALL", True)
+    monkeypatch.setattr(update, "_is_packaged_install", lambda: True)
+    monkeypatch.setattr(update, "_find_npm_pkg_src", lambda: npm_src)
+
+    update._refresh_installed_manifest()
+
+    manifest_path = runtime_home / "personal" / "config" / "runtime-core-artifacts.json"
+    if not manifest_path.is_file():
+        manifest_path = runtime_home / "config" / "runtime-core-artifacts.json"
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["script_names"] == ["nexo-catchup.py"]
+    assert manifest["hook_names"] == ["capture-tool-logs.sh"]
+    assert "daily-report.py" not in manifest["script_names"]
+
+
+def test_cleanup_retired_runtime_files_removes_legacy_heartbeat_files(tmp_path, monkeypatch):
+    from plugins import update
+
+    runtime_home = tmp_path / "runtime"
+    (runtime_home / "scripts").mkdir(parents=True)
+    (runtime_home / "hooks").mkdir()
+    legacy_files = [
+        runtime_home / "scripts" / "heartbeat-enforcement.py",
+        runtime_home / "scripts" / "heartbeat-posttool.sh",
+        runtime_home / "scripts" / "heartbeat-user-msg.sh",
+        runtime_home / "hooks" / "heartbeat-guard.sh",
+    ]
+    for path in legacy_files:
+        path.write_text("legacy\n")
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+    monkeypatch.setattr(update, "NEXO_HOME", runtime_home)
+
+    removed = update._cleanup_retired_runtime_files()
+
+    assert len(removed) == 4
+    assert all(not path.exists() for path in legacy_files)
+
+
+def test_sync_hooks_to_home_skips_samefile_when_packaged_runtime_is_source(tmp_path, monkeypatch):
+    from plugins import update
+
+    runtime_home = tmp_path / "runtime"
+    hooks_dir = runtime_home / "hooks"
+    hooks_dir.mkdir(parents=True)
+    hook = hooks_dir / "session-stop.sh"
+    hook.write_text("#!/bin/bash\nexit 0\n")
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+    monkeypatch.setattr(update, "NEXO_HOME", runtime_home)
+    monkeypatch.setattr(update, "SRC_DIR", runtime_home)
+
+    update._sync_hooks_to_home()
+
+    assert hook.read_text() == "#!/bin/bash\nexit 0\n"
+
+
+def test_sync_packaged_crons_runs_runtime_sync_script(tmp_path, monkeypatch):
+    from plugins import update
+
+    runtime_home = tmp_path / "runtime"
+    (runtime_home / "core").mkdir(parents=True)
+    (runtime_home / "core" / "cli.py").write_text("print('cli')\n")
+    sync_path = runtime_home / "crons" / "sync.py"
+    sync_path.parent.mkdir(parents=True)
+    sync_path.write_text("print('ok')\n")
+
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        captured["cwd"] = kwargs.get("cwd")
+        captured["env"] = kwargs.get("env", {})
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+    monkeypatch.setattr(update, "NEXO_HOME", runtime_home)
+    monkeypatch.setattr(update, "SRC_DIR", runtime_home)
+    monkeypatch.setattr(update.subprocess, "run", fake_run)
+
+    ok, err = update._sync_packaged_crons()
+
+    assert ok is True
+    assert err is None
+    assert captured["args"] == [sys.executable, str(sync_path)]
+    assert captured["cwd"] == str(runtime_home)
+    assert captured["env"]["NEXO_HOME"] == str(runtime_home)
+    assert captured["env"]["NEXO_CODE"] == str(runtime_home / "core")
+
+
+def test_handle_packaged_update_reloads_launchagents_after_successful_bump(monkeypatch):
+    from plugins import update
+
+    versions = iter(["5.3.6", "5.3.7"])
+    monkeypatch.setattr(update, "packaged_npm_toolchain_status", lambda repair=False: {
+        "ok": True,
+        "cmd": ["npm"],
+        "env": {},
+        "attempts": [],
+        "repaired": [],
+    })
+
+    monkeypatch.setattr(update, "_read_version", lambda: next(versions))
+    monkeypatch.setattr(update, "_backup_databases", lambda: ("backup-dir", None))
+    monkeypatch.setattr(update, "_backup_code_tree", lambda: ("code-backup", None))
+    monkeypatch.setattr(update, "_reinstall_pip_deps", lambda: None)
+    monkeypatch.setattr(update, "_run_migrations", lambda: None)
+    monkeypatch.setattr(update, "_verify_import", lambda: None)
+    monkeypatch.setattr(update, "_finalize_packaged_runtime_layout", lambda: (True, None))
+    monkeypatch.setattr(update, "_sync_packaged_crons", lambda progress_fn=None: (True, None))
+    monkeypatch.setattr(update, "_sync_hooks_to_home", lambda: None)
+    monkeypatch.setattr(update, "_cleanup_retired_runtime_files", lambda: [])
+    monkeypatch.setattr(update, "_update_runtime_dependencies", lambda progress_fn=None: [])
+    monkeypatch.setattr(update, "_sync_packaged_clients", lambda: (True, None))
+    monkeypatch.setattr(
+        update,
+        "_reload_launch_agents_after_bump",
+        lambda: {"scanned": 3, "reloaded": 3, "errors": []},
+    )
+    monkeypatch.setattr(
+        update,
+        "activate_versioned_runtime_snapshot",
+        lambda source_root, version: {"ok": True, "version": version},
+    )
+    monkeypatch.setattr(
+        update,
+        "write_restart_required_marker",
+        lambda from_version, to_version, **_kw: {"path": f"/tmp/mcp-restart-required-{to_version}.json"},
+    )
+    baseline_calls = []
+    monkeypatch.setattr(
+        update,
+        "_stamp_runtime_repair_baseline",
+        lambda source="": baseline_calls.append(source) or "runtime-repair-baseline",
+    )
+
+    def fake_run(args, **kwargs):
+        if args == ["npm", "install", "-g", "nexo-brain@latest"]:
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected subprocess call: {args}")
+
+    monkeypatch.setattr(update.subprocess, "run", fake_run)
+
+    result = update._handle_packaged_update(include_clis=False)
+
+    assert "UPDATE SUCCESSFUL (packaged install)" in result
+    assert "Version: 5.3.6 -> 5.3.7" in result
+    assert "Crons: synced with manifest" in result
+    assert "Hooks: synced to NEXO_HOME" in result
+    assert "Clients: configured client targets synced" in result
+    assert "LaunchAgents: reloaded 3/3" in result
+    assert "Repair baseline: updated" in result
+    assert baseline_calls == ["plugins.update._handle_packaged_update"]
+
+
+def test_handle_packaged_update_uses_desktop_managed_npm_runtime(monkeypatch):
+    from plugins import update
+
+    versions = iter(["7.1.1", "7.1.2"])
+    desktop_node = "/Applications/NEXO Desktop.app/Contents/MacOS/NEXO Desktop"
+    bundled_npm_cli = "/Applications/NEXO Desktop.app/Contents/Resources/app.asar.unpacked/node_modules/npm/bin/npm-cli.js"
+    managed_prefix = "/Users/franciscoc/.nexo/runtime/bootstrap/npm-global"
+
+    monkeypatch.setenv("NEXO_DESKTOP_NODE", desktop_node)
+    monkeypatch.setenv("NEXO_DESKTOP_NPM_CLI", bundled_npm_cli)
+    monkeypatch.setenv("NEXO_DESKTOP_NPM_PREFIX", managed_prefix)
+    monkeypatch.setattr(update, "packaged_npm_toolchain_status", lambda repair=False: {
+        "ok": True,
+        "cmd": [desktop_node, bundled_npm_cli],
+        "env": {
+            "ELECTRON_RUN_AS_NODE": "1",
+            "NPM_CONFIG_PREFIX": managed_prefix,
+            "PATH": f"{managed_prefix}/bin:/usr/bin",
+        },
+        "attempts": [],
+        "repaired": [],
+    })
+    monkeypatch.setattr(update, "_read_version", lambda: next(versions))
+    monkeypatch.setattr(update, "_backup_databases", lambda: ("backup-dir", None))
+    monkeypatch.setattr(update, "_backup_code_tree", lambda: ("code-backup", None))
+    monkeypatch.setattr(update, "_reinstall_pip_deps", lambda: None)
+    monkeypatch.setattr(update, "_run_migrations", lambda: None)
+    monkeypatch.setattr(update, "_verify_import", lambda: None)
+    monkeypatch.setattr(update, "_finalize_packaged_runtime_layout", lambda: (True, None))
+    monkeypatch.setattr(update, "_sync_packaged_crons", lambda progress_fn=None: (True, None))
+    monkeypatch.setattr(update, "_sync_hooks_to_home", lambda: None)
+    monkeypatch.setattr(update, "_cleanup_retired_runtime_files", lambda: [])
+    monkeypatch.setattr(update, "_update_runtime_dependencies", lambda progress_fn=None: [])
+    monkeypatch.setattr(update, "_sync_packaged_clients", lambda: (True, None))
+    monkeypatch.setattr(
+        update,
+        "_reload_launch_agents_after_bump",
+        lambda: {"scanned": 1, "reloaded": 1, "errors": []},
+    )
+    monkeypatch.setattr(
+        update,
+        "activate_versioned_runtime_snapshot",
+        lambda source_root, version: {"ok": True, "version": version},
+    )
+    monkeypatch.setattr(
+        update,
+        "write_restart_required_marker",
+        lambda from_version, to_version, **_kw: {"path": f"/tmp/mcp-restart-required-{to_version}.json"},
+    )
+    monkeypatch.setattr(update, "_stamp_runtime_repair_baseline", lambda source="": "runtime-repair-baseline")
+    monkeypatch.setattr(update.Path, "exists", lambda self: str(self) in {desktop_node, bundled_npm_cli})
+
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        captured["env"] = kwargs.get("env", {})
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(update.subprocess, "run", fake_run)
+
+    result = update._handle_packaged_update(include_clis=False)
+
+    assert "UPDATE SUCCESSFUL (packaged install)" in result
+    assert captured["args"] == [desktop_node, bundled_npm_cli, "install", "-g", "nexo-brain@latest"]
+    assert captured["env"]["ELECTRON_RUN_AS_NODE"] == "1"
+    assert captured["env"]["NPM_CONFIG_PREFIX"] == managed_prefix
+    assert captured["env"]["PATH"].split(":")[0] == f"{managed_prefix}/bin"
+
+
+def test_packaged_npm_toolchain_repairs_broken_nexo_wrappers(monkeypatch, tmp_path):
+    from plugins import update
+
+    home = tmp_path / "home"
+    runtime_home = home / ".nexo"
+    nexo_bin = runtime_home / "bin"
+    nvm_bin = home / ".nvm" / "versions" / "node" / "v22.16.0" / "bin"
+    nexo_bin.mkdir(parents=True)
+    nvm_bin.mkdir(parents=True)
+    broken_npm = nexo_bin / "npm"
+    broken_npx = nexo_bin / "npx"
+    healthy_npm = nvm_bin / "npm"
+    healthy_npx = nvm_bin / "npx"
+    broken_npm.write_text("#!/bin/sh\nexit 127\n", encoding="utf-8")
+    broken_npx.write_text("#!/bin/sh\nexit 127\n", encoding="utf-8")
+    healthy_npm.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    healthy_npx.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+    monkeypatch.setattr(update, "NEXO_HOME", runtime_home)
+    monkeypatch.setattr(update.Path, "home", lambda: home)
+    monkeypatch.setattr(update.shutil, "which", lambda name: str(broken_npm) if name == "npm" else None)
+
+    def fake_run(args, **_kwargs):
+        if args[0] in {"npm", str(broken_npm)}:
+            return mock.Mock(returncode=127, stdout="", stderr="broken npm")
+        if args[0] == str(healthy_npm):
+            if args[1:] == ["--version"]:
+                return mock.Mock(returncode=0, stdout="10.9.0\n", stderr="")
+            if args[1:] == ["root", "-g"]:
+                return mock.Mock(returncode=0, stdout=str(nvm_bin.parent / "lib" / "node_modules") + "\n", stderr="")
+        raise AssertionError(f"unexpected npm probe: {args}")
+
+    monkeypatch.setattr(update.subprocess, "run", fake_run)
+
+    status = update.packaged_npm_toolchain_status(repair=True)
+
+    assert status["ok"] is True
+    assert sorted(status["repaired"]) == ["npm", "npx"]
+    assert str(healthy_npm) in broken_npm.read_text(encoding="utf-8")
+    assert str(healthy_npx) in broken_npx.read_text(encoding="utf-8")
+
+
+def test_handle_packaged_update_finalizes_layout_before_import_verification(monkeypatch):
+    from plugins import update
+
+    versions = iter(["7.1.2", "7.1.3"])
+    call_order = []
+    monkeypatch.setattr(update, "packaged_npm_toolchain_status", lambda repair=False: {
+        "ok": True,
+        "cmd": ["npm"],
+        "env": {},
+        "attempts": [],
+        "repaired": [],
+    })
+
+    monkeypatch.setattr(update, "_read_version", lambda: next(versions))
+    monkeypatch.setattr(update, "_backup_databases", lambda: ("backup-dir", None))
+    monkeypatch.setattr(update, "_backup_code_tree", lambda: ("code-backup", None))
+    monkeypatch.setattr(update, "_reinstall_pip_deps", lambda: None)
+    monkeypatch.setattr(update, "_run_migrations", lambda: None)
+    monkeypatch.setattr(
+        update,
+        "_finalize_packaged_runtime_layout",
+        lambda: (call_order.append("finalize") or True, None),
+    )
+    monkeypatch.setattr(
+        update,
+        "_verify_import",
+        lambda: (call_order.append("verify") or None),
+    )
+    monkeypatch.setattr(
+        update,
+        "_stamp_runtime_repair_baseline",
+        lambda source="": call_order.append("baseline") or "runtime-repair-baseline",
+    )
+    monkeypatch.setattr(update, "_sync_packaged_crons", lambda progress_fn=None: (True, None))
+    monkeypatch.setattr(update, "_sync_hooks_to_home", lambda: None)
+    monkeypatch.setattr(update, "_cleanup_retired_runtime_files", lambda: [])
+    monkeypatch.setattr(update, "_update_runtime_dependencies", lambda progress_fn=None: [])
+    monkeypatch.setattr(update, "_sync_packaged_clients", lambda: (True, None))
+    monkeypatch.setattr(
+        update,
+        "_reload_launch_agents_after_bump",
+        lambda: {"scanned": 1, "reloaded": 1, "errors": []},
+    )
+    monkeypatch.setattr(
+        update,
+        "activate_versioned_runtime_snapshot",
+        lambda source_root, version: {"ok": True, "version": version},
+    )
+    monkeypatch.setattr(
+        update,
+        "write_restart_required_marker",
+        lambda from_version, to_version, **_kw: {"path": f"/tmp/mcp-restart-required-{to_version}.json"},
+    )
+
+    def fake_run(args, **kwargs):
+        if args == ["npm", "install", "-g", "nexo-brain@latest"]:
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected subprocess call: {args}")
+
+    monkeypatch.setattr(update.subprocess, "run", fake_run)
+
+    result = update._handle_packaged_update(include_clis=False)
+
+    assert "UPDATE SUCCESSFUL (packaged install)" in result
+    assert call_order[:3] == ["finalize", "verify", "baseline"]
+
+
+def test_handle_packaged_update_runs_maintenance_when_version_unchanged(monkeypatch, tmp_path):
+    from plugins import update
+
+    versions = iter(["7.12.14", "7.12.14"])
+    calls = []
+    runtime_home = tmp_path / "runtime"
+    runtime_home.mkdir()
+
+    monkeypatch.setattr(update, "NEXO_HOME", runtime_home)
+    monkeypatch.setattr(update, "packaged_npm_toolchain_status", lambda repair=False: {
+        "ok": True,
+        "cmd": ["npm"],
+        "env": {},
+        "attempts": [],
+        "repaired": [],
+    })
+    monkeypatch.setattr(update, "_read_version", lambda: next(versions))
+    monkeypatch.setattr(update, "_backup_databases", lambda: ("backup-dir", None))
+    monkeypatch.setattr(update, "_backup_code_tree", lambda: ("code-backup", None))
+    monkeypatch.setattr(update, "_reinstall_pip_deps", lambda: calls.append("pip"))
+    monkeypatch.setattr(update, "_run_migrations", lambda: calls.append("migrations") or None)
+    monkeypatch.setattr(update, "_verify_import", lambda: calls.append("verify") or None)
+    monkeypatch.setattr(update, "_finalize_packaged_runtime_layout", lambda: calls.append("layout") or (True, None))
+    monkeypatch.setattr(update, "_sync_packaged_crons", lambda progress_fn=None: calls.append("crons") or (True, None))
+    monkeypatch.setattr(update, "_sync_hooks_to_home", lambda: calls.append("hooks"))
+    monkeypatch.setattr(update, "_cleanup_retired_runtime_files", lambda: [])
+    monkeypatch.setattr(update, "_update_runtime_dependencies", lambda progress_fn=None: [])
+    monkeypatch.setattr(update, "_sync_packaged_clients", lambda: calls.append("clients") or (True, None))
+    monkeypatch.setattr(update, "activate_versioned_runtime_snapshot", lambda source_root, version: (_ for _ in ()).throw(AssertionError("no versioned runtime for unchanged version")))
+    monkeypatch.setattr(update, "write_restart_required_marker", lambda **_kw: (_ for _ in ()).throw(AssertionError("no restart marker for unchanged version")))
+
+    def fake_run(args, **kwargs):
+        if args == ["npm", "install", "-g", "nexo-brain@latest"]:
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected subprocess call: {args}")
+
+    monkeypatch.setattr(update.subprocess, "run", fake_run)
+
+    result = update._handle_packaged_update(include_clis=False)
+
+    assert "UPDATE SUCCESSFUL (packaged install)" in result
+    assert "Version: 7.12.14 (unchanged; idempotent maintenance)" in result
+    assert "Repair baseline: updated" in result
+    assert "maintenance completed without an MCP restart" in result
+    assert "migrations" in calls
+    assert "layout" in calls
+    assert "verify" in calls
+    assert "pip" not in calls
+    baseline = runtime_home / "operations" / "last-repair-baseline.json"
+    assert baseline.is_file()
+    payload = json.loads(baseline.read_text())
+    assert payload["source"] == "plugins.update._handle_packaged_update"
+
+
+def _common_packaged_update_stubs(monkeypatch, update, versions):
+    monkeypatch.setattr(update, "packaged_npm_toolchain_status", lambda repair=False: {
+        "ok": True,
+        "cmd": ["npm"],
+        "env": {},
+        "attempts": [],
+        "repaired": [],
+    })
+    monkeypatch.setattr(update, "_read_version", lambda: next(versions))
+    monkeypatch.setattr(update, "_backup_databases", lambda: ("backup-dir", None))
+    monkeypatch.setattr(update, "_backup_code_tree", lambda: ("code-backup", None))
+    monkeypatch.setattr(update, "_reinstall_pip_deps", lambda: None)
+    monkeypatch.setattr(update, "_run_migrations", lambda: None)
+    monkeypatch.setattr(update, "_verify_import", lambda: None)
+    monkeypatch.setattr(update, "_finalize_packaged_runtime_layout", lambda: (True, None))
+    monkeypatch.setattr(update, "_sync_packaged_crons", lambda progress_fn=None: (True, None))
+    monkeypatch.setattr(update, "_sync_hooks_to_home", lambda: None)
+    monkeypatch.setattr(update, "_cleanup_retired_runtime_files", lambda: [])
+    monkeypatch.setattr(update, "_update_runtime_dependencies", lambda progress_fn=None: [])
+    monkeypatch.setattr(update, "_sync_packaged_clients", lambda: (True, None))
+    monkeypatch.setattr(update, "_stamp_runtime_repair_baseline", lambda source="": "runtime-repair-baseline")
+    monkeypatch.setattr(
+        update,
+        "_reload_launch_agents_after_bump",
+        lambda: {"scanned": 1, "reloaded": 1, "errors": []},
+    )
+    monkeypatch.setattr(
+        update,
+        "activate_versioned_runtime_snapshot",
+        lambda source_root, version: {"ok": True, "version": version},
+    )
+
+    def fake_run(args, **kwargs):
+        if args == ["npm", "install", "-g", "nexo-brain@latest"]:
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected subprocess call: {args}")
+
+    monkeypatch.setattr(update.subprocess, "run", fake_run)
+
+
+def test_packaged_update_skips_restart_marker_when_fingerprint_unchanged(monkeypatch):
+    """Doc-only / README-only release path: no `.py` byte changed → no restart."""
+    from plugins import update
+
+    versions = iter(["7.10.0", "7.10.1"])
+    _common_packaged_update_stubs(monkeypatch, update, versions)
+    # Same fingerprint before and after → release did not change MCP code.
+    same_fp = "f" * 64
+    monkeypatch.setattr(update, "compute_mcp_runtime_fingerprint", lambda root: same_fp)
+    monkeypatch.setattr(update, "installed_force_restart_flag", lambda: False)
+
+    marker_calls: list[dict] = []
+
+    def fake_marker(**kwargs):
+        marker_calls.append(kwargs)
+        return {"path": "/tmp/should-not-be-written.json"}
+
+    monkeypatch.setattr(update, "write_restart_required_marker", fake_marker)
+
+    result = update._handle_packaged_update(include_clis=False)
+
+    assert "UPDATE SUCCESSFUL (packaged install)" in result
+    assert marker_calls == [], "Doc-only release must NOT write the restart marker"
+    assert "MCP source unchanged" in result
+    assert "no restart needed" in result.lower()
+
+
+def test_packaged_update_writes_marker_when_fingerprint_changes(monkeypatch):
+    """Real code change path: marker IS written, with both fingerprints recorded."""
+    from plugins import update
+
+    versions = iter(["7.10.1", "7.11.0"])
+    _common_packaged_update_stubs(monkeypatch, update, versions)
+    fingerprints = iter(["a" * 64, "b" * 64])
+    monkeypatch.setattr(
+        update, "compute_mcp_runtime_fingerprint", lambda root: next(fingerprints)
+    )
+    monkeypatch.setattr(update, "installed_force_restart_flag", lambda: False)
+
+    marker_calls: list[dict] = []
+
+    def fake_marker(**kwargs):
+        marker_calls.append(kwargs)
+        return {"path": "/tmp/mcp-restart-required.json"}
+
+    monkeypatch.setattr(update, "write_restart_required_marker", fake_marker)
+
+    result = update._handle_packaged_update(include_clis=False)
+
+    assert "UPDATE SUCCESSFUL (packaged install)" in result
+    assert len(marker_calls) == 1
+    call = marker_calls[0]
+    assert call["from_fingerprint"] == "a" * 64
+    assert call["to_fingerprint"] == "b" * 64
+    assert call["reason"] == "brain_update"
+    assert "MCP server restart needed to load new code." in result
+
+
+def test_packaged_update_force_restart_flag_writes_marker_even_when_unchanged(monkeypatch):
+    """Opt-in escape hatch: `force_restart: true` in version.json → always restart."""
+    from plugins import update
+
+    versions = iter(["7.10.1", "7.11.0"])
+    _common_packaged_update_stubs(monkeypatch, update, versions)
+    same_fp = "f" * 64
+    monkeypatch.setattr(update, "compute_mcp_runtime_fingerprint", lambda root: same_fp)
+    monkeypatch.setattr(update, "installed_force_restart_flag", lambda: True)
+
+    marker_calls: list[dict] = []
+
+    def fake_marker(**kwargs):
+        marker_calls.append(kwargs)
+        return {"path": "/tmp/forced.json"}
+
+    monkeypatch.setattr(update, "write_restart_required_marker", fake_marker)
+
+    result = update._handle_packaged_update(include_clis=False)
+
+    assert "UPDATE SUCCESSFUL (packaged install)" in result
+    assert len(marker_calls) == 1
+    assert marker_calls[0]["reason"] == "brain_update_force"
+
+
+def test_packaged_update_missing_fingerprint_falls_back_to_restart(monkeypatch):
+    """When fingerprint can't be computed, behave like the legacy path: write marker."""
+    from plugins import update
+
+    versions = iter(["7.10.1", "7.11.0"])
+    _common_packaged_update_stubs(monkeypatch, update, versions)
+    monkeypatch.setattr(update, "compute_mcp_runtime_fingerprint", lambda root: "")
+    monkeypatch.setattr(update, "installed_force_restart_flag", lambda: False)
+
+    marker_calls: list[dict] = []
+
+    def fake_marker(**kwargs):
+        marker_calls.append(kwargs)
+        return {"path": "/tmp/fallback.json"}
+
+    monkeypatch.setattr(update, "write_restart_required_marker", fake_marker)
+
+    result = update._handle_packaged_update(include_clis=False)
+
+    assert "UPDATE SUCCESSFUL (packaged install)" in result
+    # Conservative fallback (#186): missing fingerprint → assume MCP changed.
+    assert len(marker_calls) == 1
+
+
+def test_packaged_installer_discovers_root_python_modules_for_migration():
+    installer = REPO_ROOT / "bin" / "nexo-brain.js"
+    text = installer.read_text(encoding="utf-8")
+
+    assert 'function getCoreRuntimeFlatFiles(srcDir = path.join(__dirname, "..", "src"))' in text
+    assert 'name.endsWith(".py")' in text
+    assert 'new Set([...staticFiles, ...discoveredRootModules])' in text
+
+
+def test_packaged_installer_syncs_runtime_package_metadata():
+    installer = REPO_ROOT / "bin" / "nexo-brain.js"
+    text = installer.read_text(encoding="utf-8")
+
+    assert 'function syncRuntimePackageMetadata(repoRoot = path.join(__dirname, ".."), runtimeHome = NEXO_HOME)' in text
+    assert 'fs.copyFileSync(pkgSrc, path.join(runtimeHome, "package.json"));' in text
+    # The installer calls syncRuntimePackageMetadata at three points: the
+    # auto-migration flow, the Brain core install, and the legacy migration
+    # branch. After the bundle-aware refactor, the first arg may be either
+    # `path.join(__dirname, "..")` (no bundle) or `bundleRoot` (when a staged
+    # bundle has been resolved). Count both call shapes — the total must be ≥3.
+    legacy_calls = text.count('syncRuntimePackageMetadata(path.join(__dirname, ".."), NEXO_HOME);')
+    bundle_calls = text.count('syncRuntimePackageMetadata(bundleRoot, NEXO_HOME);')
+    assert legacy_calls + bundle_calls >= 3, (
+        f"expected >=3 syncRuntimePackageMetadata call sites, got "
+        f"{legacy_calls} legacy + {bundle_calls} bundleRoot"
+    )
+
+
+def test_packaged_installer_stamps_repair_baseline_after_verified_repairs():
+    installer = REPO_ROOT / "bin" / "nexo-brain.js"
+    text = installer.read_text(encoding="utf-8")
+
+    assert 'const REPAIR_BASELINE_FILE = "last-repair-baseline.json";' in text
+    assert "function stampRuntimeRepairBaseline(nexoHome = NEXO_HOME, source = \"bin.nexo-brain\")" in text
+    assert 'stampRuntimeRepairBaseline(NEXO_HOME, "bin.nexo-brain.migration")' in text
+    assert 'stampRuntimeRepairBaseline(NEXO_HOME, "bin.nexo-brain.same-version-repair")' in text
+    assert 'stampRuntimeRepairBaseline(NEXO_HOME, "bin.nexo-brain.install")' in text
+    assert 'log("  Repair baseline: updated.");' in text
+
+
+def test_packaged_installer_repairs_same_version_runtime_when_core_current_lags():
+    installer = REPO_ROOT / "bin" / "nexo-brain.js"
+    text = installer.read_text(encoding="utf-8")
+
+    assert 'function readActiveRuntimeSnapshotVersion(nexoHome = NEXO_HOME)' in text
+    assert 'function activateVersionedRuntimeSnapshot(python, nexoHome = NEXO_HOME, version = "")' in text
+    assert 'const activeRuntimeVersion = readActiveRuntimeSnapshotVersion(NEXO_HOME);' in text
+    assert 'const needsRuntimeRepair = activeRuntimeVersion !== currentVersion;' in text
+    assert 'if (installedVersion !== currentVersion || needsRuntimeRepair) {' in text
+    assert 'Repairing active runtime snapshot...' in text
+    assert 'const migActivation = activateVersionedRuntimeSnapshot(migPython, NEXO_HOME, currentVersion);' in text
+    assert 'log(`  Runtime activation: core/current -> versions/${currentVersion}`);' in text
+
+
+def test_packaged_installer_same_version_repair_refreshes_active_core():
+    installer = REPO_ROOT / "bin" / "nexo-brain.js"
+    text = installer.read_text(encoding="utf-8")
+
+    same_version_section = text[text.index("// Same version — backfill crons/"):]
+
+    assert '"disk_recovery"' in text
+    assert '"guardrails"' in text
+    assert '"presets"' in text
+    assert "const refreshSameVersionCoreRuntime = () => {" in same_version_section
+    assert "refreshSameVersionCoreRuntime();" in same_version_section
+    assert 'log("Refreshed core runtime files.");' in same_version_section
+    assert "const sameVersionActivation = activateVersionedRuntimeSnapshot(syncPython, NEXO_HOME, currentVersion);" in same_version_section
+    assert "throw new Error(`Runtime activation failed: ${sameVersionActivation.error}`);" in same_version_section
+
+
+def test_packaged_installer_verifies_bundled_local_models_before_locking():
+    installer = REPO_ROOT / "bin" / "nexo-brain.js"
+    text = installer.read_text(encoding="utf-8")
+
+    assert "function copyBundledLlmModelsToRuntime" in text
+    assert "function cleanupObsoleteRuntimeLlmModels" in text
+    assert 'const missingFiles = [];' in text
+    assert 'missingFiles.push(f.path);' in text
+    assert 'missingFiles.push(`${f.path}:size`);' in text
+    assert 'function sha256File(filePath)' in text
+    assert 'bundled LLM model ${spec.name} incomplete' in text
+    assert 'if (missingFiles.length)' in text
+    assert 'fs.writeFileSync(path.join(targetDir, ".nexo-model-lock.json")' in text
+    assert 'modelsCopied === (manifest.models || []).length' in text
+    assert "cleanupObsoleteRuntimeLlmModels(runtimeModelsDir, manifest, { reason });" in text
+    assert 'function readManagedModelLock(dir)' in text
+    assert 'sha256File(dst) !== f.sha256' in text
+    assert 'fs.copyFileSync(src, dst);' in text
+    assert 'isManagedModelRevisionDir(revisionDir, { slug, revision })' in text
+    assert 'fs.rmSync(revisionDir, { recursive: true, force: true });' in text
+
+
+@pytest.mark.skipif(not _node_available(), reason="node not available")
+def test_packaged_installer_repairs_corrupt_same_size_bundled_model_and_cleans_obsolete(tmp_path):
+    bundle = tmp_path / "bundle-models" / "fake-source"
+    bundle.mkdir(parents=True)
+    good = b"GOOD"
+    (bundle / "model.bin").write_bytes(good)
+    manifest = tmp_path / "local_model_manifest.json"
+    manifest.write_text(
+        json.dumps({
+            "version": 1,
+            "models": [{
+                "name": "fake model",
+                "kind": "local_presence_llm",
+                "model_id": "org/fake-id",
+                "source_repo": "org/fake-source",
+                "revision": "rev1",
+                "model_file": "model.bin",
+                "required_files": [{
+                    "path": "model.bin",
+                    "size": len(good),
+                    "sha256": "278f14e96cc67489e5c0d6cebec8a2718fb158ec656fd41fed7ecd031cd472b2",
+                }],
+            }],
+        }),
+        encoding="utf-8",
+    )
+    home = tmp_path / "home"
+    target = home / "runtime" / "models" / "fake-model" / "rev1"
+    target.mkdir(parents=True)
+    (target / "model.bin").write_bytes(b"BADD")
+    obsolete = home / "runtime" / "models" / "fake-model" / "rev0"
+    obsolete.mkdir(parents=True)
+    (obsolete / ".nexo-model-lock.json").write_text(
+        json.dumps({"name": "fake model", "revision": "rev0", "model_id": "org/fake-id"}),
+        encoding="utf-8",
+    )
+    manual = home / "runtime" / "models" / "fake-model" / "manual"
+    manual.mkdir(parents=True)
+
+    runner = tmp_path / "run-copy-models.js"
+    runner.write_text("""
+const fs = require('node:fs');
+const installer = require(process.argv[2]);
+const count = installer.copyBundledLlmModelsToRuntime(process.argv[3], {
+  reason: 'test',
+  bundledModelsDir: process.argv[4],
+  manifestPath: process.argv[5],
+});
+const target = `${process.argv[3]}/runtime/models/fake-model/rev1/model.bin`;
+console.log(JSON.stringify({
+  count,
+  content: fs.readFileSync(target, 'utf8'),
+  lock: fs.existsSync(`${process.argv[3]}/runtime/models/fake-model/rev1/.nexo-model-lock.json`),
+  obsolete: fs.existsSync(`${process.argv[3]}/runtime/models/fake-model/rev0`),
+  manual: fs.existsSync(`${process.argv[3]}/runtime/models/fake-model/manual`),
+}));
+""", encoding="utf-8")
+    result = subprocess.run(
+        ["node", str(runner), str(REPO_ROOT / "bin" / "nexo-brain.js"), str(home), str(tmp_path / "bundle-models"), str(manifest)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=True,
+    )
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+
+    assert payload == {
+        "count": 1,
+        "content": "GOOD",
+        "lock": True,
+        "obsolete": False,
+        "manual": True,
+    }
+
+
+@pytest.mark.skipif(not _node_available(), reason="node not available")
+def test_packaged_installer_respects_keep_obsolete_models_env(tmp_path):
+    runtime_models = tmp_path / "runtime" / "models"
+    obsolete = runtime_models / "fake-model" / "rev0"
+    obsolete.mkdir(parents=True)
+    (obsolete / ".nexo-model-lock.json").write_text(
+        json.dumps({"name": "fake model", "revision": "rev0", "model_id": "org/fake-id"}),
+        encoding="utf-8",
+    )
+    manifest = {"models": [{"name": "fake model", "revision": "rev1"}]}
+    runner = tmp_path / "run-cleanup-models.js"
+    runner.write_text("""
+const fs = require('node:fs');
+const installer = require(process.argv[2]);
+process.env.NEXO_KEEP_OBSOLETE_LLM_MODELS = '1';
+const removed = installer.cleanupObsoleteRuntimeLlmModels(process.argv[3], JSON.parse(process.argv[4]), { reason: 'test' });
+console.log(JSON.stringify({ removed, exists: fs.existsSync(`${process.argv[3]}/fake-model/rev0`) }));
+""", encoding="utf-8")
+    result = subprocess.run(
+        ["node", str(runner), str(REPO_ROOT / "bin" / "nexo-brain.js"), str(runtime_models), json.dumps(manifest)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=True,
+    )
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+
+    assert payload == {"removed": [], "exists": True}
+
+
+def test_packaged_update_and_repair_adopt_bundled_local_models_before_warmup():
+    installer = REPO_ROOT / "bin" / "nexo-brain.js"
+    text = installer.read_text(encoding="utf-8")
+
+    update_copy = 'copyBundledLlmModelsToRuntime(NEXO_HOME, { reason: "update" });'
+    update_warmup = 'runDesktopAwareModelWarmup(migPythonForWarmup, NEXO_HOME, { reason: "update", installRuntimeDeps: false });'
+    repair_copy = 'copyBundledLlmModelsToRuntime(NEXO_HOME, { reason: "repair" });'
+    repair_warmup = 'runDesktopAwareModelWarmup(syncPython, NEXO_HOME, { reason: "repair" });'
+    install_copy = 'copyBundledLlmModelsToRuntime(NEXO_HOME, { reason: "install" });'
+    install_warmup = 'runDesktopAwareModelWarmup(python, NEXO_HOME, { reason: "install", installRuntimeDeps: false });'
+
+    for snippet in (update_copy, update_warmup, repair_copy, repair_warmup, install_copy, install_warmup):
+        assert snippet in text
+
+    assert text.index(update_copy) < text.index(update_warmup)
+    assert text.index(repair_copy) < text.index(repair_warmup)
+    assert text.index(install_copy) < text.index(install_warmup)
+
+
+def test_managed_runtime_wrapper_repairs_stale_core_current_before_exec():
+    installer = REPO_ROOT / "bin" / "nexo-brain.js"
+    source = REPO_ROOT / "src" / "auto_update.py"
+    installer_text = installer.read_text(encoding="utf-8")
+    source_text = source.read_text(encoding="utf-8")
+
+    for text in (installer_text, source_text):
+        assert 'read_runtime_version() {' in text
+        assert 'repair_stale_current_runtime() {' in text
+        assert 'from runtime_versioning import activate_versioned_runtime_snapshot, read_version_for_path' in text
+        assert 'repair_stale_current_runtime' in text
+
+
+def test_auto_update_falls_back_to_core_product_mode_when_root_shim_is_missing():
+    auto_update = REPO_ROOT / "src" / "auto_update.py"
+    text = auto_update.read_text(encoding="utf-8")
+
+    assert 'if getattr(exc, "name", "") != "product_mode":' in text
+    assert '_core_runtime = Path(__file__).resolve().parent / "core"' in text
+    assert 'sys.path.insert(0, core_path)' in text
+    assert text.count("from product_mode import desktop_product_requested, enforce_desktop_product_contract") >= 2
+
+
+def test_packaged_update_repairs_desktop_managed_python_venv_contract():
+    update = REPO_ROOT / "src" / "plugins" / "update.py"
+    text = update.read_text(encoding="utf-8")
+
+    assert "from product_mode import desktop_product_requested" in text
+    assert "def _managed_venv_python_supported(python_bin: Path | str) -> bool:" in text
+    assert "return version[:2] == (3, 12)" in text
+    assert "def _resolve_managed_venv_base_python() -> str:" in text
+    assert '"/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12"' in text
+    assert 'shutil.which("python3.12")' in text
+    assert "def _archive_incompatible_managed_venv" in text
+    assert "_archive_incompatible_managed_venv(root, reason=reason)" in text
+    assert "managed Desktop venv pip is unavailable after repair" in text

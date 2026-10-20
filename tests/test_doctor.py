@@ -1,0 +1,3776 @@
+"""Tests for the Doctor diagnostic system."""
+import datetime
+import json
+import os
+import plistlib
+import sqlite3
+import textwrap
+import sys
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
+
+
+@pytest.fixture
+def nexo_home(tmp_path, monkeypatch):
+    """Create a minimal NEXO_HOME for doctor tests."""
+    home = tmp_path / "nexo"
+    for d in ["data", "scripts", "plugins", "crons", "hooks", "coordination", "operations", "logs"]:
+        (home / d).mkdir(parents=True)
+
+    (home / "crons" / "manifest.json").write_text(json.dumps({
+        "crons": [
+            {"id": "immune", "interval_seconds": 1800},
+            {"id": "watchdog", "interval_seconds": 1800},
+            {"id": "self-audit", "schedule": {"hour": 7, "minute": 0}},
+        ]
+    }))
+
+    # Create a minimal DB with the real columns Doctor inspects.
+    db_path = home / "data" / "nexo.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS sessions ("
+        "sid TEXT PRIMARY KEY, task TEXT NOT NULL DEFAULT '', started_epoch REAL NOT NULL, "
+        "last_update_epoch REAL NOT NULL, local_time TEXT NOT NULL DEFAULT ''"
+        ")"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS cron_runs ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, cron_id TEXT NOT NULL, started_at TEXT NOT NULL, "
+        "ended_at TEXT, exit_code INTEGER"
+        ")"
+    )
+    conn.execute("PRAGMA user_version = 42")
+    conn.close()
+
+    monkeypatch.setenv("NEXO_HOME", str(home))
+    monkeypatch.setenv("HOME", str(home))
+
+    # Force doctor imports to reload from this repo, not from any operator-local runtime.
+    repo_src = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
+    if repo_src in sys.path:
+        sys.path.remove(repo_src)
+    sys.path.insert(0, repo_src)
+    for name in list(sys.modules):
+        if name == "doctor" or name.startswith("doctor."):
+            sys.modules.pop(name, None)
+
+    # Patch module-level NEXO_HOME in all doctor modules
+    from doctor.providers import boot, runtime, deep
+    monkeypatch.setenv("NEXO_HOME", str(home))
+
+    monkeypatch.setenv("NEXO_HOME", str(home))
+    monkeypatch.setattr(boot, "NEXO_HOME", home)
+    monkeypatch.setenv("NEXO_HOME", str(home))
+
+    monkeypatch.setenv("NEXO_HOME", str(home))
+    monkeypatch.setattr(runtime, "NEXO_HOME", home)
+    monkeypatch.setenv("NEXO_HOME", str(home))
+
+    monkeypatch.setenv("NEXO_HOME", str(home))
+    monkeypatch.setattr(deep, "NEXO_HOME", home)
+
+    return home
+
+
+def _create_protocol_tables(db_path: Path):
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS protocol_tasks (
+            task_id TEXT PRIMARY KEY,
+            session_id TEXT DEFAULT '',
+            status TEXT DEFAULT 'open',
+            must_verify INTEGER DEFAULT 0,
+            close_evidence TEXT DEFAULT '',
+            must_change_log INTEGER DEFAULT 0,
+            change_log_id INTEGER,
+            correction_happened INTEGER DEFAULT 0,
+            learning_id INTEGER,
+            task_type TEXT DEFAULT 'answer',
+            cortex_mode TEXT DEFAULT '',
+            opened_at TEXT DEFAULT (datetime('now')),
+            closed_at TEXT
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS protocol_debt (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT DEFAULT '',
+            task_id TEXT DEFAULT '',
+            debt_type TEXT NOT NULL,
+            severity TEXT NOT NULL DEFAULT 'warn',
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at TEXT DEFAULT (datetime('now'))
+        )"""
+    )
+    conn.commit()
+    conn.close()
+
+
+def _create_learnings_table(db_path: Path):
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS learnings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT NOT NULL,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            applies_to TEXT DEFAULT '',
+            updated_at TEXT DEFAULT (datetime('now'))
+        )"""
+    )
+    conn.commit()
+    conn.close()
+
+
+def _add_rows(conn: sqlite3.Connection, table: str, count: int, prefix: str = "row") -> None:
+    conn.execute(f"CREATE TABLE IF NOT EXISTS {table} (id INTEGER PRIMARY KEY, payload TEXT)")
+    for i in range(count):
+        conn.execute(f"INSERT INTO {table} (payload) VALUES (?)", (f"{prefix}-{i}",))
+
+
+def _add_local_rows(db_path: Path, rows_by_table: dict[str, int]) -> None:
+    from db_guard import LOCAL_CONTEXT_TABLES
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        for table in LOCAL_CONTEXT_TABLES:
+            conn.execute(f"CREATE TABLE IF NOT EXISTS {table} (id INTEGER PRIMARY KEY, payload TEXT)")
+        for table, count in rows_by_table.items():
+            for i in range(count):
+                conn.execute(f"INSERT INTO {table} (payload) VALUES (?)", (f"local-{i}",))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestBootChecks:
+    def test_healthy_system(self, nexo_home):
+        from doctor.providers.boot import run_boot_checks
+        checks = run_boot_checks()
+        statuses = [c.status for c in checks]
+        assert "critical" not in statuses
+
+    def test_desktop_managed_venv_python_flags_python_313(self, nexo_home, monkeypatch):
+        from doctor.providers import boot
+
+        venv_python = nexo_home / ".venv" / "bin" / "python3"
+        venv_python.parent.mkdir(parents=True, exist_ok=True)
+        venv_python.write_text("#!/bin/sh\nexit 0\n")
+
+        monkeypatch.setattr(boot, "_desktop_product_requested", lambda: True)
+        monkeypatch.setattr(boot, "_probe_python_version", lambda _path: (3, 13, 13))
+
+        check = boot.check_managed_venv_python()
+
+        assert check.id == "boot.managed_venv_python"
+        assert check.status == "degraded"
+        assert "Python 3.12" in check.summary
+
+    def test_desktop_managed_venv_python_fix_rechecks_after_repair(self, nexo_home, monkeypatch):
+        from doctor.providers import boot
+
+        venv_python = nexo_home / ".venv" / "bin" / "python3"
+        venv_python.parent.mkdir(parents=True, exist_ok=True)
+        venv_python.write_text("#!/bin/sh\nexit 0\n")
+        versions = iter([(3, 13, 13), (3, 12, 10)])
+
+        monkeypatch.setattr(boot, "_desktop_product_requested", lambda: True)
+        monkeypatch.setattr(boot, "_probe_python_version", lambda _path: next(versions))
+        monkeypatch.setattr(boot, "_repair_managed_venv_python", lambda: True)
+
+        check = boot.check_managed_venv_python(fix=True)
+
+        assert check.status == "healthy"
+        assert check.fixed is True
+        assert "3.12.10" in check.summary
+
+    def test_missing_db(self, nexo_home):
+        os.remove(str(nexo_home / "data" / "nexo.db"))
+        from doctor.providers.boot import check_db_exists
+        check = check_db_exists()
+        assert check.status == "critical"
+
+    def test_db_integrity_flags_wiped_db_with_backup(self, nexo_home):
+        from db_guard import CRITICAL_TABLES
+
+        primary = nexo_home / "data" / "nexo.db"
+        primary.write_bytes(b"")
+        (nexo_home / "backups").mkdir(parents=True, exist_ok=True)
+        backup = nexo_home / "backups" / "nexo-2026-05-13-1400.db"
+        conn = sqlite3.connect(str(backup))
+        for table in CRITICAL_TABLES:
+            conn.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, payload TEXT)")
+        for i in range(60):
+            conn.execute("INSERT INTO protocol_tasks (payload) VALUES (?)", (f"row-{i}",))
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.boot import check_db_integrity
+        check = check_db_integrity()
+        assert check.status == "critical"
+        assert "valid backup" in check.summary
+
+    def test_db_integrity_fix_restores_wiped_db(self, nexo_home, monkeypatch):
+        from db_guard import CRITICAL_TABLES, db_row_counts
+
+        primary = nexo_home / "data" / "nexo.db"
+        primary.write_bytes(b"")
+        (nexo_home / "backups").mkdir(parents=True, exist_ok=True)
+        backup = nexo_home / "backups" / "nexo-2026-05-13-1400.db"
+        conn = sqlite3.connect(str(backup))
+        for table in CRITICAL_TABLES:
+            conn.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, payload TEXT)")
+        for i in range(75):
+            conn.execute("INSERT INTO protocol_tasks (payload) VALUES (?)", (f"row-{i}",))
+        conn.commit()
+        conn.close()
+
+        import db_guard
+        monkeypatch.setattr(
+            db_guard,
+            "quiesce_nexo_db_writers",
+            lambda dry_run=False: {
+                "terminated": 0,
+                "errors": [],
+                "mcp": {"terminated": 0, "errors": [], "scanned": 0},
+                "launchagents": {"stopped": [], "errors": [], "unsupported": False},
+                "processes": {"terminated": 0, "errors": [], "scanned": 0, "pids": []},
+            },
+        )
+
+        from doctor.providers.boot import check_db_integrity
+        check = check_db_integrity(fix=True)
+        assert check.status == "healthy"
+        assert check.fixed is True
+        assert db_row_counts(primary)["protocol_tasks"] == 75
+
+    def test_db_integrity_fix_restores_degraded_local_memory_without_rolling_back_core(self, nexo_home):
+        from db_guard import CRITICAL_TABLES, EMPTY_DB_SIZE_BYTES, LOCAL_CONTEXT_TABLES, PROTECTED_TABLES, db_row_counts
+
+        primary = nexo_home / "data" / "nexo.db"
+        local_context = nexo_home / "runtime" / "memory" / "local-context.db"
+        backup = nexo_home / "backups" / "nexo-2026-05-13-2350.db"
+        backup.parent.mkdir(parents=True, exist_ok=True)
+
+        conn = sqlite3.connect(str(primary))
+        for table in CRITICAL_TABLES:
+            conn.execute(f"CREATE TABLE IF NOT EXISTS {table} (id INTEGER PRIMARY KEY, payload TEXT)")
+        _add_rows(conn, "protocol_tasks", 999, "current")
+        conn.commit()
+        conn.close()
+        local_context.parent.mkdir(parents=True, exist_ok=True)
+        _add_local_rows(local_context, {})
+        assert local_context.stat().st_size > EMPTY_DB_SIZE_BYTES
+
+        conn = sqlite3.connect(str(backup))
+        for table in CRITICAL_TABLES:
+            conn.execute(f"CREATE TABLE IF NOT EXISTS {table} (id INTEGER PRIMARY KEY, payload TEXT)")
+        _add_rows(conn, "protocol_tasks", 100, "backup")
+        conn.commit()
+        conn.close()
+        _add_local_rows(backup, {"local_assets": 2000, "local_chunks": 4000, "local_embeddings": 4000})
+
+        from doctor.providers.boot import check_db_integrity
+        check = check_db_integrity(fix=True)
+
+        counts = db_row_counts(primary, PROTECTED_TABLES)
+        local_counts = db_row_counts(local_context, LOCAL_CONTEXT_TABLES)
+        assert check.status == "healthy"
+        assert check.fixed is True
+        assert counts["protocol_tasks"] == 999
+        assert local_counts["local_assets"] == 2000
+
+    def test_db_integrity_fix_merges_protected_tables_without_losing_current_rows(self, nexo_home):
+        from db_guard import CRITICAL_TABLES, PROTECTED_TABLES, db_row_counts
+
+        primary = nexo_home / "data" / "nexo.db"
+        backup = nexo_home / "backups" / "nexo-2026-05-21-0114.db"
+        backup.parent.mkdir(parents=True, exist_ok=True)
+
+        conn = sqlite3.connect(str(primary))
+        for table in CRITICAL_TABLES:
+            conn.execute(f"CREATE TABLE IF NOT EXISTS {table} (id INTEGER PRIMARY KEY, payload TEXT)")
+        conn.execute("INSERT INTO protocol_tasks (id, payload) VALUES (?, ?)", (1, "current-wins"))
+        conn.execute("INSERT INTO protocol_tasks (id, payload) VALUES (?, ?)", (1000, "new-current-row"))
+        conn.commit()
+        conn.close()
+
+        conn = sqlite3.connect(str(backup))
+        for table in CRITICAL_TABLES:
+            conn.execute(f"CREATE TABLE IF NOT EXISTS {table} (id INTEGER PRIMARY KEY, payload TEXT)")
+        for i in range(1, 101):
+            conn.execute("INSERT INTO protocol_tasks (id, payload) VALUES (?, ?)", (i, f"backup-{i}"))
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.boot import check_db_integrity
+        check = check_db_integrity(fix=True)
+
+        assert check.status == "healthy"
+        assert check.fixed is True
+        assert "protected tables restored" in check.summary
+        assert db_row_counts(primary, PROTECTED_TABLES)["protocol_tasks"] == 101
+        conn = sqlite3.connect(str(primary))
+        try:
+            assert conn.execute("SELECT payload FROM protocol_tasks WHERE id=1").fetchone()[0] == "current-wins"
+            assert conn.execute("SELECT payload FROM protocol_tasks WHERE id=1000").fetchone()[0] == "new-current-row"
+        finally:
+            conn.close()
+
+    def test_missing_dirs_fix(self, nexo_home):
+        import shutil
+        shutil.rmtree(str(nexo_home / "runtime" / "coordination"), ignore_errors=True); shutil.rmtree(str(nexo_home / "coordination"), ignore_errors=True)
+        from doctor.providers.boot import run_boot_checks
+        checks = run_boot_checks(fix=True)
+        dir_check = [c for c in checks if c.id == "boot.required_dirs"][0]
+        assert dir_check.fixed
+        assert (nexo_home / "runtime" / "coordination").is_dir() or (nexo_home / "coordination").is_dir()
+
+    def test_config_parse_catches_broken_manifest(self, nexo_home):
+        (nexo_home / "crons" / "manifest.json").write_text("{not valid json")
+        from doctor.providers.boot import check_config_parse
+        check = check_config_parse()
+        assert check.status == "degraded"
+        assert any("crons/manifest.json" in ev for ev in check.evidence)
+
+    def test_config_parse_catches_broken_optionals(self, nexo_home):
+        (nexo_home / "config").mkdir(parents=True, exist_ok=True)
+        (nexo_home / "config" / "optionals.json").write_text("[]")
+        from doctor.providers.boot import check_config_parse
+        check = check_config_parse()
+        assert check.status == "degraded"
+        assert any("optionals.json" in ev for ev in check.evidence)
+
+    def test_config_parse_healthy_when_all_valid(self, nexo_home):
+        (nexo_home / "config").mkdir(parents=True, exist_ok=True)
+        (nexo_home / "config" / "schedule.json").write_text('{"automation_enabled": true}')
+        (nexo_home / "config" / "optionals.json").write_text('{"automation": true}')
+        from doctor.providers.boot import check_config_parse
+        check = check_config_parse()
+        assert check.status == "healthy"
+        assert set(check.evidence) == {"schedule.json", "optionals.json", "crons/manifest.json"}
+
+    def test_core_dev_absent_on_packaged_install_is_healthy(self, nexo_home):
+        # Packaged layout: core/ exists, no src/, and core-dev/ is absent.
+        (nexo_home / "core").mkdir(parents=True, exist_ok=True)
+        from doctor.providers.boot import check_core_dev_packaged_install
+        check = check_core_dev_packaged_install()
+        assert check.status == "healthy"
+        assert check.id == "boot.core_dev_absent_on_packaged"
+
+    def test_core_dev_present_on_packaged_install_is_warn(self, nexo_home):
+        (nexo_home / "core").mkdir(parents=True, exist_ok=True)
+        core_dev = nexo_home / "core-dev"
+        (core_dev / "scripts").mkdir(parents=True, exist_ok=True)
+        (core_dev / "scripts" / "experimental.py").write_text("# dev leftover\n")
+        from doctor.providers.boot import check_core_dev_packaged_install
+        check = check_core_dev_packaged_install()
+        assert check.status == "degraded"
+        assert check.severity == "warn"
+        assert any(str(core_dev) in ev for ev in check.evidence)
+        assert any(f"rm -rf {core_dev}" in plan for plan in check.repair_plan)
+
+    def test_core_dev_present_on_dev_install_is_healthy(self, nexo_home):
+        # Dev layout: core/ exists AND src/ exists → core-dev/ is legitimate.
+        (nexo_home / "core").mkdir(parents=True, exist_ok=True)
+        (nexo_home / "src").mkdir(parents=True, exist_ok=True)
+        (nexo_home / "core-dev" / "scripts").mkdir(parents=True, exist_ok=True)
+        from doctor.providers.boot import check_core_dev_packaged_install
+        check = check_core_dev_packaged_install()
+        assert check.status == "healthy"
+        assert "dev install" in check.summary
+
+
+class TestRuntimeChecks:
+    def test_fresh_immune(self, nexo_home):
+        status = {
+            "counts": {"OK": 3, "WARN": 0, "FAIL": 0},
+            "checks": {"db": [1], "services": [1, 2]},
+        }
+        (nexo_home / "coordination" / "immune-status.json").write_text(json.dumps(status))
+        from doctor.providers.runtime import check_immune_status
+        check = check_immune_status()
+        assert check.status == "healthy"
+
+    def test_stale_immune_reuses_last_status_when_cron_is_alive(self, nexo_home):
+        status = {
+            "counts": {"OK": 3, "WARN": 0, "FAIL": 0},
+            "checks": {"db": [1], "services": [1, 2]},
+        }
+        status_path = nexo_home / "coordination" / "immune-status.json"
+        status_path.write_text(json.dumps(status))
+        old_time = time.time() - 7200
+        os.utime(str(status_path), (old_time, old_time))
+
+        conn = sqlite3.connect(str(nexo_home / "data" / "nexo.db"))
+        conn.execute(
+            "INSERT INTO cron_runs (cron_id, started_at) VALUES (?, datetime('now'))",
+            ("immune",),
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_immune_status
+
+        check = check_immune_status()
+        assert check.status == "healthy"
+        assert "reusing last reported status" in " ".join(check.evidence)
+
+    def test_stale_watchdog(self, nexo_home):
+        status_file = nexo_home / "operations" / "watchdog-status.json"
+        status_file.write_text(json.dumps({
+            "summary": {"total": 5, "pass": 5, "warn": 0, "fail": 0, "overall": "PASS"}
+        }))
+        # Make it old
+        old_time = time.time() - 7200
+        os.utime(str(status_file), (old_time, old_time))
+        from doctor.providers.runtime import check_watchdog_status
+        check = check_watchdog_status()
+        assert check.status == "degraded"
+
+    def test_watchdog_fail_is_critical(self, nexo_home):
+        status_file = nexo_home / "operations" / "watchdog-status.json"
+        status_file.write_text(json.dumps({
+            "summary": {"total": 5, "pass": 3, "warn": 1, "fail": 1, "overall": "FAIL"}
+        }))
+        from doctor.providers.runtime import check_watchdog_status
+        check = check_watchdog_status()
+        assert check.status == "critical"
+
+    def test_missing_watchdog(self, nexo_home):
+        from doctor.providers.runtime import check_watchdog_status
+        check = check_watchdog_status()
+        assert check.status == "degraded"
+
+    def test_state_watchers_summary_surfaces_critical(self, nexo_home):
+        conn = sqlite3.connect(str(nexo_home / "data" / "nexo.db"))
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS state_watchers (
+                watcher_id TEXT PRIMARY KEY,
+                watcher_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                target TEXT DEFAULT '',
+                severity TEXT NOT NULL DEFAULT 'warn',
+                status TEXT NOT NULL DEFAULT 'active',
+                config TEXT DEFAULT '{}',
+                last_health TEXT NOT NULL DEFAULT 'unknown',
+                last_result TEXT DEFAULT '{}',
+                last_checked_at TEXT DEFAULT '',
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO state_watchers (watcher_id, watcher_type, title, status) VALUES (?, ?, ?, 'active')",
+            ("SW-1", "expiry", "SSL cert"),
+        )
+        conn.commit()
+        conn.close()
+
+        (nexo_home / "operations" / "state-watchers-status.json").write_text(json.dumps({
+            "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "watcher_count": 1,
+            "counts": {"healthy": 0, "degraded": 0, "critical": 1, "unknown": 0},
+            "watchers": [{"watcher_id": "SW-1", "health": "critical"}],
+        }))
+
+        from doctor.providers.runtime import check_state_watchers
+        check = check_state_watchers()
+        assert check.status == "critical"
+
+    def test_stale_sessions_uses_last_update_epoch(self, nexo_home):
+        conn = sqlite3.connect(str(nexo_home / "data" / "nexo.db"))
+        conn.execute(
+            "INSERT INTO sessions (sid, task, started_epoch, last_update_epoch, local_time) VALUES (?, ?, ?, ?, ?)",
+            ("nexo-123-456", "audit", time.time() - 10800, time.time() - 10800, "10:00"),
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_stale_sessions
+        check = check_stale_sessions()
+        assert check.status == "degraded"
+
+    def test_cron_freshness_respects_daily_schedule(self, nexo_home):
+        conn = sqlite3.connect(str(nexo_home / "data" / "nexo.db"))
+        conn.execute(
+            "INSERT INTO cron_runs (cron_id, started_at, ended_at, exit_code) VALUES (?, ?, ?, ?)",
+            (
+                "self-audit",
+                time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 12 * 3600)),
+                time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 12 * 3600 + 60)),
+                0,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_cron_freshness
+        check = check_cron_freshness()
+        assert check.status == "healthy"
+
+    def test_cron_freshness_flags_stale_interval_cron(self, nexo_home):
+        conn = sqlite3.connect(str(nexo_home / "data" / "nexo.db"))
+        conn.execute(
+            "INSERT INTO cron_runs (cron_id, started_at, ended_at, exit_code) VALUES (?, ?, ?, ?)",
+            (
+                "watchdog",
+                time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 3 * 3600)),
+                time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 3 * 3600 + 60)),
+                0,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_cron_freshness
+        check = check_cron_freshness()
+        assert check.status == "degraded"
+
+    def test_cron_freshness_ignores_run_at_load_jobs(self, nexo_home):
+        (nexo_home / "crons" / "manifest.json").write_text(json.dumps({
+            "crons": [
+                {"id": "catchup", "run_at_load": True},
+            ]
+        }))
+
+        conn = sqlite3.connect(str(nexo_home / "data" / "nexo.db"))
+        conn.execute(
+            "INSERT INTO cron_runs (cron_id, started_at, ended_at, exit_code) VALUES (?, ?, ?, ?)",
+            (
+                "catchup",
+                time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 3 * 3600)),
+                time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 3 * 3600 + 60)),
+                0,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_cron_freshness
+        check = check_cron_freshness()
+        assert check.status == "healthy"
+
+    def test_cron_freshness_tracks_interval_jobs_even_if_run_at_load(self, nexo_home):
+        (nexo_home / "crons" / "manifest.json").write_text(json.dumps({
+            "crons": [
+                {"id": "catchup", "interval_seconds": 900, "run_at_load": True},
+            ]
+        }))
+
+        conn = sqlite3.connect(str(nexo_home / "data" / "nexo.db"))
+        conn.execute(
+            "INSERT INTO cron_runs (cron_id, started_at, ended_at, exit_code) VALUES (?, ?, ?, ?)",
+            (
+                "catchup",
+                time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 3 * 3600)),
+                time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 3 * 3600 + 60)),
+                0,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_cron_freshness
+        check = check_cron_freshness()
+        assert check.status == "degraded"
+
+    def test_cron_freshness_allows_recent_in_flight_interval_cron(self, nexo_home):
+        (nexo_home / "crons" / "manifest.json").write_text(json.dumps({
+            "crons": [
+                {"id": "catchup", "interval_seconds": 900, "run_at_load": True},
+            ]
+        }))
+
+        conn = sqlite3.connect(str(nexo_home / "data" / "nexo.db"))
+        conn.execute(
+            "INSERT INTO cron_runs (cron_id, started_at, ended_at, exit_code) VALUES (?, ?, NULL, NULL)",
+            ("catchup", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 50 * 60))),
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_cron_freshness
+        check = check_cron_freshness()
+        assert check.status == "healthy"
+
+    def test_cron_freshness_tracks_legacy_disabled_evolution(self, nexo_home):
+        (nexo_home / "crons" / "manifest.json").write_text(json.dumps({
+            "crons": [
+                {"id": "evolution", "schedule": {"hour": 5, "minute": 0, "weekday": 0}},
+            ]
+        }))
+        (nexo_home / "brain").mkdir(parents=True, exist_ok=True)
+        (nexo_home / "brain" / "evolution-objective.json").write_text(json.dumps({
+            "evolution_enabled": False,
+            "disabled_by": "desktop_product",
+        }))
+
+        conn = sqlite3.connect(str(nexo_home / "data" / "nexo.db"))
+        conn.execute(
+            "INSERT INTO cron_runs (cron_id, started_at, ended_at, exit_code) VALUES (?, ?, ?, ?)",
+            (
+                "evolution",
+                time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 11 * 86400)),
+                time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 11 * 86400 + 60)),
+                0,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_cron_freshness
+        check = check_cron_freshness()
+        assert check.status == "degraded"
+        assert any("evolution:" in item for item in check.evidence)
+
+    def test_launchagent_integrity_detects_tmp_drift(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        plist_path = nexo_home / "com.nexo.deep-sleep.plist"
+        with plist_path.open("wb") as fh:
+            plistlib.dump({
+                "EnvironmentVariables": {
+                    "NEXO_HOME": str(nexo_home),
+                    "NEXO_CODE": str(nexo_home / "src"),
+                },
+                "StartInterval": 1800,
+            }, fh)
+
+        monkeypatch.setattr(runtime.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(runtime, "_managed_launchagent_plists", lambda: [("deep-sleep", plist_path)])
+        monkeypatch.setattr(runtime.os, "getuid", lambda: 501)
+
+        def fake_run(args, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "gui/501/com.nexo.deep-sleep = {\n"
+                    "path = /private/tmp/nexo-audit-install-XYZ/Library/LaunchAgents/com.nexo.deep-sleep.plist\n"
+                    "NEXO_HOME => /tmp/nexo-audit-install-XYZ/.nexo\n"
+                    "NEXO_CODE => /tmp/nexo-audit-install-XYZ/.nexo\n"
+                    "}\n"
+                ),
+                stderr="",
+            )
+
+        monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+        check = runtime.check_launchagent_integrity()
+        assert check.status == "critical"
+        assert any("/private/tmp/" in item or "/tmp/" in item for item in check.evidence)
+
+    def test_launchagent_integrity_detects_schedule_drift(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        plist_path = nexo_home / "com.nexo.catchup.plist"
+        with plist_path.open("wb") as fh:
+            plistlib.dump({
+                "EnvironmentVariables": {
+                    "NEXO_HOME": str(nexo_home),
+                    "NEXO_CODE": str(nexo_home / "src"),
+                },
+                "StartCalendarInterval": {"Hour": 8, "Minute": 30},
+            }, fh)
+
+        monkeypatch.setattr(runtime.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(runtime, "_managed_launchagent_plists", lambda: [("catchup", plist_path)])
+        monkeypatch.setattr(runtime, "_launchagent_schedule_expectations", lambda: {
+            "catchup": {
+                "StartInterval": None,
+                "StartCalendarInterval": None,
+                "RunAtLoad": True,
+                "schedule_configured": True,
+            }
+        })
+        monkeypatch.setattr(runtime.os, "getuid", lambda: 501)
+
+        def fake_run(args, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "gui/501/com.nexo.catchup = {\n"
+                    f"path = {plist_path}\n"
+                    f"NEXO_HOME => {nexo_home}\n"
+                    f"NEXO_CODE => {nexo_home / 'src'}\n"
+                    "}\n"
+                ),
+                stderr="",
+            )
+
+        monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+        check = runtime.check_launchagent_integrity()
+        assert check.status == "degraded"
+        assert any("schedule drift" in item for item in check.evidence)
+
+    def test_launchagent_integrity_detects_tcc_risk_from_protected_paths(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        plist_path = nexo_home / "com.nexo.deep-sleep.plist"
+        protected_code = "/Users/tester/Documents/nexo/src"
+        with plist_path.open("wb") as fh:
+            plistlib.dump({
+                "EnvironmentVariables": {
+                    "NEXO_HOME": str(nexo_home),
+                    "NEXO_CODE": protected_code,
+                },
+                "ProgramArguments": ["/bin/bash", str(nexo_home / "scripts" / "nexo-cron-wrapper.sh"), "deep-sleep", "/bin/bash", protected_code + "/scripts/nexo-deep-sleep.sh"],
+                "StartCalendarInterval": {"Hour": 4, "Minute": 30},
+            }, fh)
+
+        monkeypatch.setattr(runtime.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(runtime, "_managed_launchagent_plists", lambda: [("deep-sleep", plist_path)])
+        monkeypatch.setattr(runtime, "_recent_permission_denial", lambda cron_id: cron_id == "deep-sleep")
+        monkeypatch.setattr(runtime.os, "getuid", lambda: 501)
+        monkeypatch.setattr(runtime, "PROTECTED_MACOS_ROOTS", (Path("/Users/tester/Documents"),))
+
+        def fake_run(args, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "gui/501/com.nexo.deep-sleep = {\n"
+                    f"path = {plist_path}\n"
+                    f"NEXO_HOME => {nexo_home}\n"
+                    f"NEXO_CODE => {protected_code}\n"
+                    "}\n"
+                ),
+                stderr="",
+            )
+
+        monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+        check = runtime.check_launchagent_integrity()
+        assert check.status == "critical"
+        assert any("Operation not permitted" in item for item in check.evidence)
+
+    def test_managed_launchagents_include_run_at_load_jobs(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        launch_agents = nexo_home / "launchagents"
+        launch_agents.mkdir()
+        (launch_agents / "com.nexo.catchup.plist").write_text("<plist/>")
+
+        monkeypatch.setattr(runtime, "LAUNCH_AGENTS_DIR", launch_agents)
+        monkeypatch.setattr(runtime, "_launchagent_schedule_expectations", lambda: {
+            "catchup": {
+                "StartInterval": None,
+                "StartCalendarInterval": None,
+                "RunAtLoad": True,
+                "schedule_configured": True,
+            }
+        })
+        managed = runtime._managed_launchagent_plists()
+        assert ("catchup", launch_agents / "com.nexo.catchup.plist") in managed
+
+    def test_managed_launchagents_include_manifest_managed_keep_alive_services(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        launch_agents = nexo_home / "launchagents"
+        launch_agents.mkdir()
+        (launch_agents / "com.nexo.dashboard.plist").write_text("<plist/>")
+
+        monkeypatch.setattr(runtime, "LAUNCH_AGENTS_DIR", launch_agents)
+        monkeypatch.setattr(runtime, "_launchagent_schedule_expectations", lambda: {
+            "dashboard": {
+                "StartInterval": None,
+                "StartCalendarInterval": None,
+                "RunAtLoad": True,
+                "KeepAlive": True,
+                "WatchPaths": None,
+                "schedule_configured": True,
+            }
+        })
+
+        managed = runtime._managed_launchagent_plists()
+        assert ("dashboard", launch_agents / "com.nexo.dashboard.plist") in managed
+
+    def test_launchagent_expectations_skip_disabled_optional_jobs(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        (nexo_home / "config").mkdir(parents=True, exist_ok=True)
+        (nexo_home / "config" / "optionals.json").write_text('{"autonomy": false}')
+        (nexo_home / "crons" / "manifest.json").write_text(json.dumps({
+            "crons": [
+                {"id": "watchdog", "interval_seconds": 1800, "core": True},
+                {"id": "autonomy-daemon", "keep_alive": True, "optional": "autonomy", "core": True},
+            ]
+        }))
+
+        monkeypatch.setenv("NEXO_HOME", str(nexo_home))
+
+
+        monkeypatch.setenv("NEXO_HOME", str(nexo_home))
+
+
+        monkeypatch.setenv("NEXO_HOME", str(nexo_home))
+
+
+        monkeypatch.setenv("NEXO_HOME", str(nexo_home))
+
+
+        monkeypatch.setenv("NEXO_HOME", str(nexo_home))
+
+
+        monkeypatch.setenv("NEXO_HOME", str(nexo_home))
+        monkeypatch.setattr(runtime, "NEXO_HOME", nexo_home)
+        monkeypatch.setattr(runtime, "OPTIONALS_FILE", nexo_home / "config" / "optionals.json")
+
+        expectations = runtime._launchagent_schedule_expectations()
+        assert "watchdog" in expectations
+        assert "autonomy-daemon" not in expectations
+
+    def test_launchagent_expectations_resolve_machine_staggered_weekly_schedule(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        (nexo_home / "config").mkdir(parents=True, exist_ok=True)
+        (nexo_home / "config" / "optionals.json").write_text("{}")
+        (nexo_home / "crons").mkdir(parents=True, exist_ok=True)
+        (nexo_home / "crons" / "manifest.json").write_text(json.dumps({
+            "crons": [
+                {
+                    "id": "evolution",
+                    "core": True,
+                    "schedule": {"hour": 5, "minute": 0, "weekday": 0},
+                    "schedule_strategy": "machine_weekly_spread",
+                }
+            ]
+        }))
+
+        monkeypatch.setenv("NEXO_HOME", str(nexo_home))
+        monkeypatch.setattr(runtime, "NEXO_HOME", nexo_home)
+        monkeypatch.setattr(runtime, "OPTIONALS_FILE", nexo_home / "config" / "optionals.json")
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", nexo_home / "config" / "schedule.json")
+        monkeypatch.setattr(
+            runtime,
+            "resolve_declared_schedule",
+            lambda cron: {"weekday": 3, "hour": 3, "minute": 33},
+        )
+
+        expectations = runtime._launchagent_schedule_expectations()
+        assert expectations["evolution"]["StartCalendarInterval"] == {
+            "Hour": 3,
+            "Minute": 33,
+            "Weekday": 3,
+        }
+
+    def test_launchagent_expectations_preserve_declared_weekly_schedule(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        (nexo_home / "config").mkdir(parents=True, exist_ok=True)
+        (nexo_home / "config" / "optionals.json").write_text("{}")
+        (nexo_home / "crons").mkdir(parents=True, exist_ok=True)
+        (nexo_home / "crons" / "manifest.json").write_text(json.dumps({
+            "crons": [
+                {
+                    "id": "followup-hygiene",
+                    "core": True,
+                    "schedule": {"hour": 5, "minute": 0, "weekday": 0},
+                }
+            ]
+        }))
+
+        monkeypatch.setenv("NEXO_HOME", str(nexo_home))
+        monkeypatch.setattr(runtime, "NEXO_HOME", nexo_home)
+        monkeypatch.setattr(runtime, "OPTIONALS_FILE", nexo_home / "config" / "optionals.json")
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", nexo_home / "config" / "schedule.json")
+
+        expectations = runtime._launchagent_schedule_expectations()
+        assert expectations["followup-hygiene"]["StartCalendarInterval"] == {
+            "Hour": 5,
+            "Minute": 0,
+            "Weekday": 0,
+        }
+
+    def test_launchagent_expectations_support_multiple_weekdays(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        (nexo_home / "config").mkdir(parents=True, exist_ok=True)
+        (nexo_home / "config" / "optionals.json").write_text("{}")
+        (nexo_home / "crons").mkdir(parents=True, exist_ok=True)
+        (nexo_home / "crons" / "manifest.json").write_text(json.dumps({
+            "crons": [
+                {
+                    "id": "morning-agent",
+                    "core": True,
+                    "schedule": {"hour": 7, "minute": 0, "weekdays": [2, 6]},
+                }
+            ]
+        }))
+
+        monkeypatch.setenv("NEXO_HOME", str(nexo_home))
+        monkeypatch.setattr(runtime, "NEXO_HOME", nexo_home)
+        monkeypatch.setattr(runtime, "OPTIONALS_FILE", nexo_home / "config" / "optionals.json")
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", nexo_home / "config" / "schedule.json")
+
+        expectations = runtime._launchagent_schedule_expectations()
+        assert expectations["morning-agent"]["StartCalendarInterval"] == [
+            {"Hour": 7, "Minute": 0, "Weekday": 2},
+            {"Hour": 7, "Minute": 0, "Weekday": 6},
+        ]
+
+    def test_launchagent_expectations_include_watch_paths(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        (nexo_home / "config").mkdir(parents=True, exist_ok=True)
+        (nexo_home / "config" / "optionals.json").write_text("{}")
+        (nexo_home / "crons").mkdir(parents=True, exist_ok=True)
+        (nexo_home / "crons" / "manifest.json").write_text(json.dumps({
+            "crons": [
+                {
+                    "id": "tcc-approve",
+                    "type": "shell",
+                    "run_at_load": True,
+                    "platforms": ["darwin"],
+                    "watch_paths": ["~/.local/share/claude/versions"],
+                }
+            ]
+        }))
+
+        monkeypatch.setenv("NEXO_HOME", str(nexo_home))
+        monkeypatch.setenv("NEXO_PLATFORM", "Darwin")
+        monkeypatch.setattr(runtime, "NEXO_HOME", nexo_home)
+        monkeypatch.setattr(runtime, "OPTIONALS_FILE", nexo_home / "config" / "optionals.json")
+
+        expectations = runtime._launchagent_schedule_expectations()
+        assert expectations["tcc-approve"]["RunAtLoad"] is True
+        assert expectations["tcc-approve"]["WatchPaths"] == [str(Path.home() / ".local" / "share" / "claude" / "versions")]
+
+    def test_launchagent_integrity_detects_keepalive_schedule_drift(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        plist_path = nexo_home / "com.nexo.personal-daemon.plist"
+        with plist_path.open("wb") as fh:
+            plistlib.dump({
+                "EnvironmentVariables": {
+                    "NEXO_HOME": str(nexo_home),
+                    "NEXO_CODE": str(nexo_home),
+                },
+                "RunAtLoad": True,
+            }, fh)
+
+        monkeypatch.setattr(runtime.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(runtime, "_managed_launchagent_plists", lambda: [("personal-daemon", plist_path)])
+        monkeypatch.setattr(runtime, "_launchagent_schedule_expectations", lambda: {
+            "personal-daemon": {
+                "StartInterval": None,
+                "StartCalendarInterval": None,
+                "RunAtLoad": True,
+                "KeepAlive": True,
+                "schedule_configured": True,
+            }
+        })
+        monkeypatch.setattr(runtime.os, "getuid", lambda: 501)
+
+        def fake_run(args, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "gui/501/com.nexo.personal-daemon = {\n"
+                    f"path = {plist_path}\n"
+                    f"NEXO_HOME => {nexo_home}\n"
+                    f"NEXO_CODE => {nexo_home}\n"
+                    "}\n"
+                ),
+                stderr="",
+            )
+
+        monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+        check = runtime.check_launchagent_integrity()
+        assert check.status == "degraded"
+        assert any("KeepAlive" in item for item in check.evidence)
+
+    def test_cron_freshness_ignores_personal_crons(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        (nexo_home / "config").mkdir(parents=True, exist_ok=True)
+        (nexo_home / "config" / "optionals.json").write_text("{}")
+        (nexo_home / "crons" / "manifest.json").write_text(json.dumps({
+            "crons": [
+                {"id": "watchdog", "interval_seconds": 1800, "core": True},
+            ]
+        }))
+
+        conn = sqlite3.connect(str(nexo_home / "data" / "nexo.db"))
+        conn.execute(
+            "INSERT INTO cron_runs (cron_id, started_at) VALUES (?, ?)",
+            ("watchdog", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 600))),
+        )
+        conn.execute(
+            "INSERT INTO cron_runs (cron_id, started_at) VALUES (?, ?)",
+            ("personal-backup", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 12 * 3600))),
+        )
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setenv("NEXO_HOME", str(nexo_home))
+        monkeypatch.setattr(runtime, "NEXO_HOME", nexo_home)
+        monkeypatch.setattr(runtime, "OPTIONALS_FILE", nexo_home / "config" / "optionals.json")
+
+        check = runtime.check_cron_freshness()
+        assert check.status == "healthy"
+
+    def test_personal_script_registry_summary_includes_keep_alive_runtime(self, nexo_home, monkeypatch):
+        import db
+        import script_registry
+        from doctor.providers import runtime
+
+        monkeypatch.setattr(db, "init_db", lambda: None)
+        monkeypatch.setattr(script_registry, "sync_personal_scripts", lambda prune_missing=True: {"ok": True})
+        monkeypatch.setattr(
+            db,
+            "get_personal_script_health_report",
+            lambda fix=False: {
+                "scripts": 1,
+                "schedules": 1,
+                "issues": [],
+                "schedule_audit": {
+                    "summary": {
+                        "healthy": 1,
+                        "keep_alive": 1,
+                        "runtime_alive": 1,
+                    }
+                },
+            },
+        )
+
+        check = runtime.check_personal_script_registry()
+        assert check.status == "healthy"
+        assert "keep_alive 1/1 alive" in check.summary
+
+    def test_personal_script_registry_degrades_on_keep_alive_runtime_issue(self, nexo_home, monkeypatch):
+        import db
+        import script_registry
+        from doctor.providers import runtime
+
+        monkeypatch.setattr(db, "init_db", lambda: None)
+        monkeypatch.setattr(script_registry, "sync_personal_scripts", lambda prune_missing=True: {"ok": True})
+        monkeypatch.setattr(
+            db,
+            "get_personal_script_health_report",
+            lambda fix=False: {
+                "scripts": 1,
+                "schedules": 1,
+                "issues": [
+                    {"severity": "warn", "message": "keep_alive runtime wake-recovery: keep_alive service not loaded"},
+                ],
+                "schedule_audit": {"summary": {"healthy": 1, "keep_alive": 1, "runtime_stale": 1}},
+            },
+        )
+
+        check = runtime.check_personal_script_registry()
+        assert check.status == "degraded"
+        assert "keep_alive runtime wake-recovery" in check.evidence[0]
+
+    def test_launchagent_inventory_accepts_auxiliary_and_personal_labels(self, nexo_home, monkeypatch):
+        import db
+        import script_registry
+        from doctor.providers import runtime
+
+        launch_agents = nexo_home / "launchagents"
+        launch_agents.mkdir()
+        (launch_agents / "com.nexo.backup.plist").write_text("<plist/>")
+        (launch_agents / "com.nexo.dashboard.plist").write_text("<plist/>")
+        (launch_agents / "com.nexo.email-monitor.plist").write_text("<plist/>")
+
+        monkeypatch.setattr(runtime, "LAUNCH_AGENTS_DIR", launch_agents)
+        monkeypatch.setattr(runtime.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(runtime, "_launchagent_schedule_expectations", lambda: {
+            "backup": {"schedule_configured": True},
+            "dashboard": {"schedule_configured": True},
+        })
+        monkeypatch.setattr(db, "init_db", lambda: None)
+        monkeypatch.setattr(script_registry, "sync_personal_scripts", lambda prune_missing=True: {"ok": True})
+        monkeypatch.setattr(
+            db,
+            "list_personal_script_schedules",
+            lambda: [{"cron_id": "email-monitor"}],
+        )
+
+        def fake_run(args, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout="123\t0\tcom.nexo.backup\n124\t0\tcom.nexo.dashboard\n125\t0\tcom.nexo.email-monitor\n",
+                stderr="",
+            )
+
+        monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+        check = runtime.check_launchagent_inventory()
+        assert check.status == "healthy"
+
+    def test_launchagent_inventory_syncs_personal_scripts_before_known_ids(self, nexo_home, monkeypatch):
+        import db
+        import script_registry
+        from doctor.providers import runtime
+
+        launch_agents = nexo_home / "launchagents"
+        launch_agents.mkdir()
+        (launch_agents / "com.nexo.email-monitor.plist").write_text("<plist/>")
+
+        synced = {"done": False}
+
+        def fake_sync(prune_missing=True):
+            synced["done"] = True
+            return {"ok": True}
+
+        monkeypatch.setattr(runtime, "LAUNCH_AGENTS_DIR", launch_agents)
+        monkeypatch.setattr(runtime.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(runtime, "_launchagent_schedule_expectations", lambda: {})
+        monkeypatch.setattr(db, "init_db", lambda: None)
+        monkeypatch.setattr(script_registry, "sync_personal_scripts", fake_sync)
+        monkeypatch.setattr(
+            db,
+            "list_personal_script_schedules",
+            lambda: [{"cron_id": "email-monitor"}] if synced["done"] else [],
+        )
+        monkeypatch.setattr(
+            runtime.subprocess,
+            "run",
+            lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        check = runtime.check_launchagent_inventory()
+        assert synced["done"] is True
+        assert check.status == "healthy"
+
+    def test_launchagent_inventory_warns_on_unknown_label(self, nexo_home, monkeypatch):
+        import db
+        import script_registry
+        from doctor.providers import runtime
+
+        launch_agents = nexo_home / "launchagents"
+        launch_agents.mkdir()
+        (launch_agents / "com.nexo.legacy-shadow.plist").write_text("<plist/>")
+
+        monkeypatch.setattr(runtime, "LAUNCH_AGENTS_DIR", launch_agents)
+        monkeypatch.setattr(runtime.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(runtime, "_launchagent_schedule_expectations", lambda: {})
+        monkeypatch.setattr(db, "init_db", lambda: None)
+        monkeypatch.setattr(script_registry, "sync_personal_scripts", lambda prune_missing=True: {"ok": True})
+        monkeypatch.setattr(db, "list_personal_script_schedules", lambda: [])
+        monkeypatch.setattr(
+            runtime.subprocess,
+            "run",
+            lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        check = runtime.check_launchagent_inventory()
+        assert check.status == "degraded"
+        assert "legacy-shadow" in check.evidence[0]
+
+    def test_client_backend_preferences_warns_when_selected_client_missing(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": True,
+            "automation_backend": "codex",
+        }))
+
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime, "detect_installed_clients", lambda user_home=None: {
+            "claude_code": {"installed": True},
+            "codex": {"installed": False},
+            "claude_desktop": {"installed": False},
+        })
+
+        check = runtime.check_client_backend_preferences()
+
+        assert check.status == "degraded"
+        assert any("default terminal client `codex`" in item for item in check.evidence)
+        assert any("automation backend `codex`" in item for item in check.evidence)
+
+    def test_client_backend_preferences_fix_installs_selected_claude(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+        import client_sync
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": True,
+                "codex": False,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "claude_code",
+            "automation_enabled": True,
+            "automation_backend": "claude_code",
+        }))
+
+        install_state = {"installed": False}
+        sync_kwargs = {}
+
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+
+        def fake_detect(user_home=None):
+            return {
+                "claude_code": {"installed": install_state["installed"]},
+                "codex": {"installed": False},
+                "claude_desktop": {"installed": False},
+            }
+
+        def fake_sync_all_clients(**kwargs):
+            sync_kwargs.update(kwargs)
+            install_state["installed"] = True
+            return {
+                "ok": True,
+                "install_results": {"claude_code": {"ok": True, "action": "installed"}},
+                "clients": {},
+            }
+
+        monkeypatch.setattr(runtime, "detect_installed_clients", fake_detect)
+        monkeypatch.setattr(client_sync, "sync_all_clients", fake_sync_all_clients)
+
+        check = runtime.check_client_backend_preferences(fix=True)
+
+        assert check.status == "healthy"
+        assert check.fixed is True
+        assert sync_kwargs["auto_install_missing_claude"] is True
+
+    def test_client_backend_preferences_flags_missing_desktop_managed_claude_runtime(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": False,
+            "automation_backend": "none",
+        }))
+
+        managed_prefix = nexo_home / "runtime" / "bootstrap" / "npm-global"
+
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+        monkeypatch.setattr(runtime, "detect_installed_clients", lambda user_home=None: {
+            "claude_code": {"installed": False, "path": ""},
+            "codex": {"installed": True, "path": "/tmp/fake-codex"},
+            "claude_desktop": {"installed": False, "path": ""},
+        })
+        monkeypatch.setattr(runtime, "_desktop_product_requested", lambda home=None: True)
+        monkeypatch.setattr(runtime, "_managed_claude_binary", lambda home=None: "")
+        monkeypatch.setattr(runtime, "_managed_claude_prefix", lambda home=None: managed_prefix)
+
+        check = runtime.check_client_backend_preferences()
+
+        assert check.status == "critical"
+        assert any("desktop-managed Claude runtime missing or drifted" in item for item in check.evidence)
+        assert any("npm-global" in item for item in check.repair_plan)
+
+    def test_packaged_update_npm_toolchain_reports_repaired_wrappers(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+        from plugins import update
+
+        monkeypatch.setattr(update, "packaged_npm_toolchain_status", lambda repair=False: {
+            "ok": True,
+            "cmd": ["npm"],
+            "env": {},
+            "attempts": [{"cmd": ["npm"], "ok": True}],
+            "repaired": ["npm", "npx"] if repair else [],
+        })
+
+        check = runtime.check_packaged_update_npm_toolchain(fix=True)
+
+        assert check.status == "healthy"
+        assert check.fixed is True
+        assert "repaired wrappers: npm, npx" in check.summary
+
+    def test_personal_automation_health_warns_without_observable_contract(self, nexo_home):
+        from doctor.providers import runtime
+
+        scripts_dir = nexo_home / "personal" / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / "ps-weekly-shopify-health.sh").write_text(
+            "#!/bin/sh\n"
+            "# nexo: name=weekly-shopify-health\n"
+            "# nexo: runtime=shell\n"
+            "# nexo: schedule_required=true\n"
+            "# nexo: interval_seconds=3600\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+
+        check = runtime.check_personal_automation_health_contracts()
+
+        assert check.status == "degraded"
+        assert any("no health_file contract" in item for item in check.evidence)
+
+    def test_client_bootstrap_parity_warns_when_codex_bootstrap_missing(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": False,
+            "automation_backend": "none",
+        }))
+
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime, "detect_installed_clients", lambda user_home=None: {
+            "claude_code": {"installed": True},
+            "codex": {"installed": True},
+            "claude_desktop": {"installed": False},
+        })
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+
+        check = runtime.check_client_bootstrap_parity()
+        assert check.status == "degraded"
+        assert any("bootstrap missing" in item for item in check.evidence)
+
+    def test_client_bootstrap_parity_warns_when_codex_mcp_config_missing(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": False,
+            "automation_backend": "none",
+        }))
+        codex_home = nexo_home / ".codex"
+        codex_home.mkdir(parents=True, exist_ok=True)
+        (codex_home / "AGENTS.md").write_text(
+            "<!-- nexo-codex-agents-version: 1.1.0 -->\n"
+            "******CORE******\n<!-- nexo:core:start -->\ncore\n<!-- nexo:core:end -->\n"
+            "******USER******\n<!-- nexo:user:start -->\nuser\n<!-- nexo:user:end -->\n"
+        )
+        (codex_home / "config.toml").write_text(
+            'initial_messages = [{ role = "system", content = "NEXO" }]\n\n'
+            '[nexo.codex]\n'
+            'bootstrap_managed = true\n'
+        )
+
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime, "detect_installed_clients", lambda user_home=None: {
+            "claude_code": {"installed": True},
+            "codex": {"installed": True},
+            "claude_desktop": {"installed": False},
+        })
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+
+        check = runtime.check_client_bootstrap_parity()
+        assert check.status == "degraded"
+        assert any("mcp_servers.nexo" in item for item in check.evidence)
+
+    def test_client_bootstrap_parity_warns_when_codex_initial_messages_remain(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": False,
+            "automation_backend": "none",
+        }))
+        codex_home = nexo_home / ".codex"
+        codex_home.mkdir(parents=True, exist_ok=True)
+        (codex_home / "AGENTS.md").write_text(
+            "<!-- nexo-codex-agents-version: 1.1.0 -->\n"
+            "******CORE******\n<!-- nexo:core:start -->\ncore\n<!-- nexo:core:end -->\n"
+            "******USER******\n<!-- nexo:user:start -->\nuser\n<!-- nexo:user:end -->\n"
+        )
+        (codex_home / "config.toml").write_text(
+            'initial_messages = [{ role = "system", content = "NEXO" }]\n\n'
+            '[nexo.codex]\n'
+            'bootstrap_managed = true\n'
+            'mcp_managed = true\n\n'
+            '[mcp_servers.nexo]\n'
+            'command = "python3"\n'
+            'args = ["-m", "src.server"]\n'
+        )
+        (codex_home / "hooks.json").write_text(json.dumps({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "*",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "python3 -m src.hooks.pre_tool_use",
+                            }
+                        ],
+                    }
+                ]
+            }
+        }))
+
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime, "detect_installed_clients", lambda user_home=None: {
+            "claude_code": {"installed": True},
+            "codex": {"installed": True},
+            "claude_desktop": {"installed": False},
+        })
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+
+        check = runtime.check_client_bootstrap_parity()
+        assert check.status == "degraded"
+        assert any("legacy `initial_messages`" in item for item in check.evidence)
+
+    def test_protocol_compliance_uses_latest_weekly_summary(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        summary_dir = nexo_home / "operations" / "deep-sleep"
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        (summary_dir / "2026-W14-weekly-summary.json").write_text(json.dumps({
+            "label": "2026-W14",
+            "protocol_summary": {
+                "overall_compliance_pct": 41.2,
+                "guard_check": {"required": 12, "executed": 3, "compliance_pct": 25.0},
+                "heartbeat": {"total": 20, "with_context": 10, "compliance_pct": 50.0},
+                "change_log": {"edits": 11, "logged": 4, "compliance_pct": 36.4},
+            },
+        }))
+
+        monkeypatch.setenv("NEXO_HOME", str(nexo_home))
+        monkeypatch.setattr(runtime, "NEXO_HOME", nexo_home)
+        check = runtime.check_protocol_compliance()
+
+        assert check.status == "critical"
+        assert any("41.2%" in item for item in check.evidence)
+        assert any("guard_check" in item for item in check.evidence)
+
+    def test_release_artifact_sync_detects_version_mismatch(self, nexo_home, monkeypatch, tmp_path):
+        from doctor.providers import runtime
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "scripts").mkdir()
+        (repo / "package.json").write_text(json.dumps({"version": "2.7.0"}))
+        (repo / "CHANGELOG.md").write_text("## [2.6.21] - 2026-04-05\n")
+        sync_script = repo / "scripts" / "sync_release_artifacts.py"
+        sync_script.write_text(textwrap.dedent("""\
+            import sys
+            if __name__ == "__main__":
+                print("[sync-release-artifacts] OK")
+                raise SystemExit(0)
+        """))
+
+        monkeypatch.setattr(runtime, "NEXO_CODE", repo)
+        monkeypatch.setattr(runtime, "PACKAGE_JSON", repo / "package.json")
+        monkeypatch.setattr(runtime, "CHANGELOG_FILE", repo / "CHANGELOG.md")
+
+        check = runtime.check_release_artifact_sync()
+
+        assert check.status == "critical"
+        assert any("version mismatch" in item for item in check.evidence)
+
+    def test_release_artifact_sync_uses_repo_root_when_nexo_code_points_to_src(self, nexo_home, monkeypatch, tmp_path):
+        from doctor.providers import runtime
+
+        repo = tmp_path / "repo"
+        src_root = repo / "src"
+        src_root.mkdir(parents=True)
+        (repo / "scripts").mkdir()
+        (repo / "package.json").write_text(json.dumps({"version": "3.0.0"}))
+        (repo / "CHANGELOG.md").write_text("## [3.0.0] - 2026-04-06\n")
+        sync_script = repo / "scripts" / "sync_release_artifacts.py"
+        sync_script.write_text(textwrap.dedent("""\
+            import sys
+            if __name__ == "__main__":
+                print("[sync-release-artifacts] OK")
+                raise SystemExit(0)
+        """))
+
+        monkeypatch.setattr(runtime, "NEXO_CODE", src_root)
+        monkeypatch.setattr(runtime, "PACKAGE_JSON", src_root / "package.json")
+        monkeypatch.setattr(runtime, "CHANGELOG_FILE", src_root / "CHANGELOG.md")
+
+        check = runtime.check_release_artifact_sync()
+
+        assert check.status == "healthy"
+        assert any("package version: 3.0.0" in item for item in check.evidence)
+        assert any("release artifacts in sync" in item for item in check.evidence)
+
+    def test_release_artifact_sync_uses_recorded_source_repo_for_installed_runtime(self, nexo_home, monkeypatch, tmp_path):
+        from doctor.providers import runtime
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "scripts").mkdir()
+        (repo / "package.json").write_text(json.dumps({"version": "3.0.0"}))
+        (repo / "CHANGELOG.md").write_text("## [3.0.0] - 2026-04-06\n")
+        (repo / "scripts" / "sync_release_artifacts.py").write_text(textwrap.dedent("""\
+            import sys
+            if __name__ == "__main__":
+                print("[sync-release-artifacts] OK")
+                raise SystemExit(0)
+        """))
+
+        runtime_home = tmp_path / "runtime"
+        runtime_home.mkdir()
+        (runtime_home / "version.json").write_text(json.dumps({"version": "3.0.0", "source": str(repo)}))
+
+        monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+
+
+        monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+
+
+        monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+
+
+        monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+
+
+        monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+        monkeypatch.setattr(runtime, "NEXO_HOME", runtime_home)
+        monkeypatch.setattr(runtime, "NEXO_CODE", runtime_home)
+        monkeypatch.setattr(runtime, "PACKAGE_JSON", runtime_home / "package.json")
+        monkeypatch.setattr(runtime, "CHANGELOG_FILE", runtime_home / "CHANGELOG.md")
+
+        check = runtime.check_release_artifact_sync()
+
+        assert check.status == "healthy"
+        assert any("release artifacts in sync" in item for item in check.evidence)
+
+    def test_release_artifact_sync_skips_packaged_runtime_without_source_repo(self, nexo_home, monkeypatch, tmp_path):
+        from doctor.providers import runtime
+
+        runtime_home = tmp_path / "runtime"
+        runtime_home.mkdir()
+        (runtime_home / "version.json").write_text(json.dumps({"version": "5.3.0"}))
+
+        monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+        monkeypatch.setattr(runtime, "NEXO_HOME", runtime_home)
+        monkeypatch.setattr(runtime, "NEXO_CODE", runtime_home)
+        monkeypatch.setattr(runtime, "PACKAGE_JSON", runtime_home / "package.json")
+        monkeypatch.setattr(runtime, "CHANGELOG_FILE", runtime_home / "CHANGELOG.md")
+
+        check = runtime.check_release_artifact_sync()
+
+        assert check.status == "healthy"
+        assert "packaged runtime" in check.summary.lower()
+        assert any("audit skipped" in item for item in check.evidence)
+
+    def test_release_trace_hygiene_flags_stale_audit_artifacts(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        db_path = nexo_home / "data" / "nexo.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """CREATE TABLE workflow_goals (
+                goal_id TEXT PRIMARY KEY,
+                session_id TEXT,
+                title TEXT,
+                objective TEXT,
+                parent_goal_id TEXT,
+                status TEXT,
+                priority TEXT,
+                owner TEXT,
+                next_action TEXT,
+                success_signal TEXT,
+                shared_state TEXT,
+                blocker_reason TEXT,
+                opened_at TEXT,
+                updated_at TEXT,
+                closed_at TEXT
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE workflow_runs (
+                run_id TEXT PRIMARY KEY,
+                session_id TEXT,
+                goal_id TEXT,
+                goal TEXT,
+                workflow_kind TEXT,
+                status TEXT,
+                updated_at TEXT
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO workflow_goals (
+                goal_id, session_id, title, objective, parent_goal_id, status, priority, owner,
+                next_action, success_signal, shared_state, blocker_reason, opened_at, updated_at, closed_at
+            ) VALUES (
+                'WG-AUDIT-12345678', '', 'NEXO-AUDIT stale goal', '', '', 'active', 'high', 'system:self-audit',
+                'Convert the recurring theme into an explicit workflow or close it as intentional noise.',
+                '', '{}', '', datetime('now', '-2 days'), datetime('now', '-2 days'), NULL
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO workflow_runs (
+                run_id, session_id, goal_id, goal, workflow_kind, status, updated_at
+            ) VALUES (
+                'WF-STALE-1', '', '', 'Ejecutar Fase 4...', 'audit-phase', 'open', datetime('now', '-8 hours')
+            )"""
+        )
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setenv("NEXO_HOME", str(nexo_home))
+        monkeypatch.setattr(runtime, "NEXO_HOME", nexo_home)
+        check = runtime.check_release_trace_hygiene()
+
+        assert check.status == "degraded"
+        assert check.category == "operator_history"
+        assert any("WF-STALE-1" in item for item in check.evidence)
+        assert any("WG-AUDIT-12345678" in item for item in check.evidence)
+
+    def test_release_trace_hygiene_is_filtered_from_installation_live(self, nexo_home, monkeypatch):
+        from doctor.models import DoctorCheck
+        from doctor.providers import runtime
+
+        checks = runtime._filter_runtime_checks_for_plane([
+            DoctorCheck(
+                id="runtime.release_trace_hygiene",
+                tier="runtime",
+                status="degraded",
+                severity="warn",
+                summary="Release trace hygiene needs cleanup",
+                category="operator_history",
+            ),
+            DoctorCheck(
+                id="runtime.launchagents",
+                tier="runtime",
+                status="healthy",
+                severity="info",
+                summary="LaunchAgents aligned",
+            ),
+        ], plane="installation_live")
+
+        assert [check.id for check in checks] == ["runtime.launchagents"]
+
+    def test_transcript_source_parity_warns_when_codex_selected_without_sessions(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": True,
+            "automation_backend": "codex",
+        }))
+
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+
+        check = runtime.check_transcript_source_parity()
+        assert check.status == "degraded"
+        assert any("codex transcripts: missing" in item for item in check.evidence)
+
+    def test_codex_session_parity_warns_when_recent_sessions_skip_startup(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": False,
+            "automation_backend": "none",
+        }))
+        codex_file = nexo_home / ".codex" / "sessions" / "2026" / "04" / "05" / "rollout-demo.jsonl"
+        codex_file.parent.mkdir(parents=True, exist_ok=True)
+        codex_file.write_text(
+            json.dumps({"type": "session_meta", "payload": {"originator": "codex_cli_rs"}}) + "\n"
+            + json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "hola"}}) + "\n"
+        )
+
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+
+        check = runtime.check_codex_session_parity()
+        assert check.status == "critical"
+        assert any("nexo_startup seen in 0/" in item for item in check.evidence)
+
+    def test_codex_session_parity_warns_when_only_some_recent_sessions_are_compliant(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": False,
+            "automation_backend": "none",
+        }))
+        good_file = nexo_home / ".codex" / "sessions" / "2026" / "04" / "05" / "good.jsonl"
+        good_file.parent.mkdir(parents=True, exist_ok=True)
+        good_file.write_text(
+            "<!-- nexo-codex-agents-version: 1.2.5 -->\n"
+            + json.dumps({"type": "session_meta", "payload": {"originator": "codex_cli_rs"}}) + "\n"
+            + json.dumps({"type": "response_item", "payload": {"type": "function_call", "name": "nexo_startup"}}) + "\n"
+            + json.dumps({"type": "response_item", "payload": {"type": "function_call", "name": "nexo_heartbeat"}}) + "\n"
+        )
+        drift_file = nexo_home / ".codex" / "sessions" / "2026" / "04" / "05" / "drift.jsonl"
+        drift_file.write_text(
+            json.dumps({"type": "session_meta", "payload": {"originator": "codex_cli_rs"}}) + "\n"
+            + json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "hola"}}) + "\n"
+        )
+
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+
+        check = runtime.check_codex_session_parity()
+        assert check.status == "critical"
+        assert any("bootstrap markers seen in 1/2" in item for item in check.evidence)
+        assert any("session drift: 1 missing bootstrap, 1 missing startup, 1 missing heartbeat" in item for item in check.evidence)
+
+    def test_bootstrap_reached_startup_is_critical_when_any_recent_session_misses_startup(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": False,
+            "automation_backend": "none",
+        }))
+        good_file = nexo_home / ".codex" / "sessions" / "2026" / "04" / "05" / "good-startup.jsonl"
+        good_file.parent.mkdir(parents=True, exist_ok=True)
+        good_file.write_text(
+            json.dumps({"type": "session_meta", "payload": {"originator": "codex_cli_rs"}}) + "\n"
+            + json.dumps({"type": "response_item", "payload": {"type": "function_call", "name": "nexo_startup"}}) + "\n"
+        )
+        drift_file = nexo_home / ".codex" / "sessions" / "2026" / "04" / "05" / "missing-startup.jsonl"
+        drift_file.write_text(
+            json.dumps({"type": "session_meta", "payload": {"originator": "codex_cli_rs"}}) + "\n"
+            + json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "hola"}}) + "\n"
+        )
+
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+
+        check = runtime.check_bootstrap_reached_startup()
+
+        assert check.id == "installation_live.bootstrap_reached_startup"
+        assert check.status == "critical"
+        assert any("nexo_startup reached: 1/2" in item for item in check.evidence)
+
+    def test_bootstrap_reached_startup_is_healthy_when_all_recent_sessions_started(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": False,
+            "automation_backend": "none",
+        }))
+        session_file = nexo_home / ".codex" / "sessions" / "2026" / "04" / "05" / "all-started.jsonl"
+        session_file.parent.mkdir(parents=True, exist_ok=True)
+        session_file.write_text(
+            json.dumps({"type": "session_meta", "payload": {"originator": "codex_cli_rs"}}) + "\n"
+            + json.dumps({"type": "response_item", "payload": {"type": "function_call", "name": "mcp__nexo__nexo_startup"}}) + "\n"
+        )
+
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+
+        check = runtime.check_bootstrap_reached_startup()
+
+        assert check.status == "healthy"
+        assert any("nexo_startup reached: 1/1" in item for item in check.evidence)
+
+    def test_codex_protocol_compliance_fails_when_violation_rate_exceeds_five_percent(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": False,
+            "automation_backend": "none",
+        }))
+        codex_home = nexo_home / ".codex"
+        codex_home.mkdir(parents=True, exist_ok=True)
+        (codex_home / "hooks.json").write_text(json.dumps({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "^(Bash|shell_command|exec_command)$",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": f"NEXO_HOME={nexo_home} python3 {nexo_home}/hooks/pre_tool_use.py",
+                                "timeout": 8,
+                            }
+                        ],
+                    }
+                ]
+            }
+        }))
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+        monkeypatch.setattr(
+            runtime,
+            "_recent_codex_session_parity_status",
+            lambda **_kwargs: {
+                "files": 20,
+                "samples": [
+                    {"file": "/tmp/bad.jsonl", "bootstrap": False, "startup": False, "heartbeat": False}
+                ],
+            },
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_recent_codex_conditioned_file_discipline_status",
+            lambda **_kwargs: {
+                "files": 20,
+                "read_without_protocol": 0,
+                "write_without_protocol": 1,
+                "write_without_guard_ack": 0,
+                "delete_without_protocol": 0,
+                "delete_without_guard_ack": 0,
+                "samples": [{"kind": "write_without_protocol", "file": "/repo/x.py"}],
+            },
+        )
+
+        check = runtime.check_codex_protocol_compliance()
+
+        assert check.id == "installation_live.codex_protocol_compliance"
+        assert check.status == "critical"
+        assert check.severity == "error"
+        assert any("violation rate: 10.0%" in item for item in check.evidence)
+
+    def test_codex_protocol_compliance_fails_when_live_hook_missing(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": False,
+            "automation_backend": "none",
+        }))
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+
+        check = runtime.check_codex_protocol_compliance()
+
+        assert check.status == "critical"
+        assert "PreToolUse enforcement is not installed" in check.summary
+        assert any("missing managed PreToolUse hook" in item for item in check.evidence)
+
+    def test_codex_protocol_compliance_installation_mode_ignores_historical_rate(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": False,
+            "automation_backend": "none",
+        }))
+        codex_home = nexo_home / ".codex"
+        codex_home.mkdir(parents=True, exist_ok=True)
+        (codex_home / "hooks.json").write_text(json.dumps({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "^(Bash|shell_command|exec_command)$",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": f"NEXO_HOME={nexo_home} python3 {nexo_home}/hooks/pre_tool_use.py",
+                                "timeout": 8,
+                            }
+                        ],
+                    }
+                ]
+            }
+        }))
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+        monkeypatch.setattr(
+            runtime,
+            "_recent_codex_session_parity_status",
+            lambda **_kwargs: pytest.fail("installation mode must not inspect session history"),
+        )
+
+        check = runtime.check_codex_protocol_compliance(include_history=False)
+
+        assert check.status == "healthy"
+        assert check.category == "installed_product"
+        assert "live protocol enforcement is installed" in check.summary
+
+    def test_installation_live_filters_operator_history_checks(self):
+        from doctor.models import DoctorCheck
+        from doctor.providers import runtime
+
+        checks = [
+            DoctorCheck(
+                id="runtime.history",
+                tier="runtime",
+                status="critical",
+                severity="error",
+                summary="historical drift",
+                category="operator_history",
+            ),
+            DoctorCheck(
+                id="runtime.install",
+                tier="runtime",
+                status="healthy",
+                severity="info",
+                summary="installed state",
+            ),
+        ]
+
+        filtered = runtime._filter_runtime_checks_for_plane(checks, plane="installation_live")
+
+        assert [check.id for check in filtered] == ["runtime.install"]
+
+    def test_codex_session_history_respects_post_update_repair_baseline(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        baseline_epoch = time.time()
+        operations_dir = nexo_home / "operations"
+        operations_dir.mkdir(parents=True, exist_ok=True)
+        (operations_dir / "last-repair-baseline.json").write_text(json.dumps({
+            "last_repair_epoch": baseline_epoch,
+            "last_repair_at": datetime.datetime.utcfromtimestamp(baseline_epoch).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }))
+        old_file = nexo_home / ".codex" / "sessions" / "2026" / "04" / "05" / "missing-startup.jsonl"
+        old_file.parent.mkdir(parents=True, exist_ok=True)
+        old_file.write_text(
+            json.dumps({"type": "session_meta", "payload": {"originator": "codex_cli_rs"}}) + "\n"
+            + json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "hola"}}) + "\n"
+        )
+        os.utime(old_file, (baseline_epoch - 60, baseline_epoch - 60))
+
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+
+        audit = runtime._recent_codex_session_parity_status(days=1)
+
+        assert audit["files"] == 0
+        assert audit["history_baseline_epoch"] == baseline_epoch
+
+    def test_codex_parity_counts_bootstrap_sessions_with_zero_tool_uses(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        session_file = nexo_home / ".codex" / "sessions" / "2026" / "06" / "15" / "zero-tools.jsonl"
+        session_file.parent.mkdir(parents=True, exist_ok=True)
+        session_file.write_text(
+            json.dumps({"type": "session_meta", "payload": {"originator": "codex_cli_rs"}}) + "\n"
+            + json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "NEXO Shared Brain for Codex"}}) + "\n"
+            + json.dumps({"type": "event_msg", "payload": {"type": "assistant_message", "message": "ok"}}) + "\n"
+        )
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+
+        audit = runtime._recent_codex_session_parity_status(days=1)
+
+        assert audit["files"] == 1
+        assert audit["zero_tool_bootstrap_sessions"] == 1
+        assert audit["samples"][0]["tool_call_count"] == 0
+        assert audit["samples"][0]["zero_tool_bootstrap"] is True
+
+    def test_codex_conditioned_file_discipline_warns_on_read_without_protocol(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": False,
+            "automation_backend": "none",
+        }))
+        db_path = nexo_home / "data" / "nexo.db"
+        _create_learnings_table(db_path)
+        _create_protocol_tables(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """INSERT INTO learnings (category, title, content, status, applies_to)
+               VALUES (?, ?, ?, 'active', ?)""",
+            (
+                "nexo-ops",
+                "Review runtime.py before editing",
+                "Read the conditioned rule before touching runtime.py.",
+                "/repo/src/doctor/providers/runtime.py",
+            ),
+        )
+        conn.execute(
+            """INSERT INTO protocol_debt (debt_type, severity, status, created_at)
+               VALUES ('codex_conditioned_read_without_protocol', 'warn', 'open', datetime('now'))"""
+        )
+        conn.commit()
+        conn.close()
+
+        codex_file = nexo_home / ".codex" / "sessions" / "2026" / "04" / "06" / "discipline-read.jsonl"
+        codex_file.parent.mkdir(parents=True, exist_ok=True)
+        codex_file.write_text(
+            json.dumps({"type": "session_meta", "payload": {"originator": "codex_cli_rs", "cwd": "/repo"}}) + "\n"
+            + json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "sed -n '1,120p' src/doctor/providers/runtime.py"}),
+                },
+            }) + "\n"
+        )
+
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+
+        check = runtime.check_codex_conditioned_file_discipline()
+        assert check.status == "degraded"
+        assert any("read touches without protocol/guard review: 1" in item for item in check.evidence)
+
+    def test_codex_conditioned_file_discipline_ignores_bootstrap_context_reads(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": False,
+            "automation_backend": "none",
+        }))
+        db_path = nexo_home / "data" / "nexo.db"
+        _create_learnings_table(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """INSERT INTO learnings (category, title, content, status, applies_to)
+               VALUES (?, ?, ?, 'active', ?)""",
+            (
+                "nexo-ops",
+                "Review calibration bootstrap files",
+                "Bootstrap reads of calibration/project atlas are allowed around startup.",
+                "calibration.json, project-atlas.json",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        brain_dir = nexo_home / ".nexo" / "brain"
+        brain_dir.mkdir(parents=True, exist_ok=True)
+        calibration = brain_dir / "calibration.json"
+        atlas = brain_dir / "project-atlas.json"
+        calibration.write_text("{}")
+        atlas.write_text("{}")
+
+        codex_file = nexo_home / ".codex" / "sessions" / "2026" / "04" / "06" / "discipline-prestartup.jsonl"
+        codex_file.parent.mkdir(parents=True, exist_ok=True)
+        codex_file.write_text(
+            json.dumps({"type": "session_meta", "payload": {"originator": "codex_cli_rs", "cwd": str(nexo_home)}}) + "\n"
+            + json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": f"cat {calibration}"}),
+                },
+            }) + "\n"
+            + json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "mcp__nexo__nexo_startup",
+                    "arguments": "{}",
+                },
+            }) + "\n"
+            + json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": f"cat {atlas}"}),
+                },
+            }) + "\n"
+            + json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "mcp__nexo__nexo_smart_startup",
+                    "arguments": "{}",
+                },
+            }) + "\n"
+            + json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": f"sed -n '1,20p' {calibration}"}),
+                },
+            }) + "\n"
+        )
+
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+
+        audit = runtime._recent_codex_conditioned_file_discipline_status()
+        assert audit["conditioned_touches"] == 0
+        check = runtime.check_codex_conditioned_file_discipline()
+        assert check.status == "healthy"
+
+    def test_codex_conditioned_file_discipline_heals_old_read_only_drift_without_open_debt(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": False,
+            "automation_backend": "none",
+        }))
+        db_path = nexo_home / "data" / "nexo.db"
+        _create_learnings_table(db_path)
+        _create_protocol_tables(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """INSERT INTO learnings (category, title, content, status, applies_to)
+               VALUES (?, ?, ?, 'active', ?)""",
+            (
+                "nexo-ops",
+                "Review runtime.py before editing",
+                "Read the conditioned rule before touching runtime.py.",
+                "/repo/src/doctor/providers/runtime.py",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        codex_file = nexo_home / ".codex" / "sessions" / "2026" / "04" / "06" / "discipline-old-read.jsonl"
+        codex_file.parent.mkdir(parents=True, exist_ok=True)
+        codex_file.write_text(
+            json.dumps({"type": "session_meta", "payload": {"originator": "codex_cli_rs", "cwd": "/repo"}}) + "\n"
+            + json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "sed -n '1,120p' src/doctor/providers/runtime.py"}),
+                },
+            }) + "\n"
+        )
+        old_time = time.time() - 10800
+        os.utime(codex_file, (old_time, old_time))
+
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+
+        check = runtime.check_codex_conditioned_file_discipline()
+        assert check.status == "healthy"
+        assert "Historical Codex conditioned-file drift has no open protocol debt" in check.summary
+
+    def test_codex_conditioned_file_discipline_goes_critical_on_write_without_protocol(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": False,
+            "automation_backend": "none",
+        }))
+        db_path = nexo_home / "data" / "nexo.db"
+        _create_learnings_table(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """INSERT INTO learnings (category, title, content, status, applies_to)
+               VALUES (?, ?, ?, 'active', ?)""",
+            (
+                "nexo-ops",
+                "Protocol-first edits for runtime.py",
+                "Open protocol before patching runtime.py.",
+                "/repo/src/doctor/providers/runtime.py",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        codex_file = nexo_home / ".codex" / "sessions" / "2026" / "04" / "06" / "discipline-write.jsonl"
+        codex_file.parent.mkdir(parents=True, exist_ok=True)
+        codex_file.write_text(
+            json.dumps({"type": "session_meta", "payload": {"originator": "codex_cli_rs", "cwd": "/repo"}}) + "\n"
+            + json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "apply_patch",
+                    "arguments": "*** Begin Patch\n*** Update File: src/doctor/providers/runtime.py\n@@\n-old\n+new\n*** End Patch\n",
+                },
+            }) + "\n"
+        )
+
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+
+        check = runtime.check_codex_conditioned_file_discipline()
+        assert check.status == "critical"
+        assert any("write touches without protocol task: 1" in item for item in check.evidence)
+
+    def test_codex_conditioned_file_discipline_heals_tracked_recent_write_drift_without_open_debt(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": False,
+            "automation_backend": "none",
+        }))
+        db_path = nexo_home / "data" / "nexo.db"
+        _create_learnings_table(db_path)
+        _create_protocol_tables(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """INSERT INTO learnings (category, title, content, status, applies_to)
+               VALUES (?, ?, ?, 'active', ?)""",
+            (
+                "nexo-ops",
+                "Protocol-first edits for runtime.py",
+                "Open protocol before patching runtime.py.",
+                "/repo/src/doctor/providers/runtime.py",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        codex_file = nexo_home / ".codex" / "sessions" / "2026" / "04" / "06" / "discipline-write-tracked.jsonl"
+        codex_file.parent.mkdir(parents=True, exist_ok=True)
+        codex_file.write_text(
+            json.dumps({"type": "session_meta", "payload": {"originator": "codex_cli_rs", "cwd": "/repo"}}) + "\n"
+            + json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "apply_patch",
+                    "arguments": "*** Begin Patch\n*** Update File: src/doctor/providers/runtime.py\n@@\n-old\n+new\n*** End Patch\n",
+                },
+            }) + "\n"
+        )
+
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+
+        check = runtime.check_codex_conditioned_file_discipline()
+        assert check.status == "healthy"
+        assert "Tracked Codex conditioned-file mutation drift has no open protocol debt" in check.summary
+        assert any("write touches without protocol task: 1" in item for item in check.evidence)
+
+    def test_codex_conditioned_file_discipline_heals_old_write_drift_without_open_debt(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": False,
+            "automation_backend": "none",
+        }))
+        db_path = nexo_home / "data" / "nexo.db"
+        _create_learnings_table(db_path)
+        _create_protocol_tables(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """INSERT INTO learnings (category, title, content, status, applies_to)
+               VALUES (?, ?, ?, 'active', ?)""",
+            (
+                "nexo-ops",
+                "Protocol-first edits for runtime.py",
+                "Open protocol before patching runtime.py.",
+                "/repo/src/doctor/providers/runtime.py",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        codex_file = nexo_home / ".codex" / "sessions" / "2026" / "04" / "06" / "discipline-old-write.jsonl"
+        codex_file.parent.mkdir(parents=True, exist_ok=True)
+        codex_file.write_text(
+            json.dumps({"type": "session_meta", "payload": {"originator": "codex_cli_rs", "cwd": "/repo"}}) + "\n"
+            + json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "apply_patch",
+                    "arguments": "*** Begin Patch\n*** Update File: src/doctor/providers/runtime.py\n@@\n-old\n+new\n*** End Patch\n",
+                },
+            }) + "\n"
+        )
+        old_time = time.time() - 172900
+        os.utime(codex_file, (old_time, old_time))
+
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+
+        check = runtime.check_codex_conditioned_file_discipline()
+        assert check.status == "healthy"
+        assert "Historical Codex conditioned-file drift has no open protocol debt" in check.summary
+        assert any("write touches without protocol task: 1" in item for item in check.evidence)
+
+    def test_codex_conditioned_file_discipline_heals_old_guard_ack_drift_without_open_debt(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": False,
+            "automation_backend": "none",
+        }))
+        db_path = nexo_home / "data" / "nexo.db"
+        _create_learnings_table(db_path)
+        _create_protocol_tables(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """INSERT INTO learnings (category, title, content, status, applies_to)
+               VALUES (?, ?, ?, 'active', ?)""",
+            (
+                "nexo-ops",
+                "Guarded runtime.py edits",
+                "Open protocol and guard before patching runtime.py.",
+                "/repo/src/doctor/providers/runtime.py",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        codex_file = nexo_home / ".codex" / "sessions" / "2026" / "04" / "06" / "discipline-old-guard-gap.jsonl"
+        codex_file.parent.mkdir(parents=True, exist_ok=True)
+        codex_file.write_text(
+            json.dumps({"type": "session_meta", "payload": {"originator": "codex_cli_rs", "cwd": "/repo"}}) + "\n"
+            + json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "nexo_task_open",
+                    "arguments": json.dumps({"files": "/repo/src/doctor/providers/runtime.py"}),
+                },
+            }) + "\n"
+            + json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "nexo_guard_check",
+                    "arguments": json.dumps({"files": "/repo/src/doctor/providers/runtime.py"}),
+                },
+            }) + "\n"
+            + json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "apply_patch",
+                    "arguments": "*** Begin Patch\n*** Update File: src/doctor/providers/runtime.py\n@@\n-old\n+new\n*** End Patch\n",
+                },
+            }) + "\n"
+        )
+        old_time = time.time() - 10800
+        os.utime(codex_file, (old_time, old_time))
+
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+
+        check = runtime.check_codex_conditioned_file_discipline()
+        assert check.status == "healthy"
+        assert "Historical Codex conditioned-file drift has no open protocol debt" in check.summary
+        assert any("write touches without guard acknowledgement: 1" in item for item in check.evidence)
+
+    def test_codex_conditioned_file_discipline_accepts_protocol_open_and_guard_ack(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": False,
+            "automation_backend": "none",
+        }))
+        db_path = nexo_home / "data" / "nexo.db"
+        _create_learnings_table(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """INSERT INTO learnings (category, title, content, status, applies_to)
+               VALUES (?, ?, ?, 'active', ?)""",
+            (
+                "nexo-ops",
+                "Guarded runtime.py edits",
+                "Open protocol and acknowledge guard before patching runtime.py.",
+                "/repo/src/doctor/providers/runtime.py",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        codex_file = nexo_home / ".codex" / "sessions" / "2026" / "04" / "06" / "discipline-clean.jsonl"
+        codex_file.parent.mkdir(parents=True, exist_ok=True)
+        codex_file.write_text(
+            json.dumps({"type": "session_meta", "payload": {"originator": "codex_cli_rs", "cwd": "/repo"}}) + "\n"
+            + json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "mcp__nexo__nexo_task_open",
+                    "arguments": json.dumps({"goal": "Patch runtime audit", "task_type": "edit", "files": "src/doctor/providers/runtime.py"}),
+                },
+            }) + "\n"
+            + json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "mcp__nexo__nexo_task_acknowledge_guard",
+                    "arguments": json.dumps({"task_id": "task-1", "learning_ids": "41"}),
+                },
+            }) + "\n"
+            + json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "apply_patch",
+                    "arguments": "*** Begin Patch\n*** Update File: src/doctor/providers/runtime.py\n@@\n-old\n+new\n*** End Patch\n",
+                },
+            }) + "\n"
+        )
+
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+
+        check = runtime.check_codex_conditioned_file_discipline()
+        assert check.status == "healthy"
+        assert any("conditioned touches: 1" in item for item in check.evidence)
+
+    def test_codex_conditioned_file_discipline_accepts_session_task_open_plus_guard_file_check(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": False,
+            "automation_backend": "none",
+        }))
+        db_path = nexo_home / "data" / "nexo.db"
+        _create_learnings_table(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """INSERT INTO learnings (category, title, content, status, applies_to)
+               VALUES (?, ?, ?, 'active', ?)""",
+            (
+                "nexo-ops",
+                "Guarded runtime.py edits",
+                "Open protocol and review runtime.py before patching.",
+                "/repo/src/doctor/providers/runtime.py",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        codex_file = nexo_home / ".codex" / "sessions" / "2026" / "04" / "06" / "discipline-session-open-guard-file-check.jsonl"
+        codex_file.parent.mkdir(parents=True, exist_ok=True)
+        codex_file.write_text(
+            json.dumps({"type": "session_meta", "payload": {"originator": "codex_cli_rs", "cwd": "/repo"}}) + "\n"
+            + json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "mcp__nexo__nexo_task_open",
+                    "arguments": json.dumps({"goal": "Patch runtime audit", "task_type": "edit"}),
+                },
+            }) + "\n"
+            + json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "mcp__nexo__nexo_guard_file_check",
+                    "arguments": json.dumps({"files": ["/repo/src/doctor/providers/runtime.py"]}),
+                },
+            }) + "\n"
+            + json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "mcp__nexo__nexo_task_acknowledge_guard",
+                    "arguments": json.dumps({"task_id": "task-1", "learning_ids": "41"}),
+                },
+            }) + "\n"
+            + json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "apply_patch",
+                    "arguments": "*** Begin Patch\n*** Update File: src/doctor/providers/runtime.py\n@@\n-old\n+new\n*** End Patch\n",
+                },
+            }) + "\n"
+        )
+
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+
+        check = runtime.check_codex_conditioned_file_discipline()
+        assert check.status == "healthy"
+        assert any("conditioned touches: 1" in item for item in check.evidence)
+
+    def test_codex_conditioned_file_discipline_goes_critical_on_delete_without_guard_ack(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": True,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "codex",
+            "automation_enabled": False,
+            "automation_backend": "none",
+        }))
+        db_path = nexo_home / "data" / "nexo.db"
+        _create_learnings_table(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """INSERT INTO learnings (category, title, content, status, applies_to)
+               VALUES (?, ?, ?, 'active', ?)""",
+            (
+                "nexo-ops",
+                "Guard delete on runtime.py",
+                "Open protocol and acknowledge guard before deleting runtime.py.",
+                "/repo/src/doctor/providers/runtime.py",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        codex_file = nexo_home / ".codex" / "sessions" / "2026" / "04" / "06" / "discipline-delete.jsonl"
+        codex_file.parent.mkdir(parents=True, exist_ok=True)
+        codex_file.write_text(
+            json.dumps({"type": "session_meta", "payload": {"originator": "codex_cli_rs", "cwd": "/repo"}}) + "\n"
+            + json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "mcp__nexo__nexo_task_open",
+                    "arguments": json.dumps({"goal": "Delete runtime file", "task_type": "edit", "files": "src/doctor/providers/runtime.py"}),
+                },
+            }) + "\n"
+            + json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "rm src/doctor/providers/runtime.py"}),
+                },
+            }) + "\n"
+        )
+
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+
+        check = runtime.check_codex_conditioned_file_discipline()
+        assert check.status == "critical"
+        assert any("delete touches without guard acknowledgement: 1" in item for item in check.evidence)
+
+    def test_claude_desktop_shared_brain_reports_mcp_only_mode(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        schedule_file = nexo_home / "config" / "schedule.json"
+        schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        schedule_file.write_text(json.dumps({
+            "interactive_clients": {
+                "claude_code": False,
+                "codex": False,
+                "claude_desktop": True,
+            },
+            "default_terminal_client": "claude_code",
+            "automation_enabled": False,
+            "automation_backend": "none",
+        }))
+        desktop_dir = nexo_home / "Library" / "Application Support" / "Claude"
+        desktop_dir.mkdir(parents=True, exist_ok=True)
+        (desktop_dir / "claude_desktop_config.json").write_text(json.dumps({
+            "mcpServers": {
+                "nexo": {
+                    "command": "/opt/homebrew/bin/python3",
+                    "args": [str(nexo_home / "server.py")],
+                }
+            },
+            "nexo": {
+                "claude_desktop": {
+                    "shared_brain_managed": True,
+                    "shared_brain_mode": "mcp_only",
+                    "managed_runtime_home": str(nexo_home),
+                }
+            },
+        }))
+
+        monkeypatch.setattr(runtime, "SCHEDULE_FILE", schedule_file)
+        monkeypatch.setattr(runtime.Path, "home", lambda: nexo_home)
+        monkeypatch.setattr(runtime, "detect_installed_clients", lambda user_home=None: {
+            "claude_code": {"installed": True},
+            "codex": {"installed": False},
+            "claude_desktop": {"installed": True},
+        })
+
+        check = runtime.check_claude_desktop_shared_brain()
+        assert check.status == "healthy"
+        assert "MCP-only mode" in check.summary
+
+    def test_client_assumption_regressions_flags_unapproved_claude_only_paths(self, nexo_home, monkeypatch, tmp_path):
+        from doctor.providers import runtime
+
+        src_root = tmp_path / "src"
+        scripts_dir = src_root / "scripts" / "deep-sleep"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / "collect.py").write_text("CLAUDE = '~/.claude/projects'\nCODEX='~/.codex/sessions'\nfind_codex_session_files = True\n")
+        (src_root / "foo.py").write_text("ROOT='~/.claude/projects'\n")
+
+        monkeypatch.setattr(runtime, "NEXO_CODE", tmp_path)
+        check = runtime.check_client_assumption_regressions()
+        assert check.status == "critical"
+        assert any("foo.py" in item for item in check.evidence)
+
+    def test_client_assumption_regressions_ignore_runtime_backups(self, nexo_home, monkeypatch, tmp_path):
+        from doctor.providers import runtime
+
+        runtime_home = tmp_path / "runtime"
+        backups_dir = runtime_home / "backups" / "runtime-tree-old"
+        contrib_dir = runtime_home / "contrib" / "public-core" / "repo" / "src"
+        active_src = runtime_home / "src"
+        backups_dir.mkdir(parents=True, exist_ok=True)
+        contrib_dir.mkdir(parents=True, exist_ok=True)
+        active_src.mkdir(parents=True, exist_ok=True)
+        (backups_dir / "foo.py").write_text("ROOT='~/.claude/projects'\n")
+        (contrib_dir / "bar.py").write_text("ROOT='~/.claude/projects'\n")
+        (active_src / "scripts" / "deep-sleep").mkdir(parents=True, exist_ok=True)
+        (active_src / "scripts" / "deep-sleep" / "collect.py").write_text(
+            "CLAUDE='~/.claude/projects'\nCODEX='~/.codex/sessions'\nfind_codex_session_files=True\n"
+        )
+
+        monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+        monkeypatch.setattr(runtime, "NEXO_HOME", runtime_home)
+        monkeypatch.setattr(runtime, "NEXO_CODE", runtime_home)
+
+        check = runtime.check_client_assumption_regressions()
+
+        assert check.status == "healthy"
+
+    def test_client_assumption_regressions_ignore_version_snapshots(self, nexo_home, monkeypatch, tmp_path):
+        from doctor.providers import runtime
+
+        runtime_home = tmp_path / "runtime"
+        active_src = runtime_home / "src"
+        snapshot_src = active_src / "versions" / "7.9.10"
+        (active_src / "scripts" / "deep-sleep").mkdir(parents=True, exist_ok=True)
+        snapshot_src.mkdir(parents=True, exist_ok=True)
+        (active_src / "scripts" / "deep-sleep" / "collect.py").write_text(
+            "CLAUDE='~/.claude/projects'\nCODEX='~/.codex/sessions'\nfind_codex_session_files=True\n"
+        )
+        (snapshot_src / "old.py").write_text("ROOT='~/.claude/projects'\n")
+
+        monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+        monkeypatch.setattr(runtime, "NEXO_HOME", runtime_home)
+        monkeypatch.setattr(runtime, "NEXO_CODE", runtime_home)
+
+        check = runtime.check_client_assumption_regressions()
+
+        assert check.status == "healthy"
+
+    def test_client_assumption_regressions_allows_runtime_detector_copy(self, nexo_home, monkeypatch, tmp_path):
+        from doctor.providers import runtime
+
+        runtime_home = tmp_path / "runtime"
+        src_root = runtime_home / "src"
+        detector_dir = src_root / "doctor" / "providers"
+        scripts_dir = src_root / "scripts" / "deep-sleep"
+        detector_dir.mkdir(parents=True, exist_ok=True)
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / "collect.py").write_text(
+            "CLAUDE='~/.claude/projects'\nCODEX='~/.codex/sessions'\nfind_codex_session_files=True\n"
+        )
+        (detector_dir / "runtime.py").write_text(
+            "if '.claude/projects' in text and '.codex' in text:\n    pass\n"
+        )
+
+        monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+        monkeypatch.setattr(runtime, "NEXO_HOME", runtime_home)
+        monkeypatch.setattr(runtime, "NEXO_CODE", runtime_home)
+
+        check = runtime.check_client_assumption_regressions()
+
+        assert check.status == "healthy"
+
+    def test_launchagent_integrity_fix_bootstraps_real_plist(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        plist_path = nexo_home / "com.nexo.watchdog.plist"
+        sync_path = nexo_home / "runtime" / "crons" / "sync.py"
+        sync_path.parent.mkdir(parents=True)
+        sync_path.write_text("print('ok')\n")
+        with plist_path.open("wb") as fh:
+            plistlib.dump({
+                "EnvironmentVariables": {
+                    "NEXO_HOME": str(nexo_home),
+                    "NEXO_CODE": str(nexo_home / "src"),
+                },
+                "StartInterval": 1800,
+            }, fh)
+
+        monkeypatch.setattr(runtime.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(runtime, "_managed_launchagent_plists", lambda: [("watchdog", plist_path)])
+        monkeypatch.setattr(runtime.os, "getuid", lambda: 501)
+        monkeypatch.setenv("NEXO_ALLOW_EPHEMERAL_INSTALL", "1")
+
+        calls = []
+        bootstrapped = {"done": False}
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            if len(args) >= 2 and str(args[1]).endswith("sync.py"):
+                return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+            if args[1] == "print":
+                if not bootstrapped["done"]:
+                    return SimpleNamespace(returncode=1, stdout="", stderr='Could not find service "com.nexo.watchdog"')
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        "gui/501/com.nexo.watchdog = {\n"
+                        f"path = {plist_path}\n"
+                        f"NEXO_HOME => {nexo_home}\n"
+                        f"NEXO_CODE => {nexo_home / 'src'}\n"
+                        "}\n"
+                    ),
+                    stderr="",
+                )
+            if args[1] == "bootstrap":
+                bootstrapped["done"] = True
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+        check = runtime.check_launchagent_integrity(fix=True)
+        assert check.fixed
+        assert check.status == "healthy"
+        assert any(args[1] == "bootstrap" for args in calls)
+
+    def test_launchagent_integrity_fix_normalizes_special_launchagent_env(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        plist_path = nexo_home / "com.nexo.tcc-approve.plist"
+        old_code = "/Users/tester/Documents/nexo/src"
+        with plist_path.open("wb") as fh:
+            plistlib.dump({
+                "EnvironmentVariables": {
+                    "NEXO_HOME": str(nexo_home),
+                    "NEXO_CODE": old_code,
+                },
+                "ProgramArguments": ["/bin/bash", str(nexo_home / "scripts" / "nexo-tcc-approve.sh")],
+                "RunAtLoad": True,
+            }, fh)
+
+        monkeypatch.setattr(runtime.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(runtime, "_managed_launchagent_plists", lambda: [("tcc-approve", plist_path)])
+        monkeypatch.setattr(runtime, "_launchagent_schedule_expectations", lambda: {})
+        monkeypatch.setattr(runtime, "_recent_permission_denial", lambda cron_id: False)
+        monkeypatch.setattr(runtime.os, "getuid", lambda: 501)
+        monkeypatch.setattr(runtime, "PROTECTED_MACOS_ROOTS", (Path("/Users/tester/Documents"),))
+        # The fix path delegates cron syncing and launchagent reload to two
+        # helpers whose real implementations require a `crons/sync.py` script
+        # and a working `launchctl bootstrap`. Neither is meaningful for this
+        # test — we are exercising `_repair_special_launchagent_plists` (the
+        # env-normalizing helper). Stub the siblings so they don't drag a real
+        # filesystem or launchd dependency into the assertion.
+        monkeypatch.setattr(runtime, "_sync_launchagents_from_manifest", lambda: (True, []))
+        monkeypatch.setattr(runtime, "_repair_launchagents", lambda items: (True, []))
+
+        calls = {"print": 0}
+
+        def fake_run(args, **kwargs):
+            if args[:2] == ["launchctl", "print"]:
+                calls["print"] += 1
+                current_code = old_code if calls["print"] == 1 else str(nexo_home / "core")
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        "gui/501/com.nexo.tcc-approve = {\n"
+                        f"path = {plist_path}\n"
+                        f"NEXO_HOME => {nexo_home}\n"
+                        f"NEXO_CODE => {current_code}\n"
+                        "}\n"
+                    ),
+                    stderr="",
+                )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+        check = runtime.check_launchagent_integrity(fix=True)
+        assert check.fixed
+        with plist_path.open("rb") as fh:
+            fixed = plistlib.load(fh)
+        assert fixed["EnvironmentVariables"]["NEXO_CODE"] == str(nexo_home / "core")
+
+    def test_protocol_compliance_prefers_live_runtime_data_when_healthy(self, nexo_home):
+        db_path = nexo_home / "data" / "nexo.db"
+        _create_protocol_tables(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """INSERT INTO protocol_tasks (
+                task_id, status, must_verify, close_evidence, must_change_log,
+                change_log_id, correction_happened, learning_id, task_type,
+                cortex_mode, opened_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+            ("PT-1", "done", 1, "pytest passed", 1, 42, 0, None, "edit", "act"),
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_protocol_compliance
+
+        check = check_protocol_compliance()
+        assert check.status == "healthy"
+        assert any("overall live protocol compliance" in item for item in check.evidence)
+
+    def test_protocol_compliance_counts_propose_as_non_blocking_and_skips_warmup_decision_eval(self, nexo_home):
+        db_path = nexo_home / "data" / "nexo.db"
+        _create_protocol_tables(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("ALTER TABLE protocol_tasks ADD COLUMN response_high_stakes INTEGER DEFAULT 0")
+        conn.execute(
+            """CREATE TABLE cortex_evaluations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT DEFAULT '',
+                created_at TEXT DEFAULT (datetime('now'))
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO protocol_tasks (
+                task_id, status, must_verify, close_evidence, must_change_log,
+                change_log_id, correction_happened, learning_id, task_type,
+                cortex_mode, response_high_stakes, opened_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+            ("PT-10", "done", 1, "pytest passed", 1, 42, 0, None, "edit", "propose", 0),
+        )
+        conn.execute(
+            """INSERT INTO protocol_tasks (
+                task_id, status, must_verify, close_evidence, must_change_log,
+                change_log_id, correction_happened, learning_id, task_type,
+                cortex_mode, response_high_stakes, opened_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+            ("PT-11", "done", 1, "smoke passed", 1, 43, 0, None, "execute", "propose", 1),
+        )
+        conn.execute(
+            "INSERT INTO cortex_evaluations (task_id, created_at) VALUES (?, datetime('now'))",
+            ("PT-11",),
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_protocol_compliance
+
+        check = check_protocol_compliance()
+        assert check.status == "healthy"
+        assert any("action tasks Cortex-cleared: 2/2" in item for item in check.evidence)
+        assert any("decision-eval rollout warming up" in item for item in check.evidence)
+
+    def test_protocol_compliance_does_not_penalize_unseeded_decision_eval_rollout(self, nexo_home):
+        db_path = nexo_home / "data" / "nexo.db"
+        _create_protocol_tables(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("ALTER TABLE protocol_tasks ADD COLUMN response_high_stakes INTEGER DEFAULT 0")
+        for idx in range(1, 4):
+            conn.execute(
+                """INSERT INTO protocol_tasks (
+                    task_id, status, must_verify, close_evidence, must_change_log,
+                    change_log_id, correction_happened, learning_id, task_type,
+                    cortex_mode, response_high_stakes, opened_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+                (f"PT-seed-{idx}", "done", 1, "pytest passed", 1, 40 + idx, 0, None, "execute", "act", 1),
+            )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_protocol_compliance
+
+        check = check_protocol_compliance()
+        assert check.status == "healthy"
+        assert any("high-stakes decision-eval rollout not yet seeded in the live window" in item for item in check.evidence)
+
+    def test_protocol_compliance_goes_critical_on_open_error_debt(self, nexo_home):
+        db_path = nexo_home / "data" / "nexo.db"
+        _create_protocol_tables(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """INSERT INTO protocol_tasks (
+                task_id, status, must_verify, close_evidence, must_change_log,
+                change_log_id, correction_happened, learning_id, task_type,
+                cortex_mode, opened_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+            ("PT-2", "done", 1, "", 1, 10, 0, None, "edit", "act"),
+        )
+        conn.execute(
+            """INSERT INTO protocol_debt (debt_type, severity, status, created_at)
+               VALUES (?, ?, ?, datetime('now'))""",
+            ("claimed_done_without_evidence", "error", "open"),
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_protocol_compliance
+
+        check = check_protocol_compliance()
+        assert check.status == "critical"
+        assert any("claimed_done_without_evidence" in item for item in check.evidence)
+
+    def test_protocol_compliance_ignores_live_guard_debt_on_active_task(self, nexo_home):
+        db_path = nexo_home / "data" / "nexo.db"
+        _create_protocol_tables(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("ALTER TABLE protocol_tasks ADD COLUMN response_high_stakes INTEGER DEFAULT 0")
+        conn.execute(
+            """INSERT INTO sessions (sid, task, started_epoch, last_update_epoch, local_time)
+               VALUES (?, ?, ?, ?, ?)""",
+            ("nexo-live", "active task", time.time() - 120, time.time(), "10:00"),
+        )
+        conn.execute(
+            """INSERT INTO protocol_tasks (
+                task_id, session_id, status, must_verify, close_evidence, must_change_log,
+                change_log_id, correction_happened, learning_id, task_type,
+                cortex_mode, response_high_stakes, opened_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+            ("PT-LIVE", "nexo-live", "open", 1, "", 0, None, 0, None, "execute", "propose", 0),
+        )
+        conn.execute(
+            """INSERT INTO protocol_debt (
+                session_id, task_id, debt_type, severity, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, datetime('now'))""",
+            ("nexo-live", "PT-LIVE", "unacknowledged_guard_blocking", "error", "open"),
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_protocol_compliance
+
+        check = check_protocol_compliance()
+        assert check.status == "healthy"
+        assert any("live in-progress guard acknowledgements pending: 1" in item for item in check.evidence)
+
+    def test_protocol_compliance_ignores_debt_attached_to_open_task(self, nexo_home):
+        db_path = nexo_home / "data" / "nexo.db"
+        _create_protocol_tables(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("ALTER TABLE protocol_tasks ADD COLUMN response_high_stakes INTEGER DEFAULT 0")
+        conn.execute(
+            """INSERT INTO protocol_tasks (
+                task_id, session_id, status, must_verify, close_evidence, must_change_log,
+                change_log_id, correction_happened, learning_id, task_type,
+                cortex_mode, response_high_stakes, opened_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+            ("PT-OPEN", "nexo-open", "open", 1, "", 0, None, 0, None, "execute", "propose", 0),
+        )
+        conn.execute(
+            """INSERT INTO protocol_debt (
+                session_id, task_id, debt_type, severity, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, datetime('now'))""",
+            ("nexo-open", "PT-OPEN", "missing_cortex_evaluation", "error", "open"),
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_protocol_compliance
+
+        check = check_protocol_compliance()
+        assert check.status == "healthy"
+        assert any("in-progress task protocol debt pending: 1" in item for item in check.evidence)
+
+    def test_protocol_compliance_ignores_cancelled_tasks_for_change_log_coverage(self, nexo_home):
+        db_path = nexo_home / "data" / "nexo.db"
+        _create_protocol_tables(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """INSERT INTO protocol_tasks (
+                task_id, status, must_verify, close_evidence, must_change_log,
+                change_log_id, correction_happened, learning_id, task_type,
+                cortex_mode, opened_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+            ("PT-DONE", "done", 1, "pytest passed", 1, 42, 0, None, "edit", "act"),
+        )
+        conn.execute(
+            """INSERT INTO protocol_tasks (
+                task_id, status, must_verify, close_evidence, must_change_log,
+                change_log_id, correction_happened, learning_id, task_type,
+                cortex_mode, opened_at, closed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))""",
+            ("PT-CANCELLED", "cancelled", 0, "", 1, None, 0, None, "edit", "act"),
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_protocol_compliance
+
+        check = check_protocol_compliance()
+        assert check.status == "healthy"
+        assert any("change_log coverage: 1/1" in item for item in check.evidence)
+
+    def test_automation_telemetry_goes_critical_when_cost_coverage_is_missing(self, nexo_home):
+        db_path = nexo_home / "data" / "nexo.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """CREATE TABLE automation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                total_cost_usd REAL,
+                input_tokens INTEGER DEFAULT 0,
+                cached_input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cost_source TEXT DEFAULT '',
+                backend TEXT DEFAULT '',
+                created_at TEXT DEFAULT (datetime('now'))
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO automation_runs (
+                total_cost_usd, input_tokens, output_tokens, cost_source, backend, created_at
+            ) VALUES (?, ?, ?, ?, ?, datetime('now'))""",
+            (None, 120, 20, "pricing_unavailable", "codex"),
+        )
+        conn.execute(
+            """INSERT INTO automation_runs (
+                total_cost_usd, input_tokens, output_tokens, cost_source, backend, created_at
+            ) VALUES (?, ?, ?, ?, ?, datetime('now'))""",
+            (0.12, 100, 10, "backend", "claude_code"),
+        )
+        conn.execute(
+            """INSERT INTO automation_runs (
+                total_cost_usd, input_tokens, output_tokens, cost_source, backend, created_at
+            ) VALUES (?, ?, ?, ?, ?, datetime('now'))""",
+            (0.08, 90, 12, "backend", "claude_code"),
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_automation_telemetry
+
+        check = check_automation_telemetry()
+        assert check.status == "critical"
+        assert any("cost_coverage=66.7%" in item for item in check.evidence)
+
+    def test_automation_telemetry_ignores_failed_runs_without_usage(self, nexo_home):
+        db_path = nexo_home / "data" / "nexo.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """CREATE TABLE automation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                backend TEXT DEFAULT '',
+                model TEXT DEFAULT '',
+                reasoning_effort TEXT DEFAULT '',
+                input_tokens INTEGER DEFAULT 0,
+                cached_input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                total_cost_usd REAL,
+                telemetry_source TEXT DEFAULT '',
+                cost_source TEXT DEFAULT '',
+                status TEXT DEFAULT 'ok',
+                metadata TEXT DEFAULT '{}',
+                created_at TEXT DEFAULT (datetime('now'))
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO automation_runs (
+                backend, input_tokens, output_tokens, total_cost_usd, cost_source, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))""",
+            ("claude_code", 120, 20, 0.12, "backend", "ok"),
+        )
+        conn.execute(
+            """INSERT INTO automation_runs (
+                backend, input_tokens, output_tokens, total_cost_usd, cost_source, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))""",
+            ("codex", 0, 0, 0.0, "pricing_snapshot", "failed"),
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_automation_telemetry
+
+        check = check_automation_telemetry()
+        assert check.status == "healthy"
+        assert any("successful_runs=1" in item for item in check.evidence)
+        assert any("failed_runs=1" in item for item in check.evidence)
+
+    def test_automation_telemetry_tolerates_single_missing_usage_run(self, nexo_home):
+        db_path = nexo_home / "data" / "nexo.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """CREATE TABLE automation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                backend TEXT DEFAULT '',
+                model TEXT DEFAULT '',
+                reasoning_effort TEXT DEFAULT '',
+                input_tokens INTEGER DEFAULT 0,
+                cached_input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                total_cost_usd REAL,
+                telemetry_source TEXT DEFAULT '',
+                cost_source TEXT DEFAULT '',
+                status TEXT DEFAULT 'ok',
+                metadata TEXT DEFAULT '{}',
+                created_at TEXT DEFAULT (datetime('now'))
+            )"""
+        )
+        conn.executemany(
+            """INSERT INTO automation_runs (
+                backend, input_tokens, output_tokens, total_cost_usd, cost_source, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))""",
+            [
+                ("codex", 120, 20, 0.12, "pricing_snapshot", "ok"),
+                ("codex", 90, 18, 0.10, "pricing_snapshot", "ok"),
+                ("codex", 0, 0, 0.0, "pricing_snapshot", "ok"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_automation_telemetry
+
+        check = check_automation_telemetry()
+        assert check.status == "healthy"
+        assert any("missing_usage_runs=1" in item for item in check.evidence)
+
+    def test_automation_telemetry_tolerates_high_coverage_sparse_usage_gaps(self, nexo_home):
+        db_path = nexo_home / "data" / "nexo.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """CREATE TABLE automation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                backend TEXT DEFAULT '',
+                model TEXT DEFAULT '',
+                reasoning_effort TEXT DEFAULT '',
+                input_tokens INTEGER DEFAULT 0,
+                cached_input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                total_cost_usd REAL,
+                telemetry_source TEXT DEFAULT '',
+                cost_source TEXT DEFAULT '',
+                status TEXT DEFAULT 'ok',
+                metadata TEXT DEFAULT '{}',
+                created_at TEXT DEFAULT (datetime('now'))
+            )"""
+        )
+        conn.executemany(
+            """INSERT INTO automation_runs (
+                backend, input_tokens, output_tokens, total_cost_usd, cost_source, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))""",
+            [("codex", 120, 20, 0.12, "pricing_snapshot", "ok") for _ in range(497)]
+            + [("codex", 0, 0, 0.0, "pricing_snapshot", "ok") for _ in range(3)],
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_automation_telemetry
+
+        check = check_automation_telemetry()
+        assert check.status == "healthy"
+        assert any("usage_coverage=99.4%" in item for item in check.evidence)
+        assert any("missing_usage_runs=3" in item for item in check.evidence)
+
+    def test_automation_telemetry_still_warns_on_material_usage_gaps(self, nexo_home):
+        db_path = nexo_home / "data" / "nexo.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """CREATE TABLE automation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                backend TEXT DEFAULT '',
+                input_tokens INTEGER DEFAULT 0,
+                cached_input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                total_cost_usd REAL,
+                cost_source TEXT DEFAULT '',
+                status TEXT DEFAULT 'ok',
+                created_at TEXT DEFAULT (datetime('now'))
+            )"""
+        )
+        conn.executemany(
+            """INSERT INTO automation_runs (
+                backend, input_tokens, output_tokens, total_cost_usd, cost_source, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))""",
+            [("codex", 120, 20, 0.12, "pricing_snapshot", "ok") for _ in range(7)]
+            + [("codex", 0, 0, 0.0, "pricing_snapshot", "ok") for _ in range(3)],
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_automation_telemetry
+
+        check = check_automation_telemetry()
+        assert check.status == "degraded"
+        assert any("usage_coverage=70.0%" in item for item in check.evidence)
+
+    def test_automation_telemetry_excludes_interactive_desktop_sessions_from_scored_coverage(self, nexo_home):
+        db_path = nexo_home / "data" / "nexo.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """CREATE TABLE automation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                backend TEXT DEFAULT '',
+                model TEXT DEFAULT '',
+                reasoning_effort TEXT DEFAULT '',
+                input_tokens INTEGER DEFAULT 0,
+                cached_input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                total_cost_usd REAL,
+                telemetry_source TEXT DEFAULT '',
+                cost_source TEXT DEFAULT '',
+                status TEXT DEFAULT 'ok',
+                session_type TEXT DEFAULT 'headless',
+                created_at TEXT DEFAULT (datetime('now'))
+            )"""
+        )
+        conn.executemany(
+            """INSERT INTO automation_runs (
+                backend, input_tokens, output_tokens, total_cost_usd, cost_source, status, session_type, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+            [
+                ("claude_code", 120, 20, 0.12, "backend", "ok", "headless"),
+                ("claude_code", 0, 0, None, "", "ok", "interactive_desktop"),
+                ("claude_code", 0, 0, None, "", "ok", "interactive_chat"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_automation_telemetry
+
+        check = check_automation_telemetry()
+        assert check.status == "healthy"
+        assert any("scored_successful_runs=1" in item for item in check.evidence)
+        assert any("interactive_unmetered_runs_excluded=2" in item for item in check.evidence)
+
+    def test_automation_telemetry_excludes_headless_zero_usage_backend_noops(self, nexo_home):
+        db_path = nexo_home / "data" / "nexo.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """CREATE TABLE automation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                backend TEXT DEFAULT '',
+                input_tokens INTEGER DEFAULT 0,
+                cached_input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                total_cost_usd REAL,
+                telemetry_source TEXT DEFAULT '',
+                cost_source TEXT DEFAULT '',
+                status TEXT DEFAULT 'ok',
+                session_type TEXT DEFAULT 'headless',
+                created_at TEXT DEFAULT (datetime('now'))
+            )"""
+        )
+        conn.executemany(
+            """INSERT INTO automation_runs (
+                backend, input_tokens, cached_input_tokens, output_tokens,
+                total_cost_usd, telemetry_source, cost_source, status, session_type, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+            [
+                ("claude_code", 120, 0, 20, 0.12, "claude_json", "backend", "ok", "headless"),
+                ("claude_code", 0, 0, 0, 0.0, "claude_json", "backend", "ok", "headless"),
+                ("claude_code", 0, 0, 0, None, "missing", "missing", "ok", "headless"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_automation_telemetry
+
+        check = check_automation_telemetry()
+        assert check.status == "healthy"
+        assert any("scored_successful_runs=1" in item for item in check.evidence)
+        assert any("headless_unmetered_runs_excluded=2" in item for item in check.evidence)
+
+    def test_local_index_hygiene_retries_transient_db_lock(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        calls = {"count": 0, "sleep": 0}
+
+        def fake_hygiene(*, fix=False, quick=True):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return {
+                "residue": {},
+                "cleanup": {},
+                "privacy": {"residue": {}, "cleanup": {}, "truncated": False, "quick": quick},
+                "removed_roots": [],
+                "quick": quick,
+            }
+
+        monkeypatch.setitem(
+            sys.modules,
+            "local_context",
+            SimpleNamespace(api=SimpleNamespace(local_index_hygiene=fake_hygiene)),
+        )
+        monkeypatch.setattr(runtime.time, "sleep", lambda _seconds: calls.__setitem__("sleep", calls["sleep"] + 1))
+
+        check = runtime.check_local_index_hygiene(fix=False)
+
+        assert check.status == "healthy"
+        assert calls == {"count": 2, "sleep": 1}
+
+    def test_local_index_hygiene_quick_truncation_without_residue_is_info(self, nexo_home, monkeypatch):
+        from doctor.providers import runtime
+
+        def fake_hygiene(*, fix=False, quick=True):
+            return {
+                "residue": {},
+                "cleanup": {},
+                "privacy": {
+                    "residue": {"assets": 0, "dirs": 0, "content_secret_assets": 0, "truncated": True},
+                    "cleanup": {},
+                    "truncated": True,
+                    "quick": quick,
+                },
+                "removed_roots": [],
+                "quick": quick,
+            }
+
+        monkeypatch.setitem(
+            sys.modules,
+            "local_context",
+            SimpleNamespace(api=SimpleNamespace(local_index_hygiene=fake_hygiene)),
+        )
+
+        check = runtime.check_local_index_hygiene(fix=False)
+
+        assert check.status == "healthy"
+        assert "quick scan" in check.summary
+        assert any("privacy_truncated=True" in item for item in check.evidence)
+
+    def test_automation_caller_coverage_warns_on_core_cron_without_matching_caller(self, nexo_home):
+        db_path = nexo_home / "data" / "nexo.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """CREATE TABLE automation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                caller TEXT DEFAULT '',
+                session_type TEXT DEFAULT 'headless',
+                started_at TEXT DEFAULT (datetime('now')),
+                created_at TEXT DEFAULT (datetime('now'))
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO cron_runs (cron_id, started_at, ended_at, exit_code) "
+            "VALUES ('email-monitor', datetime('now'), datetime('now'), 0)"
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_automation_caller_coverage
+
+        check = check_automation_caller_coverage()
+        assert check.status == "degraded"
+        assert any("email-monitor:" in item and "no_matching_caller=email_monitor" in item for item in check.evidence)
+
+    def test_automation_caller_coverage_accepts_matching_caller(self, nexo_home):
+        db_path = nexo_home / "data" / "nexo.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """CREATE TABLE automation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                caller TEXT DEFAULT '',
+                session_type TEXT DEFAULT 'headless',
+                started_at TEXT DEFAULT (datetime('now')),
+                created_at TEXT DEFAULT (datetime('now'))
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO cron_runs (cron_id, started_at, ended_at, exit_code) "
+            "VALUES ('email-monitor', datetime('now'), datetime('now'), 0)"
+        )
+        conn.execute(
+            "INSERT INTO automation_runs (caller, session_type, started_at, created_at) "
+            "VALUES ('email_monitor', 'headless', datetime('now'), datetime('now'))"
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.runtime import check_automation_caller_coverage
+
+        check = check_automation_caller_coverage()
+        assert check.status == "healthy"
+        assert any("email-monitor: cron_runs=1 caller_runs=email_monitor:1" in item for item in check.evidence)
+
+
+class TestDeepChecks:
+    def test_schema_version(self, nexo_home):
+        from doctor.providers.deep import check_schema_version
+        check = check_schema_version()
+        assert check.status == "healthy"
+        assert "42" in check.summary
+
+    def test_missing_self_audit(self, nexo_home):
+        from doctor.providers.deep import check_self_audit_summary
+        check = check_self_audit_summary()
+        assert check.status == "degraded"
+
+    def test_missing_self_audit_is_advisory_during_fresh_bootstrap(self, nexo_home):
+        (nexo_home / "version.json").write_text(json.dumps({
+            "version": "5.3.9",
+            "installed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }))
+        from doctor.providers.deep import check_self_audit_summary
+        check = check_self_audit_summary()
+        assert check.status == "healthy"
+        assert "no summary yet" in check.summary.lower()
+
+    def test_self_audit_errors_are_critical(self, nexo_home):
+        (nexo_home / "logs" / "self-audit-summary.json").write_text(json.dumps({
+            "findings": [{"severity": "ERROR", "msg": "boom"}],
+            "counts": {"error": 1, "warn": 0, "info": 0},
+        }))
+        from doctor.providers.deep import check_self_audit_summary
+        check = check_self_audit_summary()
+        assert check.status == "critical"
+
+    def test_self_audit_warns_are_advisory(self, nexo_home):
+        (nexo_home / "logs" / "self-audit-summary.json").write_text(json.dumps({
+            "findings": [{"severity": "WARN", "msg": "manual review still pending"}],
+            "counts": {"error": 0, "warn": 1, "info": 0},
+        }))
+        from doctor.providers.deep import check_self_audit_summary
+        check = check_self_audit_summary()
+        assert check.status == "healthy"
+        assert "1 warn" in check.summary
+
+    def test_failed_preflight_is_critical(self, nexo_home):
+        (nexo_home / "logs" / "runtime-preflight-summary.json").write_text(json.dumps({
+            "ok": False,
+            "checks": {"db_copy": False},
+            "errors": ["db copy failed"],
+        }))
+        from doctor.providers.deep import check_preflight_summary
+        check = check_preflight_summary()
+        assert check.status == "critical"
+
+    def test_failed_watchdog_smoke_is_critical(self, nexo_home):
+        (nexo_home / "logs" / "watchdog-smoke-summary.json").write_text(json.dumps({
+            "ok": False,
+            "findings": [{"severity": "ERROR", "msg": "hash mismatch"}],
+        }))
+        from doctor.providers.deep import check_watchdog_smoke
+        check = check_watchdog_smoke()
+        assert check.status == "critical"
+
+    def test_learning_count_uses_status_column(self, nexo_home):
+        db_path = nexo_home / "data" / "nexo.db"
+        _create_learnings_table(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "INSERT INTO learnings (category, title, content, status) VALUES (?, ?, ?, ?)",
+            ("ops", "Active", "content", "active"),
+        )
+        conn.execute(
+            "INSERT INTO learnings (category, title, content, status) VALUES (?, ?, ?, ?)",
+            ("ops", "Archived", "content", "archived"),
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.deep import check_learning_count
+
+        check = check_learning_count()
+        assert check.status == "healthy"
+        assert check.summary == "1 non-archived learnings in memory"
+
+    def test_learning_count_supports_legacy_archived_column(self, nexo_home):
+        db_path = nexo_home / "data" / "nexo.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("DROP TABLE IF EXISTS learnings")
+        conn.execute(
+            """CREATE TABLE learnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                archived INTEGER DEFAULT 0
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO learnings (category, title, content, archived) VALUES (?, ?, ?, ?)",
+            ("ops", "Active", "content", 0),
+        )
+        conn.execute(
+            "INSERT INTO learnings (category, title, content, archived) VALUES (?, ?, ?, ?)",
+            ("ops", "Archived", "content", 1),
+        )
+        conn.commit()
+        conn.close()
+
+        from doctor.providers.deep import check_learning_count
+
+        check = check_learning_count()
+        assert check.status == "healthy"
+        assert check.summary == "1 non-archived learnings in memory"
+
+
+class TestOrchestrator:
+    def test_boot_tier(self, nexo_home):
+        from doctor.orchestrator import run_doctor
+        report = run_doctor(tier="boot", plane="installation_live")
+        assert report.overall_status in ("healthy", "degraded", "critical")
+        assert report.duration_ms >= 0
+        assert len(report.checks) > 0
+
+    def test_all_tiers(self, nexo_home):
+        from doctor.orchestrator import run_doctor
+        report = run_doctor(tier="all", plane="installation_live")
+        tiers = {c.tier for c in report.checks}
+        assert "boot" in tiers
+        assert "runtime" in tiers
+        assert "deep" in tiers
+
+    def test_invalid_tier_returns_critical(self, nexo_home):
+        from doctor.orchestrator import run_doctor
+        report = run_doctor(tier="nonexistent", plane="installation_live")
+        assert report.overall_status == "critical"
+        assert len(report.checks) == 1
+        assert report.checks[0].id == "orchestrator.invalid_tier"
+        assert "nonexistent" in report.checks[0].summary
+
+    def test_doctor_defaults_blank_plane_to_runtime_personal(self, nexo_home):
+        from doctor.orchestrator import run_doctor
+
+        report = run_doctor(tier="boot")
+
+        assert all(c.id != "orchestrator.diagnostic_plane_required" for c in report.checks)
+        assert all(c.id != "orchestrator.diagnostic_plane_invalid" for c in report.checks)
+
+    def test_doctor_rejects_invalid_plane(self, nexo_home):
+        from doctor.orchestrator import run_doctor
+
+        report = run_doctor(tier="boot", plane="invented-plane")
+
+        assert report.overall_status == "critical"
+        assert len(report.checks) == 1
+        assert report.checks[0].id == "orchestrator.diagnostic_plane_invalid"
+        assert "invented-plane" in report.checks[0].summary
+
+    def test_doctor_rejects_cooperator_plane(self, nexo_home):
+        from doctor.orchestrator import run_doctor
+
+        report = run_doctor(tier="boot", plane="cooperator")
+
+        assert report.overall_status == "degraded"
+        assert len(report.checks) == 1
+        assert report.checks[0].id == "orchestrator.diagnostic_plane_mismatch"
+        assert "co-operator" in report.checks[0].summary.lower()
+
+    def test_tier_crash_is_caught_and_reported(self, nexo_home, monkeypatch):
+        from doctor import orchestrator
+
+        def exploding_runner(fix=False, plane=""):
+            raise RuntimeError("provider exploded")
+
+        monkeypatch.setitem(orchestrator._TIER_RUNNERS, "boot", exploding_runner)
+
+        report = orchestrator.run_doctor(tier="boot", plane="installation_live")
+        assert report.overall_status == "critical"
+        crash_checks = [c for c in report.checks if c.id == "orchestrator.boot_crashed"]
+        assert len(crash_checks) == 1
+        assert "RuntimeError" in crash_checks[0].summary
+        assert "provider exploded" in crash_checks[0].summary
+
+    def test_partial_tier_crash_preserves_other_tiers(self, nexo_home, monkeypatch):
+        from doctor import orchestrator
+
+        def exploding_runtime(fix=False, plane=""):
+            raise ValueError("runtime blew up")
+
+        monkeypatch.setitem(orchestrator._TIER_RUNNERS, "runtime", exploding_runtime)
+
+        report = orchestrator.run_doctor(tier="all", plane="installation_live")
+        tiers = {c.tier for c in report.checks}
+        assert "boot" in tiers
+        assert "deep" in tiers
+        crash_checks = [c for c in report.checks if c.id == "orchestrator.runtime_crashed"]
+        assert len(crash_checks) == 1
+
+
+class TestFormatters:
+    def test_json_format(self, nexo_home):
+        from doctor.orchestrator import run_doctor
+        from doctor.formatters import format_report
+        report = run_doctor(tier="boot", plane="installation_live")
+        output = format_report(report, fmt="json")
+        data = json.loads(output)
+        assert "overall_status" in data
+        assert "checks" in data
+
+    def test_text_format(self, nexo_home):
+        from doctor.orchestrator import run_doctor
+        from doctor.formatters import format_report
+        report = run_doctor(tier="boot", plane="installation_live")
+        output = format_report(report, fmt="text")
+        assert "NEXO Doctor" in output
+        assert "BOOT" in output
+
+
+class TestSafeCheck:
+    def test_safe_check_passes_through_normal_result(self):
+        from doctor.models import DoctorCheck, safe_check
+
+        def good_check():
+            return DoctorCheck(
+                id="test.good", tier="boot", status="healthy",
+                severity="info", summary="All fine",
+            )
+
+        result = safe_check(good_check)
+        assert result.id == "test.good"
+        assert result.status == "healthy"
+
+    def test_safe_check_catches_exception(self):
+        from doctor.models import safe_check
+
+        def bad_check():
+            raise RuntimeError("kaboom")
+
+        result = safe_check(bad_check)
+        assert result.status == "critical"
+        assert "bad_check" in result.id
+        assert "kaboom" in result.summary
+        assert result.evidence
+
+    def test_safe_check_forwards_args_and_kwargs(self):
+        from doctor.models import DoctorCheck, safe_check
+
+        def check_with_args(fix=False):
+            return DoctorCheck(
+                id="test.args", tier="boot", status="healthy",
+                severity="info", summary=f"fix={fix}",
+            )
+
+        result = safe_check(check_with_args, fix=True)
+        assert "fix=True" in result.summary
+
+    def test_boot_tier_survives_single_check_crash(self, nexo_home, monkeypatch):
+        from doctor.providers import boot
+
+        original_check_disk = boot.check_disk_space
+
+        def exploding_disk_check():
+            raise OSError("disk check exploded")
+
+        monkeypatch.setattr(boot, "check_disk_space", exploding_disk_check)
+        checks = boot.run_boot_checks()
+
+        ids = [c.id for c in checks]
+        assert "boot.db_exists" in ids
+        assert "boot.required_dirs" in ids
+        crash = [c for c in checks if "crashed" in c.id]
+        assert len(crash) == 1
+        assert "exploding_disk_check" in crash[0].id
+        assert crash[0].status == "critical"
+
+    def test_deep_tier_survives_single_check_crash(self, nexo_home, monkeypatch):
+        from doctor.providers import deep
+
+        def exploding_schema_check():
+            raise ValueError("schema check failed")
+
+        monkeypatch.setattr(deep, "check_schema_version", exploding_schema_check)
+        checks = deep.run_deep_checks()
+
+        crash = [c for c in checks if "crashed" in c.id]
+        assert len(crash) == 1
+        non_crash = [c for c in checks if "crashed" not in c.id]
+        assert len(non_crash) >= 3

@@ -1,0 +1,46 @@
+# NEXO Brain — runtime dependencies
+# Core (required)
+# v7.27.5 — cap fastmcp <3.2.0 hasta validar 3.2.x. Builds intermedias 3.x
+# perdieron el re-export de ToolResult desde fastmcp.tools (live failure
+# en Win10 22H2 Azure VM 2026-05-28). Mantenemos el fallback de import en
+# src/runtime_versioning.py por defensa-en-profundidad.
+fastmcp>=2.9.0,<3.2.0
+numpy
+tomli; python_version < "3.11"
+
+# Fase 2 Protocol Enforcer — Guardian classifier (call_model_raw)
+# Anthropic SDK is the default backend; OpenAI SDK covers the Codex
+# backend path (automation_backend=codex). Version floors correspond
+# to the latest APIs exercised by src/call_model_raw.py — earlier
+# versions lack APITimeoutError / APIStatusError.status_code handling.
+anthropic>=0.80.0
+openai>=2.20.0
+
+# Embedding model (optional but recommended for cognitive features).
+# fastembed is hard-pinned (==) so the offline wheel bundle is reproducible; it is
+# pure-python (py3-none-any) so the pin holds on every platform. >=0.8.0 was the
+# floor (older releases need Python <3.12 and pip iterates each obsolete version for
+# ~10 min on Ubuntu 24.04 before finding a compatible one, verified during Win11
+# clean install bootstrap); 0.8.0 is the bundled version.
+#
+# onnxruntime (fastembed's native transitive dep) is deliberately NOT hard-pinned:
+# its wheels are platform/glibc-specific — e.g. 1.26 only ships for manylinux_2_28,
+# while the offline bundle also targets manylinux_2_17/2014 (which cap at 1.19.2).
+# A `==` pin can't be satisfied for every target and breaks BOTH the cross-platform
+# wheel bundle and installs on older Linux. Let fastembed/pip resolve the best
+# onnxruntime wheel per platform.
+fastembed==0.8.0
+
+# Local Context Layer — document parsers (REQUIRED for the local memory index).
+# extractors.py imports these lazily; without them a clean bundle silently indexes
+# every PDF / XLSX / MSG as EMPTY text (the try/except returns ''). Real bug: on a
+# clean venv `import pypdf` raised ModuleNotFoundError and all invoices read blank.
+pypdf>=4.0
+openpyxl>=3.1
+extract-msg>=0.48
+
+# Dashboard (optional, only needed for `python -m dashboard.app`)
+fastapi
+uvicorn
+pydantic
+jinja2

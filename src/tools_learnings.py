@@ -1,0 +1,723 @@
+"""Learnings CRUD tools: add, search, update, delete, list."""
+
+import json
+import os
+import re
+import unicodedata
+from datetime import datetime
+
+from db import (create_learning, update_learning, delete_learning, search_learnings,
+                list_learnings, find_similar_learnings, get_db, now_epoch, supersede_learning, extract_keywords,
+                resolve_session_correction_requirements)
+from learning_resolver import (
+    applies_overlap as _canonical_applies_overlap,
+    looks_contradictory as _canonical_looks_contradictory,
+    resolve_learning_candidate,
+)
+
+NEGATION_PATTERNS = (
+    "do not", "don't", "never", "avoid", "skip", "without", "forbid", "forbidden",
+    "disable", "disabled", "remove", "ban", "bypass",
+    " no ", " nunca ", " evita ", " evitar ", " sin ", " prohibe ", " prohibido ",
+    " desactiva ", " desactivar ", " elimina ", " eliminar ", " bloquea ", " bloquear ",
+)
+CONTRADICTION_PAIRS = (
+    ("enable", "disable"),
+    ("use", "avoid"),
+    ("add", "remove"),
+    ("allow", "forbid"),
+    ("always", "never"),
+    ("before", "after"),
+    ("require", "skip"),
+    ("validate", "skip"),
+    ("validate", "bypass"),
+    ("include", "exclude"),
+    ("activar", "desactivar"),
+    ("usar", "evitar"),
+    ("usar", "no usar"),
+    ("editar", "no editar"),
+    ("tocar", "no tocar"),
+    ("anadir", "eliminar"),
+    ("permitir", "prohibir"),
+    ("validar", "saltar"),
+    ("incluir", "excluir"),
+)
+
+
+def _skip_cognitive_learning_side_effects() -> bool:
+    value = os.environ.get("NEXO_SKIP_LEARNING_COGNITIVE_INGEST", "").strip().lower()
+    return value in {"1", "true", "yes"}
+
+
+def _split_applies_to(applies_to: str) -> list[str]:
+    return [item.strip() for item in str(applies_to or "").split(",") if item.strip()]
+
+
+def _normalize_applies_token(value: str) -> str:
+    return str(value or "").replace("\\", "/").rstrip("/").lower()
+
+
+def _applies_overlap(left: str, right: str) -> bool:
+    return _canonical_applies_overlap(left, right)
+
+
+def _normalize_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(text or ""))
+    ascii_text = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return re.sub(r"\s+", " ", ascii_text.strip().lower())
+
+
+def _tokenize(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9_-]+", _normalize_text(text))
+
+
+def _contains_negation(text: str) -> bool:
+    lowered = f" {_normalize_text(text)} "
+    return any(token in lowered for token in NEGATION_PATTERNS)
+
+
+def _negated_action_verbs(text: str) -> set[str]:
+    lowered = _normalize_text(text)
+    matches = set()
+    for pattern in (
+        r"(?:never|avoid|skip|disable|remove|forbid|bypass|nunca|evita|evitar|desactiva|desactivar|elimina|eliminar|prohibe|prohibir|bloquea|bloquear)\s+([a-z0-9_-]+)",
+        r"(?:do not|don't|no)\s+([a-z0-9_-]+)",
+        r"(?:without|sin)\s+([a-z0-9_-]+)",
+    ):
+        matches.update(re.findall(pattern, lowered))
+    return {match for match in matches if len(match) > 2}
+
+
+def _looks_contradictory(existing_text: str, new_text: str) -> bool:
+    return _canonical_looks_contradictory(existing_text, new_text)
+
+
+def _find_conflicting_active_learning(conn, *, category: str, title: str, content: str,
+                                      applies_to: str, exclude_id: int | None = None) -> dict | None:
+    if not applies_to:
+        return None
+    params = [category]
+    sql = (
+        "SELECT id, title, content, applies_to FROM learnings "
+        "WHERE category = ? AND status = 'active' AND COALESCE(applies_to, '') != ''"
+    )
+    if exclude_id is not None:
+        sql += " AND id != ?"
+        params.append(exclude_id)
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    incoming_text = f"{title} {content}"
+    for row in rows:
+        if not _applies_overlap(row["applies_to"], applies_to):
+            continue
+        if _looks_contradictory(f"{row['title']} {row['content']}", incoming_text):
+            return dict(row)
+    return None
+
+
+def find_conflicting_active_learning(*, category: str, title: str, content: str,
+                                     applies_to: str, exclude_id: int | None = None) -> dict | None:
+    """Public wrapper for canonical-rule enforcement on file-scoped learnings."""
+    conn = get_db()
+    return _find_conflicting_active_learning(
+        conn,
+        category=category.lower().strip(),
+        title=title,
+        content=content,
+        applies_to=applies_to,
+        exclude_id=exclude_id,
+    )
+
+
+def _resolve_pending_correction_learning(learning_id: int) -> int:
+    """Best-effort D.5 bridge: a real learning_add resolves one open correction window."""
+    try:
+        return resolve_session_correction_requirements(learning_id=int(learning_id))
+    except Exception:
+        return 0
+
+
+def _priority_score(priority: str) -> float:
+    return {
+        "critical": 1.0,
+        "high": 0.85,
+        "medium": 0.65,
+        "low": 0.45,
+    }.get(str(priority or "medium").strip().lower(), 0.65)
+
+
+def _parse_timestamp(value) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return float(text)
+    except Exception:
+        pass
+    for fmt in (None, "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            if fmt is None:
+                return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+            return datetime.strptime(text, fmt).timestamp()
+        except Exception:
+            continue
+    return 0.0
+
+
+def _format_timestamp(value) -> str:
+    ts = _parse_timestamp(value)
+    if not ts:
+        return ""
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(value or "")
+
+
+def _recency_score(row: dict) -> float:
+    reference = _parse_timestamp(row.get("last_guard_hit_at")) or _parse_timestamp(row.get("updated_at")) or _parse_timestamp(row.get("created_at"))
+    if not reference:
+        return 0.35
+    age_days = max(0.0, (now_epoch() - reference) / 86400.0)
+    if age_days <= 7:
+        return 1.0
+    if age_days <= 30:
+        return 0.8
+    if age_days <= 90:
+        return 0.6
+    if age_days <= 180:
+        return 0.4
+    return 0.25
+
+
+def _usefulness_score(row: dict) -> float:
+    hits = int(row.get("guard_hits") or 0)
+    if hits >= 5:
+        return 1.0
+    if hits >= 3:
+        return 0.85
+    if hits >= 1:
+        return 0.65
+    return 0.35 if str(row.get("status") or "active") == "active" else 0.15
+
+
+def _source_richness_score(row: dict) -> float:
+    parts = 0.0
+    if str(row.get("reasoning") or "").strip():
+        parts += 0.25
+    if str(row.get("prevention") or "").strip():
+        parts += 0.25
+    if str(row.get("applies_to") or "").strip():
+        parts += 0.2
+    if row.get("review_due_at"):
+        parts += 0.15
+    if len(str(row.get("content") or "").strip()) >= 80:
+        parts += 0.15
+    return min(1.0, parts)
+
+
+def _contradiction_pressure_score(conn, row: dict) -> float:
+    if str(row.get("status") or "active") != "active":
+        return 0.7
+    conflicting = _find_conflicting_active_learning(
+        conn,
+        category=str(row.get("category") or ""),
+        title=str(row.get("title") or ""),
+        content=str(row.get("content") or ""),
+        applies_to=str(row.get("applies_to") or ""),
+        exclude_id=int(row.get("id") or 0),
+    )
+    return 0.0 if conflicting else 1.0
+
+
+def score_learning_quality(row: dict, conn=None) -> dict:
+    """Compute a 0-100 quality score for a learning using usefulness and conflict pressure."""
+    conn = conn or get_db()
+    confidence = min(1.0, (_priority_score(row.get("priority")) * 0.45) + (float(row.get("weight") or 0.5) * 0.55))
+    usefulness = _usefulness_score(row)
+    recency = _recency_score(row)
+    contradiction = _contradiction_pressure_score(conn, row)
+    source_richness = _source_richness_score(row)
+    status = str(row.get("status") or "active")
+    status_multiplier = 1.0 if status == "active" else 0.65 if status in {"pending_review", "review"} else 0.45
+    overall = (
+        confidence * 0.28
+        + usefulness * 0.24
+        + recency * 0.18
+        + contradiction * 0.18
+        + source_richness * 0.12
+    ) * status_multiplier
+    score = max(0, min(100, round(overall * 100)))
+    if score >= 80:
+        label = "strong"
+    elif score >= 60:
+        label = "usable"
+    elif score >= 40:
+        label = "weak"
+    else:
+        label = "fragile"
+    return {
+        "score": score,
+        "label": label,
+        "confidence": round(confidence * 100),
+        "usefulness": round(usefulness * 100),
+        "recency_relevance": round(recency * 100),
+        "contradiction_pressure": round((1.0 - contradiction) * 100),
+        "source_richness": round(source_richness * 100),
+    }
+
+
+def handle_learning_add(category: str, title: str, content: str, reasoning: str = '',
+                        prevention: str = '', applies_to: str = '', review_days: int = 30,
+                        priority: str = 'medium', supersedes_id: int = 0,
+                        source_authority: str = 'explicit_instruction') -> str:
+    """Add a new learning entry to the specified category.
+
+    Args:
+        category: Free-form category name (e.g., 'backend', 'frontend', 'devops', 'infrastructure', 'security', 'nexo-ops'). Use consistent names — learnings are grouped and searched by category.
+        title: Short title for the learning
+        content: Full description of what was learned
+        reasoning: WHY this matters — what led to discovering this, what was the context
+        prevention: Concrete rule/check that prevents repeating this mistake
+        applies_to: Files, systems, or areas this learning applies to
+        review_days: Days until this learning should be reviewed again
+        priority: critical, high, medium, low (default: medium)
+    """
+    if priority not in ('critical', 'high', 'medium', 'low'):
+        priority = 'medium'
+    category = category.lower().strip()
+    if not category:
+        return "ERROR: Category cannot be empty."
+    conn = get_db()
+    resolution = resolve_learning_candidate(
+        category=category,
+        title=title,
+        content=content,
+        reasoning=reasoning,
+        prevention=prevention,
+        applies_to=applies_to,
+        priority=priority,
+        supersedes_id=supersedes_id,
+        source_authority=source_authority,
+        conn=conn,
+    )
+    if resolution["action"] == "reject":
+        return f"ERROR: Learning candidate rejected: {resolution['reason']}."
+    if resolution["action"] == "merge":
+        existing_id = int(resolution.get("target_id") or 0)
+        existing = conn.execute("SELECT id, title, weight FROM learnings WHERE id = ?", (existing_id,)).fetchone()
+        if existing:
+            if resolution.get("reason") == "exact_title_duplicate":
+                _resolve_pending_correction_learning(existing_id)
+                return f"Learning #{existing['id']} already exists with same title in {category}: {existing['title']}. Use nexo_learning_update to modify it."
+            old_weight = float(existing["weight"] or 0.0)
+            new_weight = min(1.0, old_weight + 0.1)
+            conn.execute(
+                "UPDATE learnings SET weight = ?, updated_at = ? WHERE id = ?",
+                (new_weight, now_epoch(), existing_id),
+            )
+            conn.commit()
+            _resolve_pending_correction_learning(existing_id)
+            return (
+                f"Learning #{existing_id} resolved as merge ({resolution['reason']}, similarity "
+                f"{float(resolution.get('similarity') or 0):.2f}). No duplicate created. "
+                f"Weight bumped {old_weight:.2f} -> {new_weight:.2f}. Use nexo_learning_update(id={existing_id}) "
+                "to refine the canonical text."
+            )
+    if resolution["action"] == "conflict_review":
+        conflicting = {
+            "id": resolution.get("target_id"),
+            "title": resolution.get("target_title"),
+            "applies_to": applies_to,
+        }
+        return (
+            f"ERROR: Contradictory active learning #{conflicting['id']} already exists for applies_to="
+            f"{conflicting.get('applies_to', '')}: {conflicting['title']}. "
+            f"Supersede or update the existing canonical rule instead of creating two active file rules."
+        )
+    if resolution["action"] == "supersede":
+        supersedes_id = int(resolution.get("target_id") or supersedes_id or 0)
+
+    # ── R05 (Fase 2 Protocol Enforcer): auto-merge on high Jaccard similarity ──
+    # When a near-duplicate active learning exists (Jaccard >= R05 threshold),
+    # do NOT create a new row. Instead increment the weight on the existing
+    # learning (capped at 1.0) and return a "merged" message. Same-category
+    # scope only — different categories are legitimately distinct even if
+    # keywords overlap.
+    R05_MERGE_THRESHOLD = 0.85
+    existing_for_merge = conn.execute(
+        "SELECT id, title, content, weight FROM learnings WHERE category = ? AND status = 'active'",
+        (category,)
+    ).fetchall()
+    if existing_for_merge:
+        keywords_new = set(extract_keywords(f"{title} {content}"))
+        if keywords_new:
+            best = None  # (id, similarity, title)
+            for row in existing_for_merge:
+                keywords_existing = set(extract_keywords(f"{row['title']} {row['content']}"))
+                if not keywords_existing:
+                    continue
+                overlap = keywords_new & keywords_existing
+                union = keywords_new | keywords_existing
+                similarity = (len(overlap) / len(union)) if union else 0.0
+                if similarity >= R05_MERGE_THRESHOLD and (best is None or similarity > best[1]):
+                    best = (row["id"], similarity, row["title"], row["weight"])
+            if best is not None:
+                existing_id, similarity, existing_title, existing_weight = best
+                # Bump weight (+0.1 capped at 1.0) to strengthen the existing
+                # canonical rule. No duplicate row created.
+                new_weight = min(1.0, float(existing_weight or 0.0) + 0.1)
+                conn.execute(
+                    "UPDATE learnings SET weight = ?, updated_at = ? WHERE id = ?",
+                    (new_weight, now_epoch(), existing_id),
+                )
+                conn.commit()
+                _resolve_pending_correction_learning(int(existing_id))
+                return (
+                    f"Learning #{existing_id} matched new content at Jaccard {similarity:.2f} "
+                    f">= R05 merge threshold ({R05_MERGE_THRESHOLD:.2f}). No duplicate created. "
+                    f"Existing title: {existing_title}. Weight bumped {existing_weight or 0.0:.2f} "
+                    f"→ {new_weight:.2f}. Use nexo_learning_update(id={existing_id}) if you need to "
+                    "refine the canonical text."
+                )
+    result = create_learning(
+        category, title, content, reasoning=reasoning, supersedes_id=(int(supersedes_id) if supersedes_id else None)
+    )
+    if "error" in result:
+        return f"ERROR: {result['error']}"
+    if prevention or applies_to or review_days > 0 or priority != 'medium':
+        initial_weight = {'critical': 0.9, 'high': 0.7, 'medium': 0.5, 'low': 0.3}[priority]
+        updated_at = now_epoch()
+        review_due_at = now_epoch() + (max(1, int(review_days)) * 86400)
+        conn = get_db()
+        conn.execute(
+            "UPDATE learnings SET prevention = ?, applies_to = ?, status = COALESCE(status, 'active'), "
+            "review_due_at = ?, updated_at = ?, priority = ?, weight = ? WHERE id = ?",
+            (prevention, applies_to, review_due_at, updated_at,
+             priority, initial_weight, result["id"])
+        )
+        conn.commit()
+        result = dict(result)
+        result.update({
+            "prevention": prevention,
+            "applies_to": applies_to,
+            "status": result.get("status") or "active",
+            "review_due_at": review_due_at,
+            "updated_at": updated_at,
+            "priority": priority,
+            "weight": initial_weight,
+        })
+
+    # Cognitive ingest — embed learning for semantic search
+    new_id = result["id"]
+    if not _skip_cognitive_learning_side_effects():
+        try:
+            import cognitive
+            cognitive.ingest(f"{title}: {content}", "learning", f"L{new_id}", title, category)
+        except Exception:
+            pass
+
+    # Similarity check — detect repeated errors
+    matches = find_similar_learnings(new_id, title, content, category)
+    repetition_msg = ""
+    if matches:
+        conn = get_db()
+        for original_id, similarity in matches:
+            conn.execute(
+                "INSERT INTO error_repetitions (new_learning_id, original_learning_id, similarity, area) VALUES (?,?,?,?)",
+                (new_id, original_id, similarity, category)
+            )
+        conn.commit()
+        repetition_msg = f"\n⚠️ REPETITION WARNING: Similar to {len(matches)} existing learning(s): " + \
+            ", ".join(f"#{m[0]} ({m[1]:.0%})" for m in matches[:3])
+
+    # Somatic event logging (append-only in nexo.db, projected to cognitive.db nightly)
+    try:
+        if applies_to:
+            for file_path in [f.strip() for f in applies_to.split(",") if f.strip()]:
+                get_db().execute(
+                    "INSERT INTO somatic_events (target, target_type, event_type, delta, source) VALUES (?, ?, ?, ?, ?)",
+                    (file_path, "file", "learning_add", 0.15, f"learning:{new_id}")
+                )
+        # Area + extra file pain ONLY for repeated errors
+        if matches:
+            get_db().execute(
+                "INSERT INTO somatic_events (target, target_type, event_type, delta, source) VALUES (?, ?, ?, ?, ?)",
+                (category, "area", "error_repetition", 0.15, f"learning:{new_id}")
+            )
+            if applies_to:
+                for file_path in [f.strip() for f in applies_to.split(",") if f.strip()]:
+                    get_db().execute(
+                        "INSERT INTO somatic_events (target, target_type, event_type, delta, source) VALUES (?, ?, ?, ?, ?)",
+                        (file_path, "file", "error_repetition", 0.25, f"learning:{new_id}")
+                    )
+        get_db().commit()
+    except Exception:
+        pass  # Somatic event logging is best-effort
+
+    # Knowledge graph incremental population
+    try:
+        from kg_populate import on_learning_add
+        on_learning_add(new_id, category, title, applies_to)
+    except Exception:
+        pass
+
+    if supersedes_id:
+        superseded = supersede_learning(int(supersedes_id), new_id, f"Superseded by learning #{new_id}.")
+        if "error" in superseded:
+            return f"ERROR: Learning #{new_id} created but supersede failed: {superseded['error']}"
+
+    # Post-insert verification: confirm the learning actually persisted
+    verify_conn = get_db()
+    verified = verify_conn.execute(
+        "SELECT id, title, category FROM learnings WHERE id = ? AND status = 'active'",
+        (result["id"],)
+    ).fetchone()
+    if not verified:
+        return (
+            f"⚠ PERSISTENCE FAILURE: Learning #{result['id']} was inserted but NOT found on verification read. "
+            f"Retry nexo_learning_add or investigate DB integrity."
+        )
+
+    # Fase 2 item 3: when a learning lands with an enforceable prevention
+    # rule, scan recent decisions for ones that would have been decided
+    # differently and surface them as deterministic followups. Best-effort:
+    # a failure here must NEVER block the learning insert that the user
+    # already verified above.
+    retro_meta_msg = ""
+    if prevention:
+        try:
+            from retroactive_learnings import apply_learning_retroactively
+            retro_result = apply_learning_retroactively(
+                int(result["id"]),
+                lookback_days=14,
+                max_matches=5,
+                min_score=0.4,
+            )
+            if retro_result.get("followups_created"):
+                retro_meta_msg = (
+                    f"\n📜 Retroactive scan: {retro_result['followups_created']} "
+                    f"past decision(s) flagged for review (scanned "
+                    f"{retro_result.get('scanned', 0)})"
+                )
+        except Exception:
+            pass  # Best-effort surfacing only
+
+    meta = []
+    resolved_corrections = _resolve_pending_correction_learning(int(result["id"]))
+    if prevention:
+        meta.append("with prevention")
+    if applies_to:
+        meta.append(f"applies_to={applies_to}")
+    if supersedes_id:
+        meta.append(f"supersedes={int(supersedes_id)}")
+    meta_str = f" ({', '.join(meta)})" if meta else ""
+    correction_msg = (
+        f"\nD.5: resolved {resolved_corrections} pending correction learning requirement(s)."
+        if resolved_corrections else ""
+    )
+    return f"Learning #{result['id']} added in {category}: {title}{meta_str} ✓verified{repetition_msg}{retro_meta_msg}{correction_msg}"
+
+
+def handle_learning_resolve_candidate(category: str, title: str, content: str, reasoning: str = '',
+                                      prevention: str = '', applies_to: str = '',
+                                      priority: str = 'medium', supersedes_id: int = 0,
+                                      source_authority: str = 'inference') -> str:
+    """Dry-run the canonical learning resolver without mutating state."""
+    result = resolve_learning_candidate(
+        category=category,
+        title=title,
+        content=content,
+        reasoning=reasoning,
+        prevention=prevention,
+        applies_to=applies_to,
+        priority=priority,
+        supersedes_id=supersedes_id,
+        source_authority=source_authority,
+    )
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def handle_learning_search(query: str, category: str = '') -> str:
+    """Search learnings by query string, optionally filtered by category."""
+    results = search_learnings(query, category if category else None)
+    if not results:
+        return f"No results for '{query}'."
+    lines = [f"RESULTS ({len(results)}):"]
+    conn = get_db()
+    for r in results:
+        snippet = r["content"][:100] + "..." if len(r["content"]) > 100 else r["content"]
+        status = r.get("status", "active")
+        review_due = r.get("review_due_at")
+        review_note = f" | review_due={review_due:.0f}" if isinstance(review_due, (int, float)) and review_due else ""
+        pri = r.get("priority", "medium") or "medium"
+        w = r.get("weight", 0.5) or 0.5
+        quality = score_learning_quality(r, conn)
+        pri_icon = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "⚪"}.get(pri, "🟡")
+        lines.append(f"  #{r['id']} [{r['category']}] [{status}] {pri_icon}{pri} w={w:.2f} q={quality['score']} {r['title']}{review_note}")
+        lines.append(f"    {snippet}")
+        if r.get("prevention"):
+            lines.append(f"    Prevention: {r['prevention'][:100]}")
+
+    # v1.2: Passive rehearsal — strengthen matching cognitive memories
+    if not _skip_cognitive_learning_side_effects():
+        try:
+            import cognitive
+            for r in results[:5]:
+                cognitive.rehearse_by_content(f"{r.get('title', '')} {r.get('content', '')[:200]}")
+        except Exception:
+            pass
+
+    return "\n".join(lines)
+
+
+def handle_learning_update(id: int, title: str = '', content: str = '', category: str = '',
+                           reasoning: str = '', prevention: str = '', applies_to: str = '',
+                           status: str = '', review_days: int = 0, priority: str = '',
+                           supersedes_id: int = 0) -> str:
+    """Update an existing learning, including review metadata and priority."""
+    conn = get_db()
+    current = conn.execute("SELECT * FROM learnings WHERE id = ?", (id,)).fetchone()
+    if not current:
+        return f"ERROR: Learning #{id} not found."
+    kwargs = {}
+    if title:
+        kwargs["title"] = title
+    if content:
+        kwargs["content"] = content
+    if category:
+        kwargs["category"] = category.lower().strip()
+    if reasoning:
+        kwargs["reasoning"] = reasoning
+    if prevention:
+        kwargs["prevention"] = prevention
+    if applies_to:
+        kwargs["applies_to"] = applies_to
+    if status:
+        kwargs["status"] = status
+    if review_days > 0:
+        kwargs["review_days"] = review_days
+    if not kwargs:
+        return "ERROR: Nothing to update. Provide new fields."
+    effective_category = kwargs.get("category", current["category"])
+    effective_title = kwargs.get("title", current["title"])
+    effective_content = kwargs.get("content", current["content"])
+    effective_applies_to = kwargs.get("applies_to", current["applies_to"])
+    effective_status = kwargs.get("status", current["status"])
+    if effective_status != "superseded":
+        conflicting = _find_conflicting_active_learning(
+            conn,
+            category=effective_category,
+            title=effective_title,
+            content=effective_content,
+            applies_to=effective_applies_to,
+            exclude_id=id,
+        )
+        if conflicting and int(supersedes_id or 0) != int(conflicting["id"]):
+            return (
+                f"ERROR: Update would conflict with active learning #{conflicting['id']} "
+                f"for applies_to={conflicting.get('applies_to', '')}. "
+                f"Supersede the old rule or merge into one canonical learning."
+            )
+    basic_kwargs = {k: v for k, v in kwargs.items() if k in {"title", "content", "category", "reasoning"}}
+    result = update_learning(id, **basic_kwargs)
+    if "error" in result:
+        return f"ERROR: {result['error']}"
+    extra_updates = {}
+    if prevention:
+        extra_updates["prevention"] = prevention
+    if applies_to:
+        extra_updates["applies_to"] = applies_to
+    if status:
+        extra_updates["status"] = status
+    if priority and priority in ('critical', 'high', 'medium', 'low'):
+        extra_updates["priority"] = priority
+        extra_updates["weight"] = {'critical': 0.9, 'high': 0.7, 'medium': 0.5, 'low': 0.3}[priority]
+    if review_days > 0:
+        extra_updates["review_due_at"] = now_epoch() + (max(1, int(review_days)) * 86400)
+    if extra_updates:
+        extra_updates["updated_at"] = now_epoch()
+        set_clause = ", ".join(f"{k} = ?" for k in extra_updates)
+        values = list(extra_updates.values()) + [id]
+        conn = get_db()
+        conn.execute(f"UPDATE learnings SET {set_clause} WHERE id = ?", values)
+        conn.commit()
+    if supersedes_id:
+        superseded = supersede_learning(int(supersedes_id), id, f"Superseded by learning #{id}.")
+        if "error" in superseded:
+            return f"ERROR: Learning #{id} updated but supersede failed: {superseded['error']}"
+    return f"Learning #{id} updated."
+
+
+def handle_learning_delete(id: int) -> str:
+    """Delete a learning entry by ID."""
+    deleted = delete_learning(id)
+    if not deleted:
+        return f"ERROR: Learning #{id} not found."
+    return f"Learning #{id} deleted."
+
+
+def handle_learning_list(category: str = '', created_after: str = '', created_before: str = '') -> str:
+    """List all learnings, grouped by category if no filter given."""
+    after_ts = _parse_timestamp(created_after) if str(created_after or "").strip() else None
+    before_ts = _parse_timestamp(created_before) if str(created_before or "").strip() else None
+    results = list_learnings(category if category else None, after_ts, before_ts)
+    if not results:
+        label = category if category else "ALL"
+        return f"LEARNINGS {label} (0): No entries."
+
+    conn = get_db()
+    if category:
+        label = category.upper()
+        lines = [f"LEARNINGS {label} ({len(results)}):"]
+        for r in results:
+            pri = r.get("priority", "medium") or "medium"
+            w = r.get("weight", 0.5) or 0.5
+            quality = score_learning_quality(r, conn)
+            pri_icon = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "⚪"}.get(pri, "🟡")
+            created = _format_timestamp(r.get("created_at")) or "unknown"
+            lines.append(f"  #{r['id']} [{r.get('status','active')}] created_at={created} {pri_icon}{pri} w={w:.2f} q={quality['score']} {r['title']}")
+    else:
+        lines = [f"LEARNINGS ALL ({len(results)}):"]
+        current_cat = None
+        for r in results:
+            if r["category"] != current_cat:
+                current_cat = r["category"]
+                lines.append(f"\n  [{current_cat.upper()}]")
+            pri = r.get("priority", "medium") or "medium"
+            w = r.get("weight", 0.5) or 0.5
+            quality = score_learning_quality(r, conn)
+            pri_icon = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "⚪"}.get(pri, "🟡")
+            created = _format_timestamp(r.get("created_at")) or "unknown"
+            lines.append(f"    #{r['id']} [{r.get('status','active')}] created_at={created} {pri_icon}{pri} w={w:.2f} q={quality['score']} {r['title']}")
+
+    return "\n".join(lines)
+
+
+def handle_learning_quality(id: int = 0, category: str = "", status: str = "active", limit: int = 20) -> str:
+    """Inspect memory quality so fragile learnings can be tightened before they mislead guard/retrieval."""
+    results = list_learnings(category if category else None)
+    if id:
+        results = [row for row in results if int(row.get("id") or 0) == int(id)]
+    if status:
+        results = [row for row in results if str(row.get("status") or "").lower() == str(status).lower()]
+    results = results[: max(1, int(limit or 20))]
+    if not results:
+        return "LEARNING QUALITY (0): No matching learnings."
+
+    conn = get_db()
+    scored = []
+    for row in results:
+        quality = score_learning_quality(row, conn)
+        scored.append((row, quality))
+    avg_score = round(sum(item[1]["score"] for item in scored) / len(scored))
+    weak = [item for item in scored if item[1]["score"] < 60]
+    lines = [f"LEARNING QUALITY ({len(scored)}) avg={avg_score} weak={len(weak)}:"]
+    for row, quality in scored:
+        lines.append(
+            f"  #{row['id']} q={quality['score']} [{quality['label']}] {row['title']} "
+            f"(conf={quality['confidence']} useful={quality['usefulness']} recency={quality['recency_relevance']} "
+            f"pressure={quality['contradiction_pressure']} richness={quality['source_richness']})"
+        )
+    return "\n".join(lines)

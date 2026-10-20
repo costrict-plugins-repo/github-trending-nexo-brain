@@ -1,0 +1,6223 @@
+from __future__ import annotations
+"""NEXO Auto-Update — lightweight startup check for git updates and file-based migrations.
+
+Called once per server startup. Respects a 1-hour cooldown to avoid redundant checks.
+Never blocks startup for more than 5 seconds. Logs errors and continues on failure.
+
+This is separate from plugins/update.py which handles MANUAL updates with rollback.
+"""
+
+import json
+import hashlib
+import os
+import paths
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+try:
+    from product_mode import desktop_product_requested, enforce_desktop_product_contract
+    from product_mode import DESKTOP_EVOLUTION_SUPPORT_MODE
+except ModuleNotFoundError as exc:
+    if getattr(exc, "name", "") != "product_mode":
+        raise
+    _core_runtime = Path(__file__).resolve().parent / "core"
+    if _core_runtime.is_dir():
+        core_path = str(_core_runtime)
+        if core_path not in sys.path:
+            sys.path.insert(0, core_path)
+    from product_mode import desktop_product_requested, enforce_desktop_product_contract
+    from product_mode import DESKTOP_EVOLUTION_SUPPORT_MODE
+from runtime_home import export_resolved_nexo_home, managed_nexo_home
+
+try:
+    from cognitive_paths import cleanup_legacy_cognitive_db_artifacts
+except ModuleNotFoundError as exc:
+    if getattr(exc, "name", "") != "cognitive_paths":
+        raise
+
+    # Older installed runtimes may import this newer auto_update.py before
+    # cognitive_paths.py has been copied into place. Keep update importable so
+    # the sync can finish and deliver the missing module.
+    def cleanup_legacy_cognitive_db_artifacts(*, dry_run: bool = False) -> dict:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "cognitive_paths_unavailable_until_runtime_sync",
+            "dry_run": dry_run,
+        }
+
+try:
+    from tree_hygiene import is_duplicate_artifact_name
+except ModuleNotFoundError as exc:
+    if getattr(exc, "name", "") != "tree_hygiene":
+        raise
+
+    # Older installed runtimes may update into code that references
+    # tree_hygiene.py before that module has been copied over. Fall back
+    # to "no duplicate" so the update can complete and deliver the module.
+    def is_duplicate_artifact_name(_path) -> bool:
+        return False
+
+NEXO_HOME = export_resolved_nexo_home()
+DATA_DIR = paths.data_dir()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Repo root: go up from src/
+SRC_DIR = Path(__file__).resolve().parent
+NEXO_CODE = Path(os.environ.get("NEXO_CODE", str(SRC_DIR)))
+REPO_DIR = SRC_DIR.parent
+REPAIR_BASELINE_FILE = "last-repair-baseline.json"
+
+
+def _resolve_repo_dir() -> Path:
+    """Return the source repo root, falling back to NEXO_HOME for npm installs.
+
+    On git installs SRC_DIR is ``<repo>/src`` so parent is the repo root.
+    On npm installs SRC_DIR *is* NEXO_HOME (``~/.nexo``) so parent is ``~``,
+    which has no ``templates/`` or ``migrations/``.  In that case we fall back
+    to NEXO_HOME itself where the installer already copied the runtime files.
+    """
+    candidate = SRC_DIR.parent
+    if (candidate / "templates").is_dir():
+        return candidate
+    if (NEXO_HOME / "templates").is_dir():
+        return NEXO_HOME
+    return candidate
+
+
+_RESOLVED_REPO_DIR = _resolve_repo_dir()
+
+
+def _stamp_runtime_repair_baseline(dest: Path) -> str:
+    operations_dir = dest / "operations"
+    operations_dir.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    payload = {
+        "last_repair_epoch": now,
+        "last_repair_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        "source": "auto_update._run_runtime_post_sync",
+        "reason": "verified runtime repair baseline after update/post-sync",
+    }
+    (operations_dir / REPAIR_BASELINE_FILE).write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    )
+    return "runtime-repair-baseline"
+
+LAST_CHECK_FILE = DATA_DIR / "auto_update_last_check.json"
+MIGRATION_VERSION_FILE = DATA_DIR / "migration_version"
+CLAUDE_MD_VERSION_FILE = DATA_DIR / "claude_md_version.txt"
+MIGRATIONS_DIR = _RESOLVED_REPO_DIR / "migrations"
+TEMPLATE_FILE = _RESOLVED_REPO_DIR / "templates" / "CLAUDE.md.template"
+
+CHECK_COOLDOWN_SECONDS = 3600  # 1 hour
+GIT_TIMEOUT_SECONDS = 4  # stay well under the 5s total budget
+RUNTIME_POST_SYNC_TIMEOUT_SECONDS = 180
+CRITICAL_BACKUP_TABLES = ("learnings", "session_diary", "guard_checks", "protocol_debt")
+LOCAL_CONTEXT_BACKUP_TABLES = (
+    "local_index_roots",
+    "local_index_exclusions",
+    "local_index_jobs",
+    "local_index_checkpoints",
+    "local_index_state",
+    "local_index_errors",
+    "local_index_logs",
+    "local_assets",
+    "local_asset_versions",
+    "local_chunks",
+    "local_entities",
+    "local_relations",
+    "local_embeddings",
+    "local_context_queries",
+    "local_index_dirs",
+)
+PROTECTED_BACKUP_TABLES = CRITICAL_BACKUP_TABLES + LOCAL_CONTEXT_BACKUP_TABLES
+
+
+def _backup_validation_tables(db_file: Path) -> tuple[str, ...]:
+    if db_file.name == "local-context.db":
+        return LOCAL_CONTEXT_BACKUP_TABLES
+    return PROTECTED_BACKUP_TABLES
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+BACKUP_MAX_BYTES = paths.backup_retention_cap_bytes()
+BACKUP_MIN_FREE_BYTES = paths.backup_min_free_bytes()
+LOCAL_CONTEXT_MAX_BACKUP_BYTES = _env_int("NEXO_LOCAL_CONTEXT_MAX_BACKUP_BYTES", 2 * 1024 * 1024 * 1024)
+_LAST_BACKUP_ERROR = ""
+
+
+def _run_runtime_backup_prune() -> None:
+    result = paths.run_runtime_backup_prune(max_bytes=BACKUP_MAX_BYTES)
+    if result.get("ok") is False and not result.get("skipped"):
+        _log(f"Backup self-clean warning: {result.get('error') or result.get('stderr') or 'unknown'}")
+
+
+def _backup_free_bytes() -> int | None:
+    backup_root = paths.backups_dir()
+    try:
+        usage = shutil.disk_usage(backup_root if backup_root.exists() else backup_root.parent)
+        return int(usage.free)
+    except Exception:
+        return None
+
+
+def _backup_space_error() -> str | None:
+    return paths.backup_space_error(reason="auto_update")
+
+
+def _should_include_local_context_backup(path: Path) -> bool:
+    try:
+        return path.stat().st_size <= LOCAL_CONTEXT_MAX_BACKUP_BYTES
+    except OSError:
+        return False
+
+
+CLASSIFIER_INSTALL_TIMEOUT_SECONDS = 1800
+CLASSIFIER_INSTALL_JOIN_SECONDS = 1500
+CLASSIFIER_INSTALL_LOG = paths.logs_dir() / "classifier-install.log"
+CLASSIFIER_INSTALL_STATE = paths.operations_dir() / "classifier-install-state.json"
+CLASSIFIER_INSTALL_PACKAGES = (
+    "transformers",
+    "torch",
+    "sentencepiece",
+    "sentence-transformers",
+)
+_CLASSIFIER_INSTALL_THREAD: threading.Thread | None = None
+_CORE_SCRIPT_RUNTIME_FILES = frozenset({
+    ".watchdog-hashes",
+    ".watchdog-fails",
+    ".watchdog-nexo-repair.lock",
+})
+_LEGACY_PERSONAL_BRAIN_DB_STUBS = frozenset({
+    "brain.db",
+    "cron_runs.db",
+    "nexo.db",
+    "nexo_brain.db",
+    "runtime.db",
+})
+
+
+def _log(msg: str):
+    """Log to stderr with prefix."""
+    print(f"[NEXO auto-update] {msg}", file=sys.stderr)
+
+
+def _runtime_copy_ignore(*extra_patterns: str):
+    base_ignore = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", "*.db", *extra_patterns)
+
+    def _ignore(dir_name: str, names: list[str]) -> set[str]:
+        ignored = set(base_ignore(dir_name, names))
+        ignored.update(
+            name for name in names
+            if is_duplicate_artifact_name(Path(dir_name) / name)
+        )
+        return ignored
+
+    return _ignore
+
+
+def _critical_table_count(db_path: Path, table: str) -> int | None:
+    """Return COUNT(*) for a critical table when it exists, otherwise None."""
+    import sqlite3
+
+    conn = None
+    try:
+        conn = sqlite3.connect(str(db_path))
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name = ?",
+            (table,),
+        ).fetchone()
+        if not exists:
+            return None
+        row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _find_primary_db_path() -> Path | None:
+    """Return the main nexo.db path if present."""
+    for candidate in (DATA_DIR / "nexo.db", NEXO_HOME / "nexo.db", SRC_DIR / "nexo.db"):
+        if candidate.is_file():
+            try:
+                if candidate.parent == NEXO_HOME and candidate.stat().st_size == 0:
+                    continue
+            except OSError:
+                pass
+            return candidate
+    return None
+
+
+def _cleanup_legacy_root_db_stubs(runtime_root: Path = NEXO_HOME, *, dry_run: bool = False) -> dict:
+    """Archive zero-byte DB leftovers from the pre-F0.6 flat layout."""
+    runtime_root = Path(runtime_root)
+    canonical_db = runtime_root / "runtime" / "data" / "nexo.db"
+    report = {
+        "ok": True,
+        "dry_run": dry_run,
+        "candidates": [],
+        "archived": [],
+        "errors": [],
+    }
+    if not canonical_db.is_file():
+        return report
+
+    backup_root: Path | None = None
+    for candidate in (runtime_root / "nexo.db", runtime_root / "brain.db"):
+        if not candidate.is_file():
+            continue
+        try:
+            size = int(candidate.stat().st_size)
+        except OSError as exc:
+            report["errors"].append({"path": str(candidate), "error": str(exc)})
+            continue
+        if size != 0:
+            continue
+        report["candidates"].append({"path": str(candidate), "size": size})
+        if dry_run:
+            continue
+
+        if backup_root is None:
+            backup_root = paths.create_backup_dir("legacy-root-db-stubs")
+        target = backup_root / candidate.name
+        try:
+            shutil.move(str(candidate), str(target))
+            report["archived"].append({"path": str(candidate), "backup_path": str(target)})
+        except Exception as exc:
+            report["errors"].append({"path": str(candidate), "error": str(exc)})
+    if backup_root is not None:
+        paths.finalize_backup_snapshot(backup_root)
+    return report
+
+
+def _sqlite_table_names(db_path: Path) -> list[str] | None:
+    """Return user tables for a SQLite file or ``None`` when unreadable."""
+    import sqlite3
+
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ).fetchall()
+        return [str(row[0]) for row in rows if row and row[0]]
+    except Exception:
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _cleanup_empty_personal_brain_db_stubs(runtime_root: Path = NEXO_HOME, *, dry_run: bool = False) -> dict:
+    """Archive obsolete DB shells from ``personal/brain`` after F0.6 migration.
+
+    Older layouts and partial migrations sometimes left duplicate DB files in
+    ``personal/brain``. Post-F0.6 those DBs are not canonical anymore: the live
+    runtime DBs live under ``runtime/data``. This helper only archives files
+    from a known allowlist when they are clearly empty residue:
+    - zero-byte files, or
+    - SQLite shells with zero tables
+
+    Any file with real tables is left untouched.
+    """
+    runtime_root = Path(runtime_root)
+    personal_brain_dir = runtime_root / "personal" / "brain"
+    report = {
+        "ok": True,
+        "dry_run": dry_run,
+        "candidates": [],
+        "archived": [],
+        "skipped": [],
+        "errors": [],
+    }
+    if not personal_brain_dir.is_dir():
+        return report
+
+    backup_root: Path | None = None
+    for name in sorted(_LEGACY_PERSONAL_BRAIN_DB_STUBS):
+        candidate = personal_brain_dir / name
+        if not candidate.is_file():
+            continue
+        try:
+            size = int(candidate.stat().st_size)
+        except OSError as exc:
+            report["errors"].append({"path": str(candidate), "error": str(exc)})
+            continue
+
+        reason = ""
+        if size == 0:
+            reason = "zero-byte"
+        else:
+            tables = _sqlite_table_names(candidate)
+            if tables is None:
+                report["skipped"].append({"path": str(candidate), "reason": "uninspectable"})
+                continue
+            if tables:
+                report["skipped"].append({
+                    "path": str(candidate),
+                    "reason": "has-tables",
+                    "table_count": len(tables),
+                })
+                continue
+            reason = "sqlite-empty-shell"
+
+        report["candidates"].append({"path": str(candidate), "size": size, "reason": reason})
+        if dry_run:
+            continue
+
+        if backup_root is None:
+            backup_root = paths.create_backup_dir("legacy-personal-brain-db-stubs")
+        target = backup_root / candidate.name
+        try:
+            shutil.move(str(candidate), str(target))
+            report["archived"].append({
+                "path": str(candidate),
+                "backup_path": str(target),
+                "reason": reason,
+            })
+        except Exception as exc:
+            report["errors"].append({"path": str(candidate), "error": str(exc)})
+    if backup_root is not None:
+        paths.finalize_backup_snapshot(backup_root)
+    return report
+
+
+def _validate_db_backup(source_db: Path, backup_db: Path) -> dict:
+    """Check that a backup preserves non-empty critical tables from the source DB."""
+    report = {
+        "ok": True,
+        "source_db": str(source_db),
+        "backup_db": str(backup_db),
+        "source_counts": {},
+        "backup_counts": {},
+        "regressions": [],
+        "errors": [],
+    }
+    if not source_db.is_file():
+        report["ok"] = False
+        report["errors"].append(f"source db missing: {source_db}")
+        return report
+    if not backup_db.is_file():
+        report["ok"] = False
+        report["errors"].append(f"backup db missing: {backup_db}")
+        return report
+
+    for table in _backup_validation_tables(source_db):
+        source_count = _critical_table_count(source_db, table)
+        backup_count = _critical_table_count(backup_db, table)
+        report["source_counts"][table] = source_count
+        report["backup_counts"][table] = backup_count
+
+        if source_count is None:
+            continue
+        if backup_count is None:
+            report["regressions"].append({
+                "table": table,
+                "source": source_count,
+                "backup": None,
+                "reason": "missing_in_backup",
+            })
+            continue
+        if source_count > 0 and backup_count == 0:
+            report["regressions"].append({
+                "table": table,
+                "source": source_count,
+                "backup": backup_count,
+                "reason": "critical_rows_lost",
+            })
+
+    if report["regressions"] or report["errors"]:
+        report["ok"] = False
+    return report
+
+
+def _create_validated_db_backup() -> tuple[str | None, dict | None]:
+    """Create a DB backup and validate that critical tables still contain data."""
+    backup_dir = _backup_dbs()
+    if not backup_dir:
+        if _LAST_BACKUP_ERROR:
+            return None, {
+                "ok": False,
+                "reports": [{
+                    "ok": False,
+                    "source_db": "",
+                    "backup_db": "",
+                    "errors": [_LAST_BACKUP_ERROR],
+                    "regressions": [],
+                }],
+            }
+        return None, None
+
+    source_dbs: list[Path] = []
+    primary_db = _find_primary_db_path()
+    if primary_db is not None:
+        source_dbs.append(primary_db)
+    local_context_db = paths.memory_dir() / "local-context.db"
+    if local_context_db.is_file() and _should_include_local_context_backup(local_context_db):
+        source_dbs.append(local_context_db)
+    if not source_dbs:
+        return backup_dir, None
+
+    reports = []
+    ok = True
+    for source_db in source_dbs:
+        report = _validate_db_backup(source_db, Path(backup_dir) / source_db.name)
+        reports.append(report)
+        if not report["ok"]:
+            ok = False
+            details = ", ".join(
+                f"{item['table']} {item['source']}->{item['backup']}"
+                for item in report["regressions"]
+            ) or "; ".join(report["errors"])
+            _log(f"DB backup validation failed ({source_db.name}): {details}")
+    return backup_dir, {"ok": ok, "reports": reports}
+
+
+def _read_last_check() -> dict:
+    """Read last check state from disk."""
+    try:
+        if LAST_CHECK_FILE.exists():
+            return json.loads(LAST_CHECK_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _write_last_check(data: dict):
+    """Persist last check state."""
+    try:
+        LAST_CHECK_FILE.write_text(json.dumps(data))
+    except Exception as e:
+        _log(f"Failed to write last-check file: {e}")
+
+
+def _sync_watchdog_hash_registry():
+    """Keep the immutable-hash registry aligned with the installed watchdog script.
+
+    Folds any pre-F0.6 legacy registry at ``paths.legacy_watchdog_hashes_path()``
+    into the canonical F0.6 file and then drops the legacy artifact so a later
+    ``ls ~/.nexo/scripts/.watchdog-hashes`` is empty (unless ``~/.nexo/scripts``
+    is itself a symlink to the canonical dir, in which case both paths already
+    point at the same inode).
+    """
+    try:
+        watchdog_file = paths.core_scripts_dir() / "nexo-watchdog.sh"
+        if not watchdog_file.exists():
+            return
+        registry_file = paths.core_scripts_dir() / ".watchdog-hashes"
+        legacy_registry_file = paths.legacy_watchdog_hashes_path()
+        entries: dict[str, str] = {}
+
+        def _load(path: Path) -> None:
+            if not path.exists():
+                return
+            try:
+                for line in path.read_text().splitlines():
+                    if "|" not in line:
+                        continue
+                    filepath, expected = line.split("|", 1)
+                    if filepath:
+                        entries[filepath] = expected
+            except Exception as load_error:
+                _log(f"watchdog hash registry load error at {path}: {load_error}")
+
+        _load(registry_file)
+
+        legacy_is_canonical_alias = False
+        if legacy_registry_file.exists():
+            try:
+                legacy_is_canonical_alias = (
+                    registry_file.exists()
+                    and legacy_registry_file.resolve() == registry_file.resolve()
+                )
+            except Exception:
+                legacy_is_canonical_alias = False
+            if not legacy_is_canonical_alias:
+                _load(legacy_registry_file)
+
+        actual_hash = hashlib.sha256(watchdog_file.read_bytes()).hexdigest()
+        entries[str(watchdog_file)] = actual_hash
+        registry_file.write_text(
+            "\n".join(f"{filepath}|{digest}" for filepath, digest in sorted(entries.items())) + "\n"
+        )
+
+        if (
+            legacy_registry_file.exists()
+            and not legacy_is_canonical_alias
+            and legacy_registry_file != registry_file
+        ):
+            try:
+                legacy_registry_file.unlink()
+                _log(f"watchdog hash registry migrated from legacy path: {legacy_registry_file}")
+            except Exception as unlink_error:
+                _log(f"watchdog hash registry legacy cleanup skipped: {unlink_error}")
+    except Exception as e:
+        _log(f"watchdog hash registry sync error: {e}")
+
+
+def _warn_protected_runtime_location():
+    """Log a targeted macOS TCC warning for risky NEXO_HOME locations."""
+    if sys.platform != "darwin":
+        return
+    try:
+        home = Path.home()
+        resolved = NEXO_HOME.resolve(strict=False)
+        protected_roots = (
+            home / "Documents",
+            home / "Desktop",
+            home / "Downloads",
+            home / "Library" / "Mobile Documents",
+        )
+        if any(resolved == root or root in resolved.parents for root in protected_roots):
+            _log(
+                "NEXO_HOME is inside a macOS protected folder. Background jobs may need Full Disk Access "
+                "for /bin/bash and the NEXO Python runtime, or NEXO_HOME should be moved outside "
+                "Documents/Desktop/Downloads/iCloud Drive."
+            )
+    except Exception as e:
+        _log(f"protected runtime warning skipped: {e}")
+
+
+def _is_git_repo() -> bool:
+    """Check if REPO_DIR is inside a git repository."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=str(REPO_DIR),
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+        return result.returncode == 0 and result.stdout.strip() == "true"
+    except Exception:
+        return False
+
+
+def _git(*args) -> tuple[int, str, str]:
+    """Run a git command in REPO_DIR. Returns (returncode, stdout, stderr)."""
+    result = subprocess.run(
+        ["git"] + list(args),
+        cwd=str(REPO_DIR),
+        capture_output=True,
+        text=True,
+        timeout=GIT_TIMEOUT_SECONDS,
+    )
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+
+def _read_package_version() -> str:
+    """Read version from package.json."""
+    try:
+        pkg = REPO_DIR / "package.json"
+        if pkg.exists():
+            return json.loads(pkg.read_text()).get("version", "unknown")
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _runtime_cli_wrapper_text() -> str:
+    return (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n\n"
+        f'DEFAULT_NEXO_HOME="{managed_nexo_home()}"\n'
+        'RUNTIME_HOME="${NEXO_HOME:-$DEFAULT_NEXO_HOME}"\n'
+        'if [ "$RUNTIME_HOME" = "${HOME}/claude" ] && [ -e "$DEFAULT_NEXO_HOME" ]; then\n'
+        '  RUNTIME_HOME="$DEFAULT_NEXO_HOME"\n'
+        'fi\n'
+        'if [ -e "$RUNTIME_HOME" ] && [ -e "$DEFAULT_NEXO_HOME" ]; then\n'
+        '  RESOLVED_RUNTIME="$(cd "$RUNTIME_HOME" 2>/dev/null && pwd -P || true)"\n'
+        '  RESOLVED_DEFAULT="$(cd "$DEFAULT_NEXO_HOME" 2>/dev/null && pwd -P || true)"\n'
+        '  if [ -n "$RESOLVED_RUNTIME" ] && [ "$RESOLVED_RUNTIME" = "$RESOLVED_DEFAULT" ]; then\n'
+        '    RUNTIME_HOME="$DEFAULT_NEXO_HOME"\n'
+        '  fi\n'
+        'fi\n'
+        'NEXO_HOME="$RUNTIME_HOME"\n'
+        'export NEXO_HOME\n'
+        'export PYTHONDONTWRITEBYTECODE=1\n'
+        'resolve_code_dir() {\n'
+        '  if [ -n "${NEXO_CODE:-}" ] && [ -f "${NEXO_CODE%/}/cli.py" ]; then\n'
+        '    printf \'%s\\n\' "${NEXO_CODE%/}"\n'
+        '    return 0\n'
+        '  fi\n'
+        '  if [ -f "$NEXO_HOME/core/current/cli.py" ]; then\n'
+        '    printf \'%s\\n\' "$NEXO_HOME/core/current"\n'
+        '    return 0\n'
+        '  fi\n'
+        '  if [ -f "$NEXO_HOME/core/cli.py" ]; then\n'
+        '    printf \'%s\\n\' "$NEXO_HOME/core"\n'
+        '    return 0\n'
+        '  fi\n'
+        '  if [ -f "$NEXO_HOME/cli.py" ]; then\n'
+        '    printf \'%s\\n\' "$NEXO_HOME"\n'
+        '    return 0\n'
+        '  fi\n'
+        '  if [ -d "$NEXO_HOME/core" ]; then\n'
+        '    printf \'%s\\n\' "$NEXO_HOME/core"\n'
+        '    return 0\n'
+        '  fi\n'
+        '  printf \'%s\\n\' "$NEXO_HOME"\n'
+        '}\n'
+        'NEXO_CODE="$(resolve_code_dir)"\n'
+        'export NEXO_CODE\n'
+        'resolve_python() {\n'
+        '  local candidates=()\n'
+        '  local candidate=""\n'
+        '  if [ -n "${NEXO_RUNTIME_PYTHON:-}" ]; then candidates+=("$NEXO_RUNTIME_PYTHON"); fi\n'
+        '  if [ -n "${NEXO_PYTHON:-}" ]; then candidates+=("$NEXO_PYTHON"); fi\n'
+        '  candidates+=("$NEXO_CODE/.venv/bin/python3" "$NEXO_CODE/.venv/bin/python")\n'
+        '  if [ "$NEXO_CODE" != "$NEXO_HOME" ]; then\n'
+        '    candidates+=("$NEXO_HOME/.venv/bin/python3" "$NEXO_HOME/.venv/bin/python")\n'
+        '  fi\n'
+        '  case "$(uname -s)" in\n'
+        '    Darwin) candidates+=("/opt/homebrew/bin/python3" "/usr/local/bin/python3") ;;\n'
+        '    *) candidates+=("/usr/local/bin/python3" "/usr/bin/python3") ;;\n'
+        '  esac\n'
+        '  if command -v python3 >/dev/null 2>&1; then candidates+=("$(command -v python3)"); fi\n'
+        '  if command -v python >/dev/null 2>&1; then candidates+=("$(command -v python)"); fi\n'
+        '  for candidate in "${candidates[@]}"; do\n'
+        '    [ -n "$candidate" ] || continue\n'
+        '    [ -x "$candidate" ] || continue\n'
+        '    if NEXO_HOME="$NEXO_HOME" NEXO_CODE="$NEXO_CODE" "$candidate" -c "import fastmcp" >/dev/null 2>&1; then\n'
+        '      printf \'%s\\n\' "$candidate"\n'
+        '      return 0\n'
+        '    fi\n'
+        '  done\n'
+        '  for candidate in "${candidates[@]}"; do\n'
+        '    [ -n "$candidate" ] || continue\n'
+        '    [ -x "$candidate" ] || continue\n'
+        '    printf \'%s\\n\' "$candidate"\n'
+        '    return 0\n'
+        '  done\n'
+        '  return 1\n'
+        '}\n'
+        'PYTHON="$(resolve_python || true)"\n'
+        'if [ -z "$PYTHON" ]; then\n'
+        '  echo "NEXO runtime Python not found. Run nexo-brain or nexo update to repair the installation." >&2\n'
+        '  exit 1\n'
+        'fi\n'
+        'read_runtime_version() {\n'
+        '  local base="${1:-}"\n'
+        '  [ -n "$base" ] || return 0\n'
+        '  local candidate=""\n'
+        '  for candidate in "$base/version.json" "$base/package.json"; do\n'
+        '    [ -f "$candidate" ] || continue\n'
+        '    "$PYTHON" -c "import json, sys; from pathlib import Path; payload=json.loads(Path(sys.argv[1]).read_text(encoding=\\"utf-8\\")); version=str(payload.get(\\"version\\", \\"\\")).strip(); sys.stdout.write(version); sys.exit(0 if version else 1)" "$candidate" 2>/dev/null || continue\n'
+        '    return 0\n'
+        '  done\n'
+        '  return 0\n'
+        '}\n'
+        'repair_stale_current_runtime() {\n'
+        '  local core_root="$NEXO_HOME/core"\n'
+        '  local current_root="$NEXO_HOME/core/current"\n'
+        '  [ -d "$core_root" ] || return 0\n'
+        '  [ -e "$current_root" ] || return 0\n'
+        '  local core_version=""\n'
+        '  local current_version=""\n'
+        '  core_version="$(read_runtime_version "$core_root")"\n'
+        '  current_version="$(read_runtime_version "$current_root")"\n'
+        '  [ -n "$core_version" ] || return 0\n'
+        '  [ "$core_version" = "$current_version" ] && return 0\n'
+        '  NEXO_HOME="$NEXO_HOME" NEXO_CODE="$core_root" "$PYTHON" -c "import os, sys; from pathlib import Path; home=Path(os.environ[\\"NEXO_HOME\\"]); core=home / \\"core\\"; sys.path.insert(0, str(core)); from runtime_versioning import activate_versioned_runtime_snapshot, read_version_for_path; version=read_version_for_path(core); result=activate_versioned_runtime_snapshot(source_root=core, version=str(version or \\"\\").strip()); sys.exit(0 if result.get(\\"ok\\") else 1)" >/dev/null 2>&1 || return 0\n'
+        '}\n'
+        'repair_stale_current_runtime\n'
+        'CLI_PY="$NEXO_CODE/cli.py"\n'
+        'if [ ! -f "$CLI_PY" ] && [ -f "$NEXO_HOME/core/current/cli.py" ]; then\n'
+        '  NEXO_CODE="$NEXO_HOME/core/current"\n'
+        '  export NEXO_CODE\n'
+        '  CLI_PY="$NEXO_HOME/core/current/cli.py"\n'
+        'fi\n'
+        'if [ ! -f "$CLI_PY" ] && [ -f "$NEXO_HOME/core/cli.py" ]; then\n'
+        '  NEXO_CODE="$NEXO_HOME/core"\n'
+        '  export NEXO_CODE\n'
+        '  CLI_PY="$NEXO_HOME/core/cli.py"\n'
+        'fi\n'
+        'if [ ! -f "$CLI_PY" ] && [ -f "$NEXO_HOME/cli.py" ]; then\n'
+        '  NEXO_CODE="$NEXO_HOME"\n'
+        '  export NEXO_CODE\n'
+        '  CLI_PY="$NEXO_HOME/cli.py"\n'
+        'fi\n'
+        'if [ ! -f "$CLI_PY" ]; then\n'
+        '  echo "NEXO CLI not found under $NEXO_HOME. Run nexo-brain or nexo update to repair the installation." >&2\n'
+        '  exit 1\n'
+        'fi\n'
+        'exec "$PYTHON" "$CLI_PY" "$@"\n'
+    )
+
+
+def _runtime_config_dir(runtime_root: Path = NEXO_HOME) -> Path:
+    new = runtime_root / "personal" / "config"
+    legacy = runtime_root / "config"
+    if new.exists():
+        return new
+    if legacy.exists():
+        return legacy
+    return new
+
+
+def _runtime_core_artifacts_candidates(runtime_root: Path = NEXO_HOME) -> list[Path]:
+    """Return plausible locations for ``runtime-core-artifacts.json``.
+
+    During fresh install F0.6 migration we create ``personal/config`` before
+    moving the legacy ``config/`` tree, so blindly asking for the canonical
+    config dir can point at an empty directory while the manifest still lives
+    in ``~/.nexo/config``. Search both locations explicitly so packaged core
+    scripts are not misclassified as personal during the migration window.
+    """
+    candidates = [
+        runtime_root / "config" / "runtime-core-artifacts.json",
+        runtime_root / "personal" / "config" / "runtime-core-artifacts.json",
+        _runtime_config_dir(runtime_root) / "runtime-core-artifacts.json",
+    ]
+    ordered: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate.resolve(strict=False))
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(candidate)
+    return ordered
+
+
+def _runtime_code_dir(runtime_root: Path | None = None) -> Path:
+    """Return the packaged code root, preferring ``core/`` post-F0.6."""
+    runtime_root = Path(runtime_root or NEXO_HOME)
+    core_root = runtime_root / "core"
+    for candidate in (core_root, runtime_root):
+        if (candidate / "cli.py").is_file() or (candidate / "server.py").is_file() or (candidate / "db").is_dir():
+            return candidate
+    return core_root if core_root.exists() else runtime_root
+
+
+def _shell_rc_files() -> list[Path]:
+    shell = os.environ.get("SHELL", "/bin/bash")
+    home_dir = Path.home()
+    if "zsh" in shell:
+        return [home_dir / ".zshrc"]
+    return [home_dir / ".bash_profile", home_dir / ".bashrc"]
+
+
+def _should_skip_shell_profile_backfill() -> tuple[bool, str]:
+    """Decide whether to skip writing ``export PATH`` into the user's shell rc.
+
+    The backfill must only touch the real user shell profile when the runtime
+    is installed at the canonical ``$HOME/.nexo`` location. When ``NEXO_HOME``
+    points elsewhere (pytest ``tmp_path``, CI sandbox, containerised test
+    harness) writing to ``~/.bash_profile`` / ``~/.bashrc`` / ``~/.zshrc``
+    leaks a non-canonical ``export PATH`` line into the developer's real
+    shell, which is exactly the bug reported for v6.0.x. Users can force-skip
+    via ``NEXO_SKIP_SHELL_PROFILE=1``.
+    """
+    flag = os.environ.get("NEXO_SKIP_SHELL_PROFILE", "").strip().lower()
+    if flag in {"1", "true", "yes", "on"}:
+        return True, f"NEXO_SKIP_SHELL_PROFILE={flag}"
+    try:
+        canonical = managed_nexo_home()
+    except Exception:
+        canonical = Path.home() / ".nexo"
+    try:
+        same = NEXO_HOME.resolve(strict=False) == canonical.resolve(strict=False)
+    except Exception:
+        same = NEXO_HOME == canonical
+    if not same:
+        return True, f"NEXO_HOME={NEXO_HOME} is not the canonical {canonical}"
+    return False, ""
+
+
+def _normalize_runtime_probe_path(candidate: str | os.PathLike[str] | None) -> str:
+    if not candidate:
+        return ""
+    try:
+        resolved = Path(candidate).expanduser().resolve(strict=False)
+    except Exception:
+        try:
+            resolved = Path(candidate).expanduser()
+        except Exception:
+            return ""
+    normalized = str(resolved).replace("\\", "/").rstrip("/")
+    return normalized
+
+
+def _is_within_path(candidate: str, root: str) -> bool:
+    return bool(candidate) and bool(root) and (candidate == root or candidate.startswith(f"{root}/"))
+
+
+def _is_ephemeral_runtime_install(runtime_root: Path | None = None) -> bool:
+    """Return True for pytest/CI temp installs that should skip heavyweight bootstrap.
+
+    Mirrors the installer's ``isEphemeralInstall()`` contract: real product
+    installs should still bootstrap the local classifier automatically, but
+    sandboxed test runtimes under ``/tmp`` / macOS ``/var/folders`` must not
+    spend minutes installing large ML dependencies during ``nexo update``.
+    """
+    if str(os.environ.get("NEXO_ALLOW_EPHEMERAL_INSTALL", "")).strip() == "1":
+        return False
+
+    temp_roots: set[str] = set()
+    for root in (
+        tempfile.gettempdir(),
+        "/tmp",
+        "/private/tmp",
+        "/var/folders",
+        "/private/var/folders",
+    ):
+        normalized = _normalize_runtime_probe_path(root)
+        if not normalized:
+            continue
+        temp_roots.add(normalized)
+        if normalized == "/tmp":
+            temp_roots.add("/private/tmp")
+        elif normalized == "/private/tmp":
+            temp_roots.add("/tmp")
+        elif normalized.startswith("/var/"):
+            temp_roots.add(f"/private{normalized}")
+        elif normalized.startswith("/private/var/"):
+            temp_roots.add(normalized.removeprefix("/private"))
+
+    user_home = _normalize_runtime_probe_path(os.environ.get("HOME", str(Path.home())))
+    runtime_home = _normalize_runtime_probe_path(runtime_root or NEXO_HOME)
+    for candidate in (runtime_home, user_home):
+        if any(_is_within_path(candidate, root) for root in temp_roots):
+            return True
+    return False
+
+
+def _ensure_runtime_cli_in_shell():
+    skip, reason = _should_skip_shell_profile_backfill()
+    if skip:
+        _log(f"Skipping shell profile backfill — {reason}")
+        return
+    path_line = f'export PATH="{NEXO_HOME / "bin"}:$PATH"'
+    comment = "# NEXO runtime CLI"
+    for rc_file in _shell_rc_files():
+        try:
+            content = rc_file.read_text() if rc_file.exists() else ""
+            if path_line not in content:
+                with rc_file.open("a") as fh:
+                    fh.write(f"\n{comment}\n{path_line}\n")
+                _log(f"Backfilled runtime CLI PATH in {rc_file.name}")
+        except Exception as e:
+            _log(f"Shell PATH backfill error for {rc_file.name}: {e}")
+
+
+def _ensure_runtime_cli_wrapper():
+    try:
+        bin_dir = NEXO_HOME / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        wrapper = bin_dir / "nexo"
+        content = _runtime_cli_wrapper_text()
+        if not wrapper.exists() or wrapper.read_text() != content:
+            wrapper.write_text(content)
+            wrapper.chmod(0o755)
+            _log("Backfilled runtime CLI wrapper")
+    except Exception as e:
+        _log(f"Runtime CLI wrapper backfill error: {e}")
+
+
+# ── Hook sync ────────────────────────────────────────────────────────
+
+def _requirements_hash() -> str:
+    """Return a content hash of requirements.txt, or empty string if missing."""
+    import hashlib
+    req_file = SRC_DIR / "requirements.txt"
+    if req_file.exists():
+        return hashlib.sha256(req_file.read_bytes()).hexdigest()
+    return ""
+
+
+def _venv_python_path(runtime_root: Path = NEXO_HOME) -> Path:
+    if sys.platform == "win32":
+        return runtime_root / ".venv" / "Scripts" / "python.exe"
+    return runtime_root / ".venv" / "bin" / "python3"
+
+
+def _venv_pip_path(runtime_root: Path = NEXO_HOME) -> Path:
+    if sys.platform == "win32":
+        return runtime_root / ".venv" / "Scripts" / "pip.exe"
+    return runtime_root / ".venv" / "bin" / "pip"
+
+
+def _python_version_tuple(python_bin: Path | str) -> tuple[int, int, int] | None:
+    try:
+        result = subprocess.run(
+            [str(python_bin), "-c", "import sys; print('.'.join(map(str, sys.version_info[:3])))"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", result.stdout or result.stderr or "")
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
+def _managed_venv_python_supported(python_bin: Path | str) -> bool:
+    version = _python_version_tuple(python_bin)
+    if not version:
+        return False
+    if desktop_product_requested():
+        return version[:2] == (3, 12)
+    return version >= (3, 10, 0)
+
+
+def _resolve_managed_venv_base_python() -> str:
+    candidates = [
+        os.environ.get("NEXO_BOOTSTRAP_PYTHON", ""),
+        os.environ.get("NEXO_RUNTIME_PYTHON", ""),
+        os.environ.get("NEXO_PYTHON", ""),
+    ]
+    if desktop_product_requested():
+        candidates.extend([
+            "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12",
+            "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
+            "/opt/homebrew/bin/python3.12",
+            "/usr/local/bin/python3.12",
+            shutil.which("python3.12") or "",
+        ])
+    candidates.append(sys.executable)
+    candidates.append(shutil.which("python3") or "")
+    for candidate in candidates:
+        clean = str(candidate or "").strip()
+        if clean and Path(clean).exists() and _managed_venv_python_supported(clean):
+            return clean
+    return sys.executable
+
+
+def _archive_incompatible_runtime_venv(runtime_root: Path = NEXO_HOME, reason: str = "incompatible-python") -> Path | None:
+    venv_dir = runtime_root / ".venv"
+    if not venv_dir.exists():
+        return None
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup_root = runtime_root / "runtime" / "backups"
+    try:
+        backup_root.mkdir(parents=True, exist_ok=True)
+        target = backup_root / f"venv-{reason}-{stamp}"
+        counter = 2
+        while target.exists():
+            target = backup_root / f"venv-{reason}-{stamp}-{counter}"
+            counter += 1
+        shutil.move(str(venv_dir), str(target))
+        _log(f"Archived incompatible managed venv at {target}")
+        return target
+    except Exception as exc:
+        _log(f"venv archive failed: {exc}")
+        return None
+
+
+def _ensure_runtime_venv(runtime_root: Path = NEXO_HOME) -> Path | None:
+    venv_python = _venv_python_path(runtime_root)
+    if venv_python.exists():
+        if _managed_venv_python_supported(venv_python):
+            return venv_python
+        version = _python_version_tuple(venv_python)
+        reason = f"python-{'.'.join(map(str, version[:2]))}" if version else "unreadable-python"
+        if _archive_incompatible_runtime_venv(runtime_root, reason=reason) is None:
+            return None
+    base_python = _resolve_managed_venv_base_python()
+    if not _managed_venv_python_supported(base_python):
+        _log(f"no supported base Python found for managed venv: {base_python}")
+        return None
+    try:
+        runtime_root.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            [base_python, "-m", "venv", str(runtime_root / ".venv")],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode == 0 and venv_python.exists():
+            _log(f"Created managed venv at {runtime_root / '.venv'}")
+            return venv_python
+        _log(f"venv creation failed (exit {result.returncode}): {result.stderr or result.stdout}")
+    except Exception as e:
+        _log(f"venv creation failed: {e}")
+    return None
+
+
+def _bundled_wheels_dir() -> "Path | None":
+    """Locate the bundled Python wheels for offline install.
+
+    Priority: explicit NEXO_BUNDLED_WHEELS_DIR (set by the Desktop bundle) →
+    a canonical runtime copy under NEXO_HOME. Returns the dir only if it holds
+    at least one .whl, else None (caller falls back to PyPI).
+    """
+    candidates = []
+    env_dir = os.environ.get("NEXO_BUNDLED_WHEELS_DIR", "").strip()
+    if env_dir:
+        candidates.append(Path(env_dir).expanduser())
+    candidates.append(NEXO_HOME / "runtime" / "python-wheels")
+    for directory in candidates:
+        try:
+            if directory.is_dir() and any(directory.glob("*.whl")):
+                return directory
+        except Exception:
+            continue
+    return None
+
+
+def _pip_install_argv(pip_bin, req_file, *, wheels_dir=None, use_python_m=False, break_system=False) -> list:
+    """Build a pip install argv. Offline (--no-index --find-links) when wheels_dir is set."""
+    argv = [str(pip_bin)]
+    if use_python_m:
+        argv += ["-m", "pip"]
+    argv += ["install", "--quiet", "-r", str(req_file)]
+    if wheels_dir is not None:
+        argv += ["--no-index", "--find-links", str(wheels_dir)]
+    if break_system:
+        argv.append("--break-system-packages")
+    return argv
+
+
+def _reinstall_pip_deps() -> bool:
+    """Reinstall Python deps from requirements.txt. Returns True on success.
+
+    Prefers the bundled wheels (offline) so a user with no internet still gets a
+    self-repairing runtime; falls back to PyPI if the bundle can't satisfy it.
+    """
+    req_file = SRC_DIR / "requirements.txt"
+    if not req_file.exists():
+        return True
+    venv_python = _ensure_runtime_venv(NEXO_HOME)
+    venv_pip = _venv_pip_path(NEXO_HOME)
+    if not venv_pip.exists() and sys.platform != "win32":
+        alt_pip = NEXO_HOME / ".venv" / "bin" / "pip3"
+        if alt_pip.exists():
+            venv_pip = alt_pip
+    wheels_dir = _bundled_wheels_dir()
+    # Large wheel sets / slow links need more than the old 120s.
+    timeout_s = 600
+    use_python_m = not venv_pip.exists()
+    if use_python_m and desktop_product_requested():
+        _log(f"managed venv unavailable for Desktop dependency repair: {venv_python}")
+        return False
+    pip_bin = venv_pip if venv_pip.exists() else sys.executable
+    try:
+        argv = _pip_install_argv(
+            pip_bin, req_file, wheels_dir=wheels_dir,
+            use_python_m=use_python_m, break_system=use_python_m,
+        )
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
+        if result.returncode != 0 and wheels_dir is not None:
+            # Offline set couldn't satisfy it (missing/incompatible wheel) → retry online.
+            _log(f"offline pip install failed, retrying via PyPI: {result.stderr or result.stdout}")
+            argv_online = _pip_install_argv(
+                pip_bin, req_file, wheels_dir=None,
+                use_python_m=use_python_m, break_system=use_python_m,
+            )
+            result = subprocess.run(argv_online, capture_output=True, text=True, timeout=timeout_s)
+        if result.returncode != 0:
+            _log(f"pip install failed (exit {result.returncode}): {result.stderr or result.stdout}")
+            return False
+        _log("Reinstalled Python dependencies" + (" (offline)" if wheels_dir is not None else ""))
+        return True
+    except Exception as e:
+        _log(f"pip reinstall failed: {e}")
+        return False
+
+
+def _classifier_install_log_path() -> Path:
+    CLASSIFIER_INSTALL_LOG.parent.mkdir(parents=True, exist_ok=True)
+    return CLASSIFIER_INSTALL_LOG
+
+
+def _classifier_install_state_path() -> Path:
+    CLASSIFIER_INSTALL_STATE.parent.mkdir(parents=True, exist_ok=True)
+    return CLASSIFIER_INSTALL_STATE
+
+
+def _write_classifier_install_log(message: str) -> None:
+    try:
+        log_path = _classifier_install_log_path()
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(message)
+            if not message.endswith("\n"):
+                fh.write("\n")
+    except Exception as exc:
+        _log(f"classifier install log write failed: {exc}")
+
+
+def _write_classifier_install_state(payload: dict) -> None:
+    try:
+        state_path = _classifier_install_state_path()
+        state_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except Exception as exc:
+        _log(f"classifier install state write failed: {exc}")
+
+
+def _probe_local_classifier_dependencies() -> tuple[bool, dict[str, str], list[str]]:
+    module_specs = (
+        ("transformers", "transformers"),
+        ("torch", "torch"),
+        ("sentencepiece", "sentencepiece"),
+        ("sentence_transformers", "sentence_transformers"),
+    )
+    versions: dict[str, str] = {}
+    missing: list[str] = []
+    for module_name, state_key in module_specs:
+        try:
+            module = __import__(module_name)
+        except Exception:
+            missing.append(state_key)
+            continue
+        versions[state_key] = str(getattr(module, "__version__", "") or "")
+    if missing:
+        try:
+            probe_script = """
+import json
+
+mods = [
+    ("transformers", "transformers"),
+    ("torch", "torch"),
+    ("sentencepiece", "sentencepiece"),
+    ("sentence_transformers", "sentence_transformers"),
+]
+versions = {}
+missing = []
+for module_name, state_key in mods:
+    try:
+        module = __import__(module_name)
+        versions[state_key] = str(getattr(module, "__version__", "") or "")
+    except Exception:
+        missing.append(state_key)
+print(json.dumps({"versions": versions, "missing": missing}))
+""".strip()
+            probe = subprocess.run(
+                [sys.executable, "-c", probe_script],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=os.environ.copy(),
+            )
+            if probe.returncode == 0:
+                payload = json.loads(probe.stdout or "{}")
+                fresh_versions = dict(payload.get("versions") or {})
+                fresh_missing = list(payload.get("missing") or [])
+                if not fresh_missing:
+                    return True, fresh_versions, []
+        except Exception:
+            pass
+    return not missing, versions, missing
+
+
+def _download_local_classifier_model() -> tuple[bool, str]:
+    script = (
+        "from classifier_local import MODEL_ID, MODEL_REVISION; "
+        "from transformers import AutoTokenizer, AutoModelForSequenceClassification; "
+        "AutoTokenizer.from_pretrained(MODEL_ID, revision=MODEL_REVISION); "
+        "AutoModelForSequenceClassification.from_pretrained(MODEL_ID, revision=MODEL_REVISION); "
+        "print(MODEL_REVISION)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(SRC_DIR),
+        capture_output=True,
+        text=True,
+        timeout=CLASSIFIER_INSTALL_TIMEOUT_SECONDS,
+        env={**os.environ, "PYTHONPATH": str(SRC_DIR)},
+    )
+    _write_classifier_install_log(result.stdout or "")
+    _write_classifier_install_log(result.stderr or "")
+    if result.returncode != 0:
+        return False, (result.stderr or result.stdout or "model download failed").strip()
+    return True, ""
+
+
+def _local_classifier_install_command() -> list[str]:
+    in_virtualenv = bool(os.environ.get("VIRTUAL_ENV")) or (
+        getattr(sys, "prefix", "") != getattr(sys, "base_prefix", getattr(sys, "prefix", ""))
+    )
+    cmd = [sys.executable, "-m", "pip", "install"]
+    if not in_virtualenv:
+        cmd.append("--user")
+    cmd.extend(CLASSIFIER_INSTALL_PACKAGES)
+    return cmd
+
+
+def _local_classifier_auto_install_enabled() -> bool:
+    return str(os.environ.get("NEXO_LOCAL_CLASSIFIER", "")).strip().lower() in {
+        "1",
+        "true",
+        "on",
+        "auto",
+    }
+
+
+def _install_local_classifier_worker() -> None:
+    from classifier_local import MODEL_REVISION
+
+    installed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if str(os.environ.get("NEXO_LOCAL_CLASSIFIER", "")).strip().lower() == "off":
+        _write_classifier_install_log("[classifier-install] operator opt-out via NEXO_LOCAL_CLASSIFIER=off")
+        _write_classifier_install_state({
+            "installed_at": installed_at,
+            "model_revision": MODEL_REVISION,
+            "deps_ok": False,
+            "opt_out": True,
+        })
+        return
+
+    deps_ok, versions, missing = _probe_local_classifier_dependencies()
+    if deps_ok:
+        _write_classifier_install_state({
+            "installed_at": installed_at,
+            "model_revision": MODEL_REVISION,
+            "deps_ok": True,
+            "transformers_version": versions.get("transformers", ""),
+            "torch_version": versions.get("torch", ""),
+        })
+        return
+
+    install_cmd = _local_classifier_install_command()
+    _write_classifier_install_log("[classifier-install] " + " ".join(install_cmd))
+    try:
+        result = subprocess.run(
+            install_cmd,
+            capture_output=True,
+            text=True,
+            timeout=CLASSIFIER_INSTALL_TIMEOUT_SECONDS,
+            env=os.environ.copy(),
+        )
+    except Exception as exc:
+        _write_classifier_install_log(f"[classifier-install] pip failed to start: {exc}")
+        _write_classifier_install_state({
+            "installed_at": installed_at,
+            "model_revision": MODEL_REVISION,
+            "deps_ok": False,
+            "transformers_version": versions.get("transformers", ""),
+            "torch_version": versions.get("torch", ""),
+            "missing_deps": missing,
+            "error": str(exc),
+        })
+        return
+
+    _write_classifier_install_log(result.stdout or "")
+    _write_classifier_install_log(result.stderr or "")
+    if result.returncode != 0:
+        _write_classifier_install_state({
+            "installed_at": installed_at,
+            "model_revision": MODEL_REVISION,
+            "deps_ok": False,
+            "transformers_version": versions.get("transformers", ""),
+            "torch_version": versions.get("torch", ""),
+            "missing_deps": missing,
+            "error": (result.stderr or result.stdout or f"pip exit {result.returncode}").strip(),
+            "pip_returncode": result.returncode,
+        })
+        return
+
+    deps_ok, versions, missing = _probe_local_classifier_dependencies()
+    state = {
+        "installed_at": installed_at,
+        "model_revision": MODEL_REVISION,
+        "deps_ok": deps_ok,
+        "transformers_version": versions.get("transformers", ""),
+        "torch_version": versions.get("torch", ""),
+        "missing_deps": missing,
+    }
+    if not deps_ok:
+        _write_classifier_install_state(state)
+        return
+
+    model_ok, model_error = _download_local_classifier_model()
+    if not model_ok:
+        state["model_cached"] = False
+        state["error"] = model_error
+        _write_classifier_install_state(state)
+        return
+
+    state["model_cached"] = True
+    _write_classifier_install_state(state)
+
+
+def _maybe_install_local_classifier() -> None:
+    global _CLASSIFIER_INSTALL_THREAD
+    if str(os.environ.get("NEXO_LOCAL_CLASSIFIER", "")).strip().lower() == "off":
+        from classifier_local import MODEL_REVISION
+
+        _write_classifier_install_log("[classifier-install] operator opt-out via NEXO_LOCAL_CLASSIFIER=off")
+        _write_classifier_install_state({
+            "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "model_revision": MODEL_REVISION,
+            "deps_ok": False,
+            "opt_out": True,
+        })
+        return
+    if not _local_classifier_auto_install_enabled():
+        from classifier_local import MODEL_REVISION
+
+        _write_classifier_install_log("[classifier-install] deferred: model is not bundled; set NEXO_LOCAL_CLASSIFIER=auto to install")
+        _write_classifier_install_state({
+            "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "model_revision": MODEL_REVISION,
+            "deps_ok": False,
+            "deferred": True,
+            "reason": "not_bundled",
+        })
+        return
+    try:
+        deps_ok, versions, _missing = _probe_local_classifier_dependencies()
+        if deps_ok:
+            from classifier_local import MODEL_REVISION
+
+            _write_classifier_install_state({
+                "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "model_revision": MODEL_REVISION,
+                "deps_ok": True,
+                "transformers_version": versions.get("transformers", ""),
+                "torch_version": versions.get("torch", ""),
+            })
+            return
+    except Exception:
+        pass
+
+    if _CLASSIFIER_INSTALL_THREAD and _CLASSIFIER_INSTALL_THREAD.is_alive():
+        return
+
+    _CLASSIFIER_INSTALL_THREAD = threading.Thread(
+        target=_install_local_classifier_worker,
+        name="nexo-classifier-install",
+        daemon=True,
+    )
+    _CLASSIFIER_INSTALL_THREAD.start()
+    _CLASSIFIER_INSTALL_THREAD.join(CLASSIFIER_INSTALL_JOIN_SECONDS)
+    if _CLASSIFIER_INSTALL_THREAD.is_alive():
+        _log(
+            "local classifier install still running in background; "
+            f"continuing after {CLASSIFIER_INSTALL_JOIN_SECONDS}s join timeout"
+        )
+
+
+def _refresh_installed_manifest():
+    """Copy source crons/ to NEXO_HOME/crons/ so catchup & watchdog stay current."""
+    try:
+        import shutil
+        src_crons = SRC_DIR / "crons"
+        dst_crons = paths.crons_dir()
+        if src_crons.exists():
+            dst_crons.mkdir(parents=True, exist_ok=True)
+            for f in src_crons.iterdir():
+                if f.is_file() and not is_duplicate_artifact_name(f):
+                    shutil.copy2(str(f), str(dst_crons / f.name))
+            _log("Refreshed installed crons manifest")
+    except Exception as e:
+        _log(f"Manifest refresh warning: {e}")
+
+
+def _cleanup_retired_runtime_files():
+    """Remove retired core files that should not survive updates."""
+    retired = [
+        paths.core_scripts_dir() / "nexo-day-orchestrator.sh",
+        paths.core_scripts_dir() / "heartbeat-enforcement.py",
+        paths.core_scripts_dir() / "heartbeat-posttool.sh",
+        paths.core_scripts_dir() / "heartbeat-user-msg.sh",
+        paths.core_hooks_dir() / "heartbeat-guard.sh",
+    ]
+    conditional_retired = [
+        (paths.core_scripts_dir() / "nexo-postcompact.sh", paths.core_hooks_dir() / "post-compact.sh"),
+        (paths.core_scripts_dir() / "nexo-memory-precompact.sh", paths.core_hooks_dir() / "pre-compact.sh"),
+        (paths.core_scripts_dir() / "nexo-memory-stop.sh", paths.core_hooks_dir() / "session-stop.sh"),
+        (paths.core_scripts_dir() / "nexo-session-briefing.sh", paths.core_hooks_dir() / "session-start.sh"),
+    ]
+    for target in retired:
+        try:
+            if target.exists():
+                if target.is_dir():
+                    import shutil
+                    shutil.rmtree(target)
+                else:
+                    target.unlink()
+                _log(f"Removed retired runtime file: {target.name}")
+        except Exception as e:
+            _log(f"Retired runtime cleanup warning ({target.name}): {e}")
+    for target, canonical in conditional_retired:
+        try:
+            if target.exists() and canonical.exists():
+                target.unlink()
+                _log(f"Removed retired runtime alias: {target.name} (canonical: {canonical.name})")
+        except Exception as e:
+            _log(f"Retired runtime alias cleanup warning ({target.name}): {e}")
+
+
+def _sync_crons():
+    """Sync cron definitions with manifest after a git pull."""
+    try:
+        cron_sync_path = SRC_DIR / "crons" / "sync.py"
+        if cron_sync_path.exists():
+            result = subprocess.run(
+                [sys.executable, str(cron_sync_path)],
+                capture_output=True, text=True, timeout=30,
+                env={**os.environ, "NEXO_HOME": str(NEXO_HOME), "NEXO_CODE": str(SRC_DIR)},
+            )
+            if result.returncode != 0:
+                _log(f"Cron sync failed (exit {result.returncode}): {result.stderr or result.stdout}")
+                return  # Don't refresh manifest if timers weren't actually updated
+            _log("Synced cron definitions with manifest")
+        _cleanup_retired_runtime_files()
+        # Refresh the installed manifest only after successful sync
+        _refresh_installed_manifest()
+    except Exception as e:
+        _log(f"Cron sync warning: {e}")
+
+
+def _reload_launch_agents_after_bump() -> dict:
+    """Unload+load NEXO LaunchAgents so they pick up the new code on next fire.
+
+    Closes Bloque D of NEXO-AUDIT-2026-04-11 (learning #186 from Fase 1).
+    Until this helper, `nexo update` would `git pull` the new code into
+    NEXO_CODE but the 40+ LaunchAgents already running held the old
+    Python modules in memory until macOS happened to restart them. With
+    a single function call we explicitly tell launchd to reload the
+    plist files so the next fire reads the fresh code.
+
+    Best-effort throughout — a failure here must NEVER block the update
+    that just succeeded. Returns a dict with what was attempted so the
+    caller can log a single summary line.
+
+    Returns:
+        {
+          "scanned": N,        # plists found in ~/Library/LaunchAgents
+          "reloaded": N,       # plists where unload+load both succeeded
+          "skipped_missing": N, # plist file vanished mid-scan
+          "errors": [{plist, stderr}],
+        }
+
+    Linux/WSL remains a no-op by default. Systemd user-unit reload can be
+    enabled explicitly for development/runtime experiments, but public update
+    paths must not restart host services unexpectedly.
+    """
+    result: dict = {
+        "scanned": 0,
+        "reloaded": 0,
+        "skipped_missing": 0,
+        "errors": [],
+        "platform": sys.platform,
+    }
+
+    if sys.platform == "linux":
+        if os.environ.get("NEXO_ENABLE_SYSTEMD_RELOAD_AFTER_BUMP") != "1":
+            result["skipped_reason"] = "systemd-reload-disabled"
+            return result
+
+        # Experimental Linux path: reload systemd user units so nexo-* timers
+        # updated by auto-update pick up new ExecStart paths. Best-effort: a
+        # missing systemd (Docker/CI/most WSL installs) just returns no-op.
+        try:
+            unit_dir = Path.home() / ".config" / "systemd" / "user"
+            scanned_units = []
+            if unit_dir.is_dir():
+                scanned_units = sorted(
+                    [p for p in unit_dir.iterdir() if p.suffix in {".service", ".timer"} and p.name.startswith("nexo")]
+                )
+            result["scanned"] = len(scanned_units)
+            if scanned_units:
+                reload_proc = subprocess.run(
+                    ["systemctl", "--user", "daemon-reload"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                if reload_proc.returncode != 0:
+                    result["errors"].append({
+                        "unit": "daemon-reload",
+                        "stderr": (reload_proc.stderr or reload_proc.stdout or "").strip(),
+                    })
+                else:
+                    for unit in scanned_units:
+                        restart = subprocess.run(
+                            ["systemctl", "--user", "restart", unit.name],
+                            capture_output=True,
+                            text=True,
+                            timeout=15,
+                        )
+                        if restart.returncode == 0:
+                            result["reloaded"] += 1
+                        else:
+                            result["errors"].append({
+                                "unit": unit.name,
+                                "stderr": (restart.stderr or restart.stdout or "").strip(),
+                            })
+        except FileNotFoundError:
+            result["skipped_reason"] = "systemctl-not-available"
+        except Exception as e:
+            result["errors"].append({"unit": "*", "stderr": f"systemd reload failed: {e}"})
+        return result
+
+    if sys.platform != "darwin":
+        # Other platforms (win32 native — never reached because Brain runs
+        # inside WSL Linux on Windows): nothing to reload.
+        return result
+    if _is_ephemeral_runtime_install():
+        result["skipped_reason"] = "ephemeral-runtime"
+        return result
+
+    launch_agents_dir = Path.home() / "Library" / "LaunchAgents"
+    if not launch_agents_dir.is_dir():
+        return result
+
+    try:
+        plists = sorted(launch_agents_dir.glob("com.nexo.*.plist"))
+    except Exception as e:
+        result["errors"].append({"plist": "*", "stderr": f"glob failed: {e}"})
+        return result
+
+    result["scanned"] = len(plists)
+    for plist in plists:
+        try:
+            if not plist.is_file():
+                result["skipped_missing"] += 1
+                continue
+            from runtime_power import reload_launchagent_plist
+
+            reload_result = reload_launchagent_plist(plist)
+            if reload_result.get("ok"):
+                result["reloaded"] += 1
+            else:
+                result["errors"].append({
+                    "plist": plist.name,
+                    "stderr": str(reload_result.get("error") or "reload failed")[:300],
+                })
+        except subprocess.TimeoutExpired:
+            result["errors"].append({"plist": plist.name, "stderr": "launchctl timeout"})
+        except Exception as e:
+            result["errors"].append({"plist": plist.name, "stderr": str(e)[:300]})
+
+    return result
+
+
+AUTO_UPDATE_BACKUP_KEEP = 5
+"""Maximum number of auto-update backups to keep per prefix.
+
+Both `pre-autoupdate-*/` (DB snapshots) and `runtime-tree-*/` (code mirrors)
+were accumulating indefinitely, growing to tens of GB on long-running
+installs. Rotating to the N most recent keeps a meaningful rollback window
+without unbounded disk use."""
+
+
+def _rotate_auto_update_backups(prefix: str, keep: int = AUTO_UPDATE_BACKUP_KEEP) -> int:
+    """Delete old auto-update backup directories matching a prefix, keeping `keep` most recent.
+
+    Silent on failures — cleanup must never interrupt the auto-update flow.
+    Returns number of entries removed (0 on failure or nothing to prune).
+    """
+    if keep <= 0:
+        return 0
+    base = paths.backups_dir()
+    if not base.is_dir():
+        return 0
+    try:
+        candidates = [p for p in base.iterdir() if p.is_dir() and p.name.startswith(prefix)]
+    except Exception as e:
+        _log(f"Backup rotation scan warning ({prefix}): {e}")
+        return 0
+    if len(candidates) <= keep:
+        return 0
+    # Newest first by modification time, then delete everything beyond `keep`
+    try:
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    except Exception as e:
+        _log(f"Backup rotation sort warning ({prefix}): {e}")
+        return 0
+    removed = 0
+    import shutil as _shutil
+    for old in candidates[keep:]:
+        try:
+            _shutil.rmtree(str(old))
+            removed += 1
+        except Exception as e:
+            _log(f"Backup rotation remove warning ({old.name}): {e}")
+    if removed:
+        _log(f"Rotated {removed} old {prefix}* backup(s), kept {keep} most recent")
+    return removed
+
+
+SELF_HEAL_STATE_FILE = paths.operations_dir() / ".self-heal-state.json"
+SELF_HEAL_COOLDOWN_SECONDS = 6 * 3600  # Never auto-heal twice within 6 h.
+
+
+def _self_heal_if_wiped() -> dict | None:
+    """Detect a wiped nexo.db at server startup and restore from the newest
+    hourly backup without any user action required.
+
+    Guard conditions (ALL must be true to fire):
+        - ``NEXO_DISABLE_AUTO_HEAL`` env var is unset.
+        - ``data/nexo.db`` exists but looks wiped (empty critical tables, size
+          below the empty-schema threshold, or both).
+        - A hourly backup newer than 48 h exists AND contains >= 50 rows
+          across CRITICAL_TABLES.
+        - The self-heal cooldown has elapsed since the last successful heal.
+
+    On success, writes a marker to ``~/.nexo/operations/.self-heal-state.json``
+    and returns a report dict. Returns None when no heal happened (caller
+    treats that as "normal boot").
+    """
+    if os.environ.get("NEXO_DISABLE_AUTO_HEAL") == "1":
+        return None
+    try:
+        from db_guard import (
+            CRITICAL_TABLES,
+            HOURLY_BACKUP_MAX_AGE,
+            LOCAL_CONTEXT_TABLES,
+            MIN_REFERENCE_ROWS,
+            PROTECTED_TABLES,
+            db_looks_wiped,
+            db_row_counts,
+            find_best_hourly_backup,
+            find_latest_hourly_backup,
+            quiesce_nexo_db_writers,
+            resume_nexo_launchagents,
+            safe_sqlite_backup,
+            validate_backup_matches_source,
+        )
+    except Exception as e:
+        _log(f"self-heal: db_guard import failed: {e}")
+        return None
+
+    primary = DATA_DIR / "nexo.db"
+    if not primary.is_file():
+        return None
+    if not db_looks_wiped(primary, PROTECTED_TABLES):
+        return None
+    recovery_tables = PROTECTED_TABLES + LOCAL_CONTEXT_TABLES
+    reference = find_best_hourly_backup(
+        paths.backups_dir(),
+        max_age_seconds=HOURLY_BACKUP_MAX_AGE,
+        tables=recovery_tables,
+    ) or find_latest_hourly_backup(
+        paths.backups_dir(),
+        max_age_seconds=HOURLY_BACKUP_MAX_AGE,
+        tables=recovery_tables,
+    )
+    if reference is None:
+        _log("self-heal: nexo.db looks wiped but no usable hourly backup found — skipping.")
+        return {
+            "action": "skipped",
+            "reason": "no_usable_hourly_backup",
+            "primary_db": str(primary),
+        }
+    ref_counts = db_row_counts(reference, recovery_tables)
+    ref_total = sum(v for v in ref_counts.values() if isinstance(v, int))
+    if ref_total < MIN_REFERENCE_ROWS:
+        _log(f"self-heal: reference backup {reference.name} has {ref_total} rows, below floor {MIN_REFERENCE_ROWS}")
+        return {
+            "action": "skipped",
+            "reason": "reference_below_floor",
+            "reference": str(reference),
+            "reference_rows": ref_total,
+        }
+
+    # Cooldown: don't loop-heal.
+    try:
+        if SELF_HEAL_STATE_FILE.is_file():
+            last = json.loads(SELF_HEAL_STATE_FILE.read_text())
+            last_ts = float(last.get("last_heal_ts", 0))
+            if time.time() - last_ts < SELF_HEAL_COOLDOWN_SECONDS:
+                _log(
+                    f"self-heal: cooldown active "
+                    f"({(time.time() - last_ts) / 60:.0f} min ago < "
+                    f"{SELF_HEAL_COOLDOWN_SECONDS // 60} min) — skipping."
+                )
+                return {"action": "skipped", "reason": "cooldown"}
+    except Exception:
+        pass
+
+    _log(
+        "self-heal: detected wiped nexo.db "
+        f"(reference={reference.name}, {ref_total} critical rows). Restoring..."
+    )
+
+    # Pause any live DB writers so they cannot overwrite the restored DB or
+    # keep stale handles open. Desktop installs have more writers than the MCP
+    # server: local-index, email-monitor, followup-runner, watchdog and catchup.
+    quiesce_report = quiesce_nexo_db_writers(dry_run=False)
+    stopped_launchagents = list((quiesce_report.get("launchagents") or {}).get("stopped") or [])
+    if quiesce_report.get("terminated") or stopped_launchagents:
+        _log(
+            "self-heal: quiesced DB writers "
+            f"(terminated={quiesce_report.get('terminated', 0)}, "
+            f"launchagents={len(stopped_launchagents)})."
+        )
+    if quiesce_report.get("errors"):
+        _log(f"self-heal: DB writer quiesce warnings: {quiesce_report.get('errors')}")
+
+    def _resume_quiesced() -> dict | None:
+        if not stopped_launchagents:
+            return None
+        report = resume_nexo_launchagents(stopped_launchagents)
+        if report.get("started"):
+            _log(f"self-heal: resumed {len(report['started'])} launchagent(s).")
+        if report.get("errors"):
+            _log(f"self-heal: launchagent resume warnings: {report.get('errors')}")
+        return report
+
+    # Snapshot the current (wiped) state so the heal is reversible.
+    pre_heal_dir = paths.create_backup_dir("pre-heal")
+    try:
+        import shutil as _shutil
+        pre_heal_dir.mkdir(parents=True, exist_ok=True)
+        for suffix in ("", "-wal", "-shm"):
+            sidecar = primary.parent / f"{primary.name}{suffix}"
+            if sidecar.exists():
+                _shutil.copy2(str(sidecar), str(pre_heal_dir / sidecar.name))
+    except Exception as e:
+        _log(f"self-heal: pre-heal snapshot warning: {e}")
+    paths.finalize_backup_snapshot(pre_heal_dir)
+
+    # Clear stale WAL/SHM before the restore so the new DB starts clean.
+    for suffix in ("-wal", "-shm"):
+        sidecar = primary.parent / f"{primary.name}{suffix}"
+        if sidecar.exists():
+            try:
+                sidecar.unlink()
+            except Exception as e:
+                _log(f"self-heal: could not remove {sidecar.name}: {e}")
+
+    ok, err = safe_sqlite_backup(reference, primary)
+    if not ok:
+        _log(f"self-heal: restore copy failed: {err}")
+        resume_report = _resume_quiesced()
+        return {
+            "action": "failed",
+            "reason": "restore_copy_failed",
+            "error": err,
+            "reference": str(reference),
+            "pre_heal_dir": str(pre_heal_dir),
+            "quiesce": quiesce_report,
+            "resume": resume_report,
+        }
+    valid, valid_err = validate_backup_matches_source(reference, primary, recovery_tables)
+    if not valid:
+        _log(f"self-heal: post-restore validation failed: {valid_err}")
+        resume_report = _resume_quiesced()
+        return {
+            "action": "failed",
+            "reason": "validation_failed",
+            "error": valid_err,
+            "reference": str(reference),
+            "pre_heal_dir": str(pre_heal_dir),
+            "quiesce": quiesce_report,
+            "resume": resume_report,
+        }
+
+    final_counts = db_row_counts(primary, recovery_tables)
+    final_total = sum(v for v in final_counts.values() if isinstance(v, int))
+    _log(f"self-heal: restored {final_total} critical rows from {reference.name}.")
+    resume_report = _resume_quiesced()
+    try:
+        SELF_HEAL_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SELF_HEAL_STATE_FILE.write_text(json.dumps({
+            "last_heal_ts": time.time(),
+            "reference": str(reference),
+            "critical_rows_restored": final_total,
+            "pre_heal_dir": str(pre_heal_dir),
+            "quiesced_launchagents": stopped_launchagents,
+        }))
+    except Exception as e:
+        _log(f"self-heal: state write warning: {e}")
+
+    return {
+        "action": "restored",
+        "reference": str(reference),
+        "reference_rows": ref_total,
+        "restored_rows": final_total,
+        "pre_heal_dir": str(pre_heal_dir),
+        "terminated_servers": int((quiesce_report.get("mcp") or {}).get("terminated") or 0),
+        "quiesce": quiesce_report,
+        "resume": resume_report,
+    }
+
+
+def _purge_zero_byte_db_files() -> list[Path]:
+    """Delete 0-byte .db files in NEXO_HOME and its ``data/`` subdir.
+
+    These are orphans from interrupted installs / aborted ``sqlite3.connect``
+    calls. They break backup validation by (a) masking the real DB during
+    :func:`_find_primary_db_path` selection when two ``nexo.db`` paths
+    coexist, and (b) being copied into the backup as empty shells that later
+    confuse :func:`_restore_dbs` on rollback.
+
+    Never touches SRC_DIR (the repo checkout) or the ``backups/`` tree.
+    Returns the list of removed paths for logging; failures are swallowed
+    so backup never aborts because of orphan cleanup.
+    """
+    removed: list[Path] = []
+    scan_dirs: list[Path] = []
+    if NEXO_HOME.is_dir():
+        scan_dirs.append(NEXO_HOME)
+    if DATA_DIR.is_dir() and DATA_DIR != NEXO_HOME:
+        scan_dirs.append(DATA_DIR)
+    for scan_dir in scan_dirs:
+        try:
+            candidates = [f for f in scan_dir.glob("*.db") if f.is_file()]
+        except Exception:
+            continue
+        for path in candidates:
+            try:
+                if path.stat().st_size != 0:
+                    continue
+            except Exception:
+                continue
+            try:
+                path.unlink()
+                removed.append(path)
+                _log(f"Purged zero-byte DB orphan: {path}")
+            except Exception as e:
+                _log(f"Failed to purge zero-byte DB {path}: {e}")
+    return removed
+
+
+def _migrate_effort_to_resonance(dest: Path = NEXO_HOME) -> list[str]:
+    """Auto-migrate legacy ``reasoning_effort`` preference into the new
+    ``preferences.default_resonance`` knob.
+
+    Context: before v5.9.0 the user's power-level preference lived in
+    ``config/schedule.json`` under
+    ``client_runtime_profiles.claude_code.reasoning_effort`` — one of
+    ``max`` / ``xhigh`` / ``high`` / ``medium``. v5.9.0 introduced the
+    resonance map, with ``preferences.default_resonance`` (one of
+    ``maximo`` / ``alto`` / ``medio`` / ``bajo``) written to
+    ``brain/calibration.json``. When the new code path kicks in, a user
+    whose only recorded preference is the legacy effort silently falls
+    back to ``DEFAULT_RESONANCE`` (``alto``), losing their prior
+    preference. v5.10.0 shipped without a migration for this; v5.10.1
+    adds it here.
+
+    The migration is idempotent and conservative: it only runs when the
+    user has NOT set ``default_resonance`` explicitly anywhere (neither
+    in ``calibration.json`` nor in ``schedule.json``). That means users
+    who already adjusted their preference through the Desktop UI or the
+    ``nexo preferences --resonance`` CLI keep whatever they chose; this
+    migration only recovers the legacy preference for users who never
+    touched either.
+
+    Mapping (mirrors ``_RESONANCE_TABLE`` in ``src/resonance_map.py``):
+        max    → maximo
+        xhigh  → alto
+        high   → medio
+        medium → bajo
+
+    Returns the list of actions taken for logging. Failures are
+    swallowed: migration must never block an update.
+    """
+    import json as _json
+
+    actions: list[str] = []
+
+    cal_path = dest / "personal" / "brain" / "calibration.json"
+    if not cal_path.exists():
+        cal_path = dest / "brain" / "calibration.json"
+    sched_path = _runtime_config_dir(dest) / "schedule.json"
+
+    try:
+        cal = _json.loads(cal_path.read_text()) if cal_path.exists() else {}
+        if not isinstance(cal, dict):
+            cal = {}
+    except Exception:
+        cal = {}
+
+    try:
+        sched = _json.loads(sched_path.read_text()) if sched_path.exists() else {}
+        if not isinstance(sched, dict):
+            sched = {}
+    except Exception:
+        sched = {}
+
+    existing_cal_pref = ""
+    if isinstance(cal.get("preferences"), dict):
+        existing_cal_pref = str(cal["preferences"].get("default_resonance") or "").strip().lower()
+    existing_sched_pref = str(sched.get("default_resonance") or "").strip().lower()
+
+    valid_tiers = {"maximo", "alto", "medio", "bajo"}
+    if existing_cal_pref in valid_tiers or existing_sched_pref in valid_tiers:
+        return actions  # user already has an explicit resonance preference
+
+    # Look up the legacy effort hint.
+    effort = ""
+    profiles = sched.get("client_runtime_profiles")
+    if isinstance(profiles, dict):
+        cc = profiles.get("claude_code") if isinstance(profiles.get("claude_code"), dict) else {}
+        effort = str(cc.get("reasoning_effort") or "").strip().lower()
+
+    legacy_map = {
+        "max": "maximo",
+        "xhigh": "alto",
+        "high": "medio",
+        "medium": "bajo",
+    }
+    target_tier = legacy_map.get(effort)
+    if not target_tier:
+        return actions  # nothing usable to migrate from
+
+    # Write into calibration.json (canonical location for v5.9.1+).
+    try:
+        cal_path.parent.mkdir(parents=True, exist_ok=True)
+        prefs = cal.get("preferences")
+        if not isinstance(prefs, dict):
+            prefs = {}
+        prefs["default_resonance"] = target_tier
+        cal["preferences"] = prefs
+        cal_path.write_text(_json.dumps(cal, indent=2, ensure_ascii=False) + "\n")
+        actions.append(
+            f"resonance-migration:{effort}->{target_tier}"
+        )
+    except Exception as exc:
+        actions.append(f"resonance-migration-warning:{exc.__class__.__name__}")
+
+    return actions
+
+
+def _cleanup_legacy_email_routing_config(dest: Path = NEXO_HOME) -> list[str]:
+    """Remove retired email routing overrides from persisted runtime config.
+
+    Older runtimes stored ``automation_task_profile`` inside
+    ``runtime/nexo-email/config.json`` (and earlier under ``nexo-email/``).
+    The email monitor now resolves model/effort exclusively from its caller in
+    ``resonance_map.py``, so keeping that key around only preserves a stale,
+    misleading second source of truth.
+    """
+    import json as _json
+
+    actions: list[str] = []
+    candidates = [
+        dest / "runtime" / "nexo-email" / "config.json",
+        dest / "nexo-email" / "config.json",
+    ]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            payload = _json.loads(path.read_text())
+        except Exception as exc:
+            actions.append(
+                f"email-routing-cleanup-warning:{path.name}:{exc.__class__.__name__}"
+            )
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if "automation_task_profile" not in payload:
+            continue
+        payload.pop("automation_task_profile", None)
+        try:
+            path.write_text(_json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+            actions.append(f"email-routing-cleanup:{path}")
+        except Exception as exc:
+            actions.append(
+                f"email-routing-cleanup-warning:{path.name}:{exc.__class__.__name__}"
+            )
+    return actions
+
+
+def _relocate_resonance_tiers_contract(dest: Path = NEXO_HOME) -> list[str]:
+    """Ensure ``resonance_tiers.json`` lives at the public contract path
+    ``NEXO_HOME/personal/brain/resonance_tiers.json`` and purge the legacy
+    copy at ``NEXO_HOME/resonance_tiers.json``.
+
+    Context: v6.0.0 defined the public contract (read by NEXO Desktop) as
+    ``~/.nexo/brain/resonance_tiers.json`` but the F0.6 canonical location is
+    ``~/.nexo/personal/brain/resonance_tiers.json``. Older installers also
+    copied the file to ``~/.nexo/resonance_tiers.json`` (legacy flat-file
+    layout), so Desktop failed with *"NEXO Brain contract missing"* until the
+    user moved the file by hand. The runtime now publishes to the canonical
+    F0.6 brain dir while legacy ``~/.nexo/brain`` remains only a compatibility
+    alias when present.
+
+    Idempotent: no-op once the contract file is in ``personal/brain`` and the
+    legacy flat-file copy is gone. Never raises — migration must not block an
+    update.
+    """
+    actions: list[str] = []
+    brain_dir = dest / "personal" / "brain"
+    contract_path = brain_dir / "resonance_tiers.json"
+    legacy_path = dest / "resonance_tiers.json"
+
+    try:
+        brain_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        actions.append(f"resonance-contract-relocate-warning:mkdir:{exc.__class__.__name__}")
+        return actions
+
+    # If the contract already exists in the canonical brain dir, just drop the
+    # legacy flat-file copy.
+    if contract_path.is_file():
+        if legacy_path.is_file():
+            try:
+                legacy_path.unlink()
+                actions.append("resonance-contract-relocate:legacy-removed")
+            except Exception as exc:
+                actions.append(f"resonance-contract-relocate-warning:unlink:{exc.__class__.__name__}")
+        return actions
+
+    # Contract missing from the canonical brain dir — promote the legacy file
+    # if present.
+    if legacy_path.is_file():
+        try:
+            contract_path.write_bytes(legacy_path.read_bytes())
+            legacy_path.unlink()
+            actions.append("resonance-contract-relocate:moved-to-brain")
+        except Exception as exc:
+            actions.append(f"resonance-contract-relocate-warning:move:{exc.__class__.__name__}")
+    # If neither exists, the caller (nexo-brain.js publishBrainContracts)
+    # will write it from the package source on the next install pass; nothing
+    # for this Python migration to do.
+
+    return actions
+
+
+def _refresh_resonance_tiers_model_defaults(dest: Path = NEXO_HOME) -> list[str]:
+    """Upgrade persisted resonance contracts that still use old NEXO defaults.
+
+    Existing users keep a public ``resonance_tiers.json`` contract in their
+    personal brain. Source defaults alone do not update that file, so known
+    Opus defaults must be migrated in place while custom models are left alone.
+    """
+    actions: list[str] = []
+    source_path = Path(__file__).resolve().parent / "resonance_tiers.json"
+    try:
+        source_payload = json.loads(source_path.read_text())
+    except Exception as exc:
+        return [f"resonance-default-refresh-warning:source:{exc.__class__.__name__}"]
+
+    target_paths = [
+        dest / "personal" / "brain" / "resonance_tiers.json",
+        dest / "brain" / "resonance_tiers.json",
+    ]
+    old_prefixes = ("claude-opus-4-6", "claude-opus-4-7", "claude-fable-5")
+
+    for target_path in target_paths:
+        try:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            if target_path.is_file():
+                payload = json.loads(target_path.read_text())
+            else:
+                if target_path != target_paths[0]:
+                    continue
+                payload = json.loads(json.dumps(source_payload))
+        except Exception as exc:
+            actions.append(f"resonance-default-refresh-warning:read:{target_path.name}:{exc.__class__.__name__}")
+            continue
+
+        changed = False
+        tiers = payload.get("tiers") if isinstance(payload, dict) else {}
+        source_tiers = source_payload.get("tiers") if isinstance(source_payload, dict) else {}
+        if not isinstance(tiers, dict) or not isinstance(source_tiers, dict):
+            continue
+
+        for tier_name, tier_payload in tiers.items():
+            if not isinstance(tier_payload, dict):
+                continue
+            claude = tier_payload.get("claude_code")
+            source_claude = (source_tiers.get(tier_name) or {}).get("claude_code") if isinstance(source_tiers.get(tier_name), dict) else {}
+            if not isinstance(claude, dict) or not isinstance(source_claude, dict):
+                continue
+            model = str(claude.get("model") or "").strip()
+            tier_changed = False
+            if model and model.startswith(old_prefixes):
+                claude["model"] = str(source_claude.get("model") or "claude-opus-4-8")
+                tier_changed = True
+            if tier_changed and not str(claude.get("effort") or "").strip() and source_claude.get("effort"):
+                claude["effort"] = str(source_claude.get("effort"))
+            changed = changed or tier_changed
+
+        if "default_tier" not in payload and source_payload.get("default_tier"):
+            payload["default_tier"] = source_payload.get("default_tier")
+            changed = True
+
+        if changed or not target_path.is_file():
+            try:
+                target_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+                actions.append(f"resonance-default-refresh:{target_path.name}")
+            except Exception as exc:
+                actions.append(f"resonance-default-refresh-warning:write:{target_path.name}:{exc.__class__.__name__}")
+
+    return actions
+
+
+def _bootstrap_profile_from_calibration_meta(dest: Path = NEXO_HOME) -> list[str]:
+    """Create ``brain/profile.json`` from ``calibration.json`` fields when the
+    profile file does not exist yet.
+
+    Context: the onboarding flow documented in CLAUDE.md writes ``role`` and
+    ``technical_level`` to ``brain/profile.json``. Users who went through the
+    2025/early-2026 flow (or whose onboarding was interrupted) ended up with
+    those values living under ``calibration.json → meta.role`` and
+    ``meta.technical_level`` only, with no ``profile.json`` file at all.
+    NEXO Desktop's "Preferencias → Avanzado" tab then shows an empty
+    ``{}`` for ``profile.json`` with no context — confusing for the operator.
+
+    This migration is conservative and idempotent:
+    - Only runs when ``profile.json`` does not exist (or is empty/invalid).
+    - Only writes when ``calibration.json`` has at least one of
+      ``meta.role`` / ``meta.technical_level`` / ``name`` / ``language``.
+    - Never overwrites an existing profile.
+    - Errors are swallowed into a ``profile-bootstrap-warning:*`` action
+      line; the update path never raises.
+    """
+    import json as _json
+
+    actions: list[str] = []
+
+    cal_path = dest / "brain" / "calibration.json"
+    profile_path = dest / "brain" / "profile.json"
+
+    if profile_path.exists():
+        try:
+            existing = _json.loads(profile_path.read_text())
+            if isinstance(existing, dict) and existing:
+                return actions  # profile already populated, keep untouched
+        except Exception:
+            # Corrupt / empty file — fall through and rewrite below.
+            pass
+
+    if not cal_path.exists():
+        return actions
+
+    try:
+        cal = _json.loads(cal_path.read_text())
+        if not isinstance(cal, dict):
+            return actions
+    except Exception:
+        return actions
+
+    meta = cal.get("meta") if isinstance(cal.get("meta"), dict) else {}
+    payload: dict = {}
+
+    role = str(meta.get("role") or "").strip()
+    tech = str(meta.get("technical_level") or "").strip()
+    name = str(cal.get("name") or "").strip()
+    lang = str(cal.get("language") or "").strip()
+
+    if role:
+        payload["role"] = role
+    if tech:
+        payload["technical_level"] = tech
+    if name:
+        payload["name"] = name
+    if lang:
+        payload["language"] = lang
+
+    if not payload:
+        return actions  # nothing to seed the profile with
+
+    payload["source"] = "auto_update._bootstrap_profile_from_calibration_meta"
+
+    try:
+        profile_path.parent.mkdir(parents=True, exist_ok=True)
+        profile_path.write_text(_json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+        actions.append(f"profile-bootstrap:{len(payload)-1}-fields")
+    except Exception as exc:
+        actions.append(f"profile-bootstrap-warning:{exc.__class__.__name__}")
+
+    return actions
+
+
+def _heal_deep_sleep_runtime(dest: Path = NEXO_HOME) -> list[str]:
+    """Repair deep-sleep state that older runtimes left in a bad shape.
+
+    Runs on every ``auto_update`` post-sync. The bug it fixes: between
+    Brain 5.6.1 and 5.8.0 the cron wrapper only wrote to ``cron_runs`` at
+    end, so any wrapper killed by signal produced no row. The watchdog then
+    saw the cron as "missing cron_runs entry" and kickstart-‍k'd the live
+    worker — an infinite loop that wedged deep-sleep Phase 2 on the first
+    session of every batch. 5.8.1 fixes the loop at the source (wrapper
+    start-row + watchdog in-flight detection) but older runtimes that have
+    already been running the buggy loop need their residue cleaned up.
+
+    Returns the list of actions performed, for logging. Failures are
+    swallowed: this is best-effort healing, it must never block an update.
+    """
+    import sqlite3
+    import time as _time
+
+    actions: list[str] = []
+
+    deep_sleep_dir = dest / "operations" / "deep-sleep"
+    coord_dir = dest / "coordination"
+    data_db = dest / "data" / "nexo.db"
+    now = _time.time()
+
+    # (1) Drop poisoned checkpoints: the first retry that hit Anthropic's
+    #     overloaded_error got cached as a permanent failure. Older
+    #     extract.py re-used that checkpoint forever. New extract.py treats
+    #     transient errors as retryable, but old poisoned checkpoints still
+    #     claim 0 findings — purge them so the next deep-sleep retries cleanly.
+    if deep_sleep_dir.is_dir():
+        poisoned = 0
+        for checkpoint_dir in deep_sleep_dir.glob("*/checkpoints"):
+            if not checkpoint_dir.is_dir():
+                continue
+            for entry in checkpoint_dir.glob("*.json"):
+                try:
+                    content = entry.read_text()
+                except OSError:
+                    continue
+                if "overloaded_error" in content or '"error":{"type":"' in content:
+                    try:
+                        entry.unlink()
+                        poisoned += 1
+                    except OSError:
+                        pass
+        if poisoned:
+            actions.append(f"checkpoints-purged:{poisoned}")
+
+        # Drop debug-extract-*.txt scratch files older than 7 days.
+        stale_debug = 0
+        for entry in deep_sleep_dir.glob("debug-extract-*.txt"):
+            try:
+                if now - entry.stat().st_mtime > 7 * 86400:
+                    entry.unlink()
+                    stale_debug += 1
+            except OSError:
+                continue
+        if stale_debug:
+            actions.append(f"debug-scratch-purged:{stale_debug}")
+
+    # (2) Release stale deep-sleep locks so the next 04:30 run can acquire
+    #     them. Locks older than 6h are always stale — a real run finishes
+    #     in well under an hour.
+    lock_names = ("sleep.lock", "sleep-process.lock", "synthesis.lock")
+    released = 0
+    if coord_dir.is_dir():
+        for name in lock_names:
+            lock_path = coord_dir / name
+            if not lock_path.exists():
+                continue
+            try:
+                age = now - lock_path.stat().st_mtime
+            except OSError:
+                continue
+            if age > 6 * 3600:
+                try:
+                    lock_path.unlink()
+                    released += 1
+                except OSError:
+                    pass
+    if released:
+        actions.append(f"stale-locks-released:{released}")
+
+    # (3) Close dangling cron_runs rows. Any row with ended_at IS NULL older
+    #     than 6h is either a process killed by the old watchdog loop or a
+    #     zombie left behind by a previous bad install. Close them with
+    #     exit_code=143 + summary so the NEW watchdog treats the cron as
+    #     "finished with error" rather than "in-flight forever".
+    if data_db.is_file():
+        try:
+            conn = sqlite3.connect(str(data_db), timeout=5)
+            try:
+                cur = conn.execute(
+                    """
+                    UPDATE cron_runs
+                       SET ended_at = datetime('now'),
+                           exit_code = 143,
+                           error = 'healed by auto_update (pre-5.8.1 wrapper left row open)',
+                           duration_secs = CAST(
+                               strftime('%s','now') - strftime('%s', started_at) AS REAL
+                           )
+                     WHERE ended_at IS NULL
+                       AND strftime('%s','now') - strftime('%s', started_at) > 6 * 3600
+                    """
+                )
+                closed = cur.rowcount or 0
+                conn.commit()
+                if closed:
+                    actions.append(f"cron_runs-closed-dangling:{closed}")
+            finally:
+                conn.close()
+        except Exception as exc:
+            actions.append(f"cron_runs-heal-warning:{exc.__class__.__name__}")
+
+    # (4) Remove .watchdog-fails registry entries older than 24h — the new
+    #     in-flight detection makes stale counters obsolete.
+    fails_file = dest / "scripts" / ".watchdog-fails"
+    if fails_file.exists():
+        try:
+            if now - fails_file.stat().st_mtime > 24 * 3600:
+                fails_file.unlink()
+                actions.append("watchdog-fails-reset")
+        except OSError:
+            pass
+
+    # (5) Bound Deep Sleep operational artifacts for existing installs. Older
+    # versions accumulated DB backups and large context dumps indefinitely; this
+    # apply path runs on update so users do not have to wait for the next night.
+    try:
+        from deep_sleep_retention import prune_deep_sleep_runtime
+
+        report = prune_deep_sleep_runtime(nexo_home=dest, apply=True)
+        deleted = int(report.get("deleted_count") or 0)
+        rotated = int(report.get("logs_rotated") or 0)
+        freed = int(report.get("deleted_bytes") or 0) + int(report.get("log_bytes_trimmed") or 0)
+        if deleted or rotated:
+            actions.append(f"retention:{deleted}-deleted:{rotated}-logs:{freed}-bytes")
+    except Exception as exc:
+        actions.append(f"retention-warning:{exc.__class__.__name__}")
+
+    return actions
+
+
+def _backup_dbs() -> str | None:
+    """Snapshot all .db files before migration. Returns backup dir or None."""
+    import sqlite3
+    import time as _time
+    global _LAST_BACKUP_ERROR
+    _LAST_BACKUP_ERROR = ""
+    # Drop 0-byte .db orphans first — they mask the real DB during primary
+    # path selection and turn into empty shells in the backup, breaking both
+    # validation and rollback paths. Safe no-op when there are none.
+    _purge_zero_byte_db_files()
+    backup_dir: Path | None = None
+
+    db_files = list(DATA_DIR.glob("*.db")) if DATA_DIR.is_dir() else []
+    local_context_db = paths.memory_dir() / "local-context.db"
+    if local_context_db.is_file() and _should_include_local_context_backup(local_context_db):
+        db_files.append(local_context_db)
+    db_files += [f for f in NEXO_HOME.glob("*.db") if f.is_file()]
+    src_db = SRC_DIR / "nexo.db"
+    if src_db.is_file() and src_db not in db_files:
+        db_files.append(src_db)
+
+    if not db_files:
+        return None
+
+    space_err = _backup_space_error()
+    if space_err:
+        _LAST_BACKUP_ERROR = space_err
+        _log(f"DB backup aborted: {space_err}")
+        return None
+
+    backup_dir = paths.create_backup_dir("pre-autoupdate")
+    for db_file in db_files:
+        src_conn = None
+        dst_conn = None
+        try:
+            src_conn = sqlite3.connect(str(db_file))
+            dst_conn = sqlite3.connect(str(backup_dir / db_file.name))
+            src_conn.backup(dst_conn)
+        except Exception as e:
+            _log(f"DB backup warning ({db_file.name}): {e}")
+        finally:
+            for conn in (dst_conn, src_conn):
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+    # Opportunistic rotation: keep only the N most recent pre-autoupdate dirs.
+    # Failures here must never bubble up — the caller depends on the backup
+    # path string for rollback and should not see spurious exceptions from
+    # housekeeping of older entries.
+    try:
+        _rotate_auto_update_backups("pre-autoupdate-")
+    except Exception as e:
+        _log(f"Backup rotation warning (pre-autoupdate): {e}")
+    paths.finalize_backup_snapshot(backup_dir)
+    return str(backup_dir)
+
+
+def _restore_dbs(backup_dir: str):
+    """Restore .db files from a backup directory."""
+    import sqlite3
+    bdir = Path(backup_dir)
+    if not bdir.is_dir():
+        return
+    for db_backup in bdir.glob("*.db"):
+        if db_backup.name == "local-context.db":
+            candidates = [paths.memory_dir() / db_backup.name]
+        else:
+            candidates = [DATA_DIR / db_backup.name, NEXO_HOME / db_backup.name, SRC_DIR / db_backup.name]
+        for candidate in candidates:
+            if candidate.is_file() or db_backup.name == "local-context.db":
+                src_conn = None
+                dst_conn = None
+                try:
+                    candidate.parent.mkdir(parents=True, exist_ok=True)
+                    src_conn = sqlite3.connect(str(db_backup))
+                    dst_conn = sqlite3.connect(str(candidate))
+                    src_conn.backup(dst_conn)
+                    _log(f"Restored DB: {db_backup.name}")
+                except Exception as e:
+                    _log(f"DB restore warning ({db_backup.name}): {e}")
+                finally:
+                    for conn in (dst_conn, src_conn):
+                        if conn is not None:
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
+                break
+
+
+def _sync_hooks():
+    """Copy hook scripts from src/hooks/ to NEXO_HOME/hooks/ after a git pull."""
+    import shutil
+    hooks_src = SRC_DIR / "hooks"
+    hooks_dest = paths.core_hooks_dir()
+    if not hooks_src.is_dir():
+        return
+    hooks_dest.mkdir(parents=True, exist_ok=True)
+    synced = 0
+    for f in hooks_src.iterdir():
+        if f.is_file() and f.suffix == ".sh" and not is_duplicate_artifact_name(f):
+            dest = hooks_dest / f.name
+            shutil.copy2(str(f), str(dest))
+            os.chmod(str(dest), 0o755)
+            synced += 1
+    if synced:
+        _log(f"Synced {synced} hook(s) to {hooks_dest}")
+
+
+# ── Git-based auto-update ────────────────────────────────────────────
+
+def _check_git_updates() -> str | None:
+    """Fetch remote, compare HEAD, pull if behind. Returns status message or None."""
+    # Fetch (allow it to fail silently on network issues)
+    rc, _, fetch_err = _git("fetch", "--quiet")
+    if rc != 0:
+        _log(f"git fetch failed (network?): {fetch_err}")
+        return None  # Can't check, skip silently
+
+    # Compare local HEAD vs remote tracking branch
+    rc, local_head, _ = _git("rev-parse", "HEAD")
+    if rc != 0:
+        return None
+    rc, remote_head, _ = _git("rev-parse", "@{u}")
+    if rc != 0:
+        # No upstream configured — skip
+        return None
+
+    if local_head == remote_head:
+        return None  # Already up to date
+
+    # Check if we're behind (remote has commits we don't)
+    rc, merge_base, _ = _git("merge-base", "HEAD", "@{u}")
+    if rc != 0:
+        return None
+
+    if merge_base == remote_head:
+        # Local is AHEAD — don't pull
+        return None
+    if merge_base != local_head and merge_base != remote_head:
+        # Diverged — don't auto-pull, too risky
+        _log("Local and remote have diverged. Skipping auto-pull.")
+        return "diverged"
+
+    # We're behind — safe to fast-forward pull
+    old_version = _read_package_version()
+    old_req_hash = _requirements_hash()
+
+    # Save old HEAD for rollback
+    rc, old_head, _ = _git("rev-parse", "HEAD")
+    if rc != 0:
+        return None
+
+    db_backup_dir, backup_report = _create_validated_db_backup()
+    if backup_report is not None and not backup_report["ok"]:
+        _log("Skipping auto-update because the validated pre-update DB backup is not trustworthy.")
+        return None
+
+    rc, pull_out, pull_err = _git("pull", "--ff-only")
+    if rc != 0:
+        _log(f"git pull --ff-only failed: {pull_err}")
+        return None  # Don't break anything
+
+    new_version = _read_package_version()
+    new_req_hash = _requirements_hash()
+
+    # Reinstall pip deps if requirements.txt content changed (not just version)
+    if old_req_hash != new_req_hash:
+        if not _reinstall_pip_deps():
+            # pip failed — rollback git + DBs to old HEAD
+            _log("pip install failed after pull, rolling back git...")
+            _git("reset", "--hard", old_head)
+            _reinstall_pip_deps()  # restore old deps (best-effort)
+            if db_backup_dir:
+                _restore_dbs(db_backup_dir)
+            return None
+
+    # Verify the new code can be imported before proceeding
+    if not _verify_import():
+        _log("Import verification failed after pull, rolling back git...")
+        _git("reset", "--hard", old_head)
+        if old_req_hash != new_req_hash:
+            _reinstall_pip_deps()  # restore old deps (best-effort)
+        if db_backup_dir:
+            _restore_dbs(db_backup_dir)
+        return None
+
+    # Run DB migrations after pull — rollback if they fail
+    if not _run_db_migrations():
+        _log("DB migration failed after pull, rolling back git + DB...")
+        _git("reset", "--hard", old_head)
+        if old_req_hash != new_req_hash:
+            _reinstall_pip_deps()
+        if db_backup_dir:
+            _restore_dbs(db_backup_dir)
+        return None
+
+    # Sync hooks to NEXO_HOME (nexo-brain.js copies them on install,
+    # but auto-update via git pull bypasses nexo-brain.js)
+    _sync_hooks()
+
+    # Sync cron definitions with manifest
+    _sync_crons()
+
+    # Bloque D / learning #186: when the package version actually
+    # changed, reload the LaunchAgents so the 40+ background crons
+    # pick up the new code on their next fire instead of holding the
+    # old Python modules in memory until macOS happens to restart them.
+    # Best-effort — never blocks the update flow.
+    if old_version != new_version:
+        try:
+            reload_summary = _reload_launch_agents_after_bump()
+            if reload_summary.get("reloaded"):
+                _log(
+                    f"Reloaded {reload_summary['reloaded']}/{reload_summary['scanned']} "
+                    f"NEXO LaunchAgents after version bump"
+                    + (f" ({len(reload_summary['errors'])} errors)" if reload_summary["errors"] else "")
+                )
+            elif reload_summary.get("scanned"):
+                _log(
+                    f"LaunchAgent reload after bump: scanned {reload_summary['scanned']}, "
+                    f"reloaded 0, errors {len(reload_summary['errors'])}"
+                )
+        except Exception as e:
+            _log(f"LaunchAgent reload after bump failed: {e}")
+
+    msg = f"Auto-updated: {old_version} -> {new_version}" if old_version != new_version else f"Auto-updated (v{new_version}, new commits)"
+    _log(msg)
+    return msg
+
+
+def _verify_import() -> bool:
+    """Verify that the new code can be imported. Returns True on success."""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", "import server"],
+            cwd=str(SRC_DIR),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            _log(f"Import verification failed: {result.stderr or result.stdout}")
+            return False
+        return True
+    except Exception as e:
+        _log(f"Import verification error: {e}")
+        return False
+
+
+def _run_db_migrations() -> bool:
+    """Run NEXO's DB schema migrations (from db._schema) after a pull.
+    Returns True on success, False on failure."""
+    try:
+        from db._schema import run_migrations
+        from db._core import get_db
+        conn = get_db()
+        applied = run_migrations(conn)
+        if applied > 0:
+            _log(f"Applied {applied} DB migration(s)")
+        _sync_core_rules_registry()
+        # Plan Consolidado F1 — one-shot legacy email config migration.
+        # After m46 adds the table, operators installed pre-v6.4.0 still
+        # keep their data inside ~/.nexo/nexo-email/config.json. If the
+        # table is empty and the JSON exists, port the primary account
+        # over automatically so scripts pick up the new source on the
+        # next cron without the operator running anything manually.
+        _maybe_migrate_legacy_email_config()
+        # v6.5+ one-shot — backfill task.owner on legacy rows so Desktop can
+        # drop its client-side _legacyClassifyOwner regex. Idempotent: exits
+        # fast when every followup/reminder already carries an owner token.
+        _maybe_backfill_task_owner()
+        # Plan Consolidado F0.6 — one-shot physical layout migration.
+        # If ~/.nexo/.structure-version is absent or pre-F0.6, move the
+        # flat layout into ~/.nexo/{core,personal,runtime}/<X>/, rewrite
+        # personal_scripts.path + LaunchAgent plists, then write the
+        # F0.6 marker. Idempotent: returns immediately when already F0.6.
+        _maybe_migrate_to_f06_layout()
+        try:
+            _rewrite_f06_launch_agents()
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        _log(f"DB migration error: {e}")
+        return False
+
+
+def _sync_core_rules_registry() -> None:
+    """Keep packaged product-core rules installed in the Brain DB."""
+    try:
+        from plugins.core_rules import _sync_rules_from_json
+        result = _sync_rules_from_json()
+        if result.get("status") == "applied":
+            _log(
+                "Core rules registry synced: "
+                f"v{result.get('version_from')} -> v{result.get('version_to')} "
+                f"({result.get('active_total')} active)"
+            )
+    except Exception as exc:
+        raise RuntimeError(f"core rules registry sync failed: {exc}") from exc
+
+
+def _maybe_migrate_legacy_email_config() -> None:
+    """F1 auto-migrator — idempotent. Runs the helper script the first
+    time after v6.4.0 lands on an existing runtime."""
+    try:
+        from db._email_accounts import list_email_accounts
+    except Exception:
+        return  # m46 not applied yet (older runtime), nothing to do
+    try:
+        legacy = paths.nexo_email_dir() / "config.json"
+        if not legacy.exists():
+            return
+        try:
+            accounts = list_email_accounts(include_disabled=True)
+        except Exception:
+            accounts = []
+        primary_present = any(str(a.get("label") or "") == "primary" for a in accounts)
+        operator_present = any(str(a.get("account_type") or "") == "operator" for a in accounts)
+        if primary_present and operator_present:
+            return  # agent + operator side already backfilled
+        import subprocess as _sp
+        script = Path(__file__).resolve().parent / "scripts" / "nexo-email-migrate-config.py"
+        if not script.exists():
+            return
+        _log("F1: migrating legacy email config.json → email_accounts table")
+        env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent)}
+        r = _sp.run(
+            [sys.executable, str(script)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if r.returncode == 0:
+            line = (r.stdout.strip().splitlines() or ["ok"])[-1]
+            _log(f"F1 email migration: {line}")
+        else:
+            _log(f"F1 email migration FAILED (rc={r.returncode}): {r.stderr.strip()[:200]}")
+    except _sp.TimeoutExpired:
+        _log("F1 email migration timed out after 30s")
+    except Exception as exc:
+        _log(f"F1 email migration skipped: {exc}")
+
+
+def _maybe_backfill_task_owner() -> None:
+    """v6.5+ auto-migrator — idempotent.
+
+    Runs src/scripts/backfill_task_owner.py once when legacy
+    followups/reminders still carry ``owner IS NULL``. The script derives
+    the owner token from ``calibration.json.user.name`` + contextual
+    heuristics, which lets Desktop drop its client-side
+    ``_legacyClassifyOwner`` fallback cleanly.
+
+    Bail-outs (all safe):
+      - ``followups.owner`` column absent (m40 not applied yet).
+      - No rows with ``owner IS NULL`` in followups or reminders.
+      - Helper script not present on disk.
+      - Script timed out or exited non-zero (logged, not fatal).
+    """
+    try:
+        from db._core import get_db
+    except Exception:
+        return
+    try:
+        conn = get_db()
+        try:
+            cur = conn.execute("PRAGMA table_info(followups)")
+        except Exception:
+            return
+        cols = {r[1] for r in cur.fetchall()}
+        if "owner" not in cols:
+            return
+        remaining = 0
+        for table in ("followups", "reminders"):
+            try:
+                cur = conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE owner IS NULL OR owner = ''"
+                )
+                remaining += int(cur.fetchone()[0] or 0)
+            except Exception:
+                continue
+        if remaining == 0:
+            return
+        import subprocess as _sp
+        script = Path(__file__).resolve().parent / "scripts" / "backfill_task_owner.py"
+        if not script.exists():
+            return
+        _log(f"v6.5+: backfilling task.owner on {remaining} legacy row(s)")
+        env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent)}
+        # --rules-only intentionally: server startup invokes us synchronously
+        # and any blocking >~5s breaks the MCP initialize handshake. The
+        # regex rules already cover every legacy row correctly (worst case
+        # falls back to 'shared'); Deep Sleep / cron can re-run without the
+        # flag later to refine ambiguous 'shared' rows with the classifier.
+        r = _sp.run(
+            [sys.executable, str(script), "--rules-only"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if r.returncode == 0:
+            line = (r.stdout.strip().splitlines() or ["ok"])[-1]
+            _log(f"task.owner backfill: {line}")
+        else:
+            _log(
+                f"task.owner backfill FAILED (rc={r.returncode}): "
+                f"{r.stderr.strip()[:200]}"
+            )
+    except _sp.TimeoutExpired:
+        _log("task.owner backfill timed out after 30s (--rules-only)")
+    except Exception as exc:
+        _log(f"task.owner backfill skipped: {exc}")
+
+
+# ── npm version check (notify only) ─────────────────────────────────
+
+
+def _f06_legacy_shim_map() -> list[tuple[str, Path]]:
+    core_root = NEXO_HOME / "core"
+    return [
+        ("scripts", core_root / "scripts"),
+        ("skills-core", core_root / "skills"),
+        ("db", core_root / "db"),
+        ("cognitive", core_root / "cognitive"),
+        ("doctor", core_root / "doctor"),
+        ("dashboard", core_root / "dashboard"),
+        ("brain", NEXO_HOME / "personal" / "brain"),
+        ("config", NEXO_HOME / "personal" / "config"),
+        ("skills", NEXO_HOME / "personal" / "skills"),
+        ("plugins", core_root / "plugins"),
+        ("hooks", core_root / "hooks"),
+        ("rules", core_root / "rules"),
+        ("local_context", core_root / "local_context"),
+        ("product_knowledge", core_root / "product_knowledge"),
+        ("data", NEXO_HOME / "runtime" / "data"),
+        ("logs", NEXO_HOME / "runtime" / "logs"),
+        ("operations", NEXO_HOME / "runtime" / "operations"),
+        ("state", NEXO_HOME / "runtime" / "state"),
+        ("backups", NEXO_HOME / "runtime" / "backups"),
+        ("memory", NEXO_HOME / "runtime" / "memory"),
+        ("coordination", NEXO_HOME / "runtime" / "coordination"),
+        ("exports", NEXO_HOME / "runtime" / "exports"),
+        ("nexo-email", NEXO_HOME / "runtime" / "nexo-email"),
+        ("snapshots", NEXO_HOME / "runtime" / "snapshots"),
+        ("crons", NEXO_HOME / "runtime" / "crons"),
+        ("workdir", paths.personal_lib_dir() / "workdir"),
+        ("working", paths.personal_lib_dir() / "working"),
+    ]
+
+
+def _f06_legacy_file_shim_map() -> list[tuple[str, Path]]:
+    return [
+        ("CLAUDE.md.generated", paths.personal_lib_dir() / "generated" / "CLAUDE.md.generated"),
+    ]
+
+
+def _f06_packaged_code_file_targets() -> list[tuple[str, Path]]:
+    names = list(_discover_runtime_root_python_modules(NEXO_HOME))
+    names.extend(_discover_runtime_root_python_modules(NEXO_HOME / "core"))
+    for extra in ("requirements.txt", "model_defaults.json", "package.json", "version.json"):
+        candidate = NEXO_HOME / extra
+        canonical_candidate = NEXO_HOME / "core" / extra
+        if candidate.exists() or canonical_candidate.exists():
+            names.append(extra)
+    seen: set[str] = set()
+    targets: list[tuple[str, Path]] = []
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        targets.append((name, NEXO_HOME / "core" / name))
+    return targets
+
+
+def _f06_live_legacy_paths() -> list[Path]:
+    """Return real pre-F0.6 paths that still need migration.
+
+    Symlink shims do not count here. We only care about physical files or
+    directories that keep the flat layout alive as a second source of truth.
+    """
+    legacy_anchors = [
+        NEXO_HOME / sub
+        for sub in (
+            "scripts",
+            "brain",
+            "data",
+            "operations",
+            "state",
+            "logs",
+            "backups",
+            "memory",
+            "cognitive",
+            "coordination",
+            "exports",
+            "nexo-email",
+            "doctor",
+            "snapshots",
+            "crons",
+            "skills",
+            "plugins",
+            "hooks",
+            "rules",
+            "local_context",
+            "product_knowledge",
+            "db",
+            "dashboard",
+            "skills-core",
+            "workdir",
+            "working",
+        )
+    ]
+    present = [p for p in legacy_anchors if p.exists() and not p.is_symlink()]
+    if present:
+        return present
+    live_files: list[Path] = []
+    for legacy_name, _canonical in _f06_packaged_code_file_targets():
+        candidate = NEXO_HOME / legacy_name
+        if candidate.exists() and not candidate.is_symlink():
+            live_files.append(candidate)
+    for legacy_name, _canonical in _f06_legacy_file_shim_map():
+        candidate = NEXO_HOME / legacy_name
+        if candidate.exists() and not candidate.is_symlink():
+            live_files.append(candidate)
+    return live_files
+
+
+def _promote_packaged_runtime_code_to_core() -> None:
+    """Move packaged runtime code out of ``~/.nexo`` root into ``core/``.
+
+    F0.6 originally cleaned directory layout for scripts/hooks/plugins/data,
+    but older installers still left top-level Python modules plus packages like
+    ``db``/``cognitive``/``dashboard`` living at the root. That creates two
+    problems:
+    1. root becomes a second live source of truth instead of a shim layer;
+    2. hooks resolve imports relative to ``core/`` and therefore miss these
+       packages when they stay outside ``core``.
+
+    This helper promotes those packaged runtime artifacts into ``core/`` and
+    leaves the root path to be re-created as a compatibility symlink by
+    ``_ensure_f06_legacy_shims``. Idempotent and best-effort.
+    """
+    timestamp = time.strftime("%Y-%m-%d-%H%M%S", time.gmtime())
+    conflict_root: Path | None = None
+
+    def _conflict_dir() -> Path:
+        nonlocal conflict_root
+        if conflict_root is None:
+            conflict_root = paths.create_backup_dir("packaged-code-f06-conflicts")
+        return conflict_root
+
+    def _same_file(a: Path, b: Path) -> bool:
+        try:
+            return a.is_file() and b.is_file() and a.read_bytes() == b.read_bytes()
+        except Exception:
+            return False
+
+    def _stash_existing(target: Path, label: str) -> None:
+        if not target.exists() and not target.is_symlink():
+            return
+        backup_base = _conflict_dir() / label
+        backup_base.mkdir(parents=True, exist_ok=True)
+        backup_target = backup_base / target.name
+        if backup_target.exists() or backup_target.is_symlink():
+            if backup_target.is_dir() and not backup_target.is_symlink():
+                shutil.rmtree(backup_target, ignore_errors=True)
+            else:
+                backup_target.unlink(missing_ok=True)
+        shutil.move(str(target), str(backup_target))
+
+    def _resolved_source(path: Path) -> Path | None:
+        if not path.exists() and not path.is_symlink():
+            return None
+        if path.is_symlink():
+            try:
+                resolved = path.resolve(strict=False)
+            except Exception:
+                return None
+            if not resolved.exists():
+                return None
+            return resolved
+        return path
+
+    core_root = NEXO_HOME / "core"
+    dir_targets = [
+        ("db", core_root / "db"),
+        ("cognitive", core_root / "cognitive"),
+        ("doctor", core_root / "doctor"),
+        ("dashboard", core_root / "dashboard"),
+        ("local_context", core_root / "local_context"),
+        ("product_knowledge", core_root / "product_knowledge"),
+        ("skills-core", core_root / "skills"),
+    ]
+
+    for legacy_name, canonical in dir_targets:
+        source_path = NEXO_HOME / legacy_name
+        source = _resolved_source(source_path)
+        if source is None or not source.is_dir():
+            continue
+        try:
+            if source.resolve(strict=False) == canonical.resolve(strict=False):
+                continue
+        except Exception:
+            pass
+        canonical.mkdir(parents=True, exist_ok=True)
+        for item in list(source.iterdir()):
+            target = canonical / item.name
+            if target.is_symlink():
+                try:
+                    target.unlink()
+                except Exception:
+                    pass
+            if target.exists():
+                if item.is_file() and _same_file(item, target):
+                    try:
+                        item.unlink()
+                    except Exception:
+                        pass
+                    continue
+                _stash_existing(target, legacy_name)
+            try:
+                shutil.move(str(item), str(target))
+            except Exception as exc:
+                _log(f"[F0.6 packaged-code] move {item} -> {target} failed: {exc}")
+
+    for legacy_name, canonical in _f06_packaged_code_file_targets():
+        source_path = NEXO_HOME / legacy_name
+        source = _resolved_source(source_path)
+        if source is None or not source.is_file():
+            continue
+        try:
+            if source.resolve(strict=False) == canonical.resolve(strict=False):
+                continue
+        except Exception:
+            pass
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        if canonical.exists():
+            if _same_file(source, canonical):
+                try:
+                    source.unlink()
+                except Exception:
+                    pass
+                continue
+            _stash_existing(canonical, "flat-runtime")
+        try:
+            shutil.move(str(source), str(canonical))
+        except Exception as exc:
+            _log(f"[F0.6 packaged-code] move {source} -> {canonical} failed: {exc}")
+    if conflict_root is not None:
+        paths.finalize_backup_snapshot(conflict_root)
+
+
+def _ensure_f06_legacy_shims() -> None:
+    """Heal hybrid installs by replacing live legacy dirs with shims.
+
+    F0.6 originally moved most trees but older installs could keep
+    physical `~/.nexo/<legacy>` directories alongside their canonical
+    post-F0.6 destinations. This helper merges remaining content into
+    the canonical tree, preserves conflicts under runtime/backups, and
+    then installs relative symlinks so the legacy path is no longer a
+    second source of truth.
+    """
+    conflict_root: Path | None = None
+    timestamp = time.strftime("%Y-%m-%d-%H%M%S", time.gmtime())
+
+    def _conflict_dir() -> Path:
+        nonlocal conflict_root
+        if conflict_root is None:
+            conflict_root = paths.create_backup_dir("legacy-shim-conflicts")
+        return conflict_root
+
+    def _same_file(a: Path, b: Path) -> bool:
+        try:
+            return a.is_file() and b.is_file() and a.read_bytes() == b.read_bytes()
+        except Exception:
+            return False
+
+    for legacy_name, canonical in _f06_legacy_shim_map():
+        legacy = NEXO_HOME / legacy_name
+        canonical.mkdir(parents=True, exist_ok=True)
+
+        if legacy.is_symlink():
+            try:
+                if legacy.resolve(strict=False) == canonical.resolve(strict=False):
+                    continue
+            except Exception:
+                pass
+            try:
+                legacy.unlink()
+            except Exception as exc:
+                _log(f"[F0.6 shim] could not replace symlink {legacy_name}: {exc}")
+                continue
+
+        if legacy.is_dir():
+            for item in list(legacy.iterdir()):
+                target = canonical / item.name
+                if target.exists():
+                    if item.is_dir() and target.is_dir():
+                        for child in list(item.iterdir()):
+                            child_target = target / child.name
+                            if child_target.exists():
+                                if _same_file(child, child_target):
+                                    if child.is_file():
+                                        child.unlink()
+                                    continue
+                                backup_target = _conflict_dir() / legacy_name / item.name
+                                backup_target.mkdir(parents=True, exist_ok=True)
+                                shutil.move(str(child), str(backup_target / child.name))
+                                continue
+                            shutil.move(str(child), str(child_target))
+                        try:
+                            item.rmdir()
+                        except OSError:
+                            pass
+                        continue
+                    if _same_file(item, target):
+                        if item.is_file():
+                            item.unlink()
+                        continue
+                    backup_target = _conflict_dir() / legacy_name
+                    backup_target.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(item), str(backup_target / item.name))
+                    continue
+                shutil.move(str(item), str(target))
+            try:
+                legacy.rmdir()
+            except OSError:
+                _log(f"[F0.6 shim] keeping non-empty legacy dir {legacy_name} (manual review may be needed)")
+                continue
+        elif legacy.exists():
+            _log(f"[F0.6 shim] legacy path {legacy_name} is not a directory; skipped")
+            continue
+
+        try:
+            relative = os.path.relpath(str(canonical), str(legacy.parent))
+            legacy.symlink_to(relative, target_is_directory=True)
+        except Exception as exc:
+            _log(f"[F0.6 shim] symlink create failed for {legacy_name}: {exc}")
+
+    for legacy_name, canonical in _f06_packaged_code_file_targets():
+        legacy = NEXO_HOME / legacy_name
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+
+        if legacy.is_symlink():
+            try:
+                if legacy.resolve(strict=False) == canonical.resolve(strict=False):
+                    continue
+            except Exception:
+                pass
+            try:
+                legacy.unlink()
+            except Exception as exc:
+                _log(f"[F0.6 shim] could not replace file symlink {legacy_name}: {exc}")
+                continue
+
+        if legacy.is_file():
+            if canonical.exists():
+                if _same_file(legacy, canonical):
+                    try:
+                        legacy.unlink()
+                    except Exception:
+                        pass
+                else:
+                    backup_target = _conflict_dir() / "flat-runtime"
+                    backup_target.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(legacy), str(backup_target / legacy.name))
+            else:
+                try:
+                    shutil.move(str(legacy), str(canonical))
+                except Exception as exc:
+                    _log(f"[F0.6 shim] move failed for flat file {legacy_name}: {exc}")
+                    continue
+        elif legacy.exists():
+            _log(f"[F0.6 shim] legacy flat path {legacy_name} is not a file; skipped")
+            continue
+
+        if not canonical.exists():
+            continue
+        try:
+            relative = os.path.relpath(str(canonical), str(legacy.parent))
+            legacy.symlink_to(relative)
+        except Exception as exc:
+            _log(f"[F0.6 shim] file symlink create failed for {legacy_name}: {exc}")
+
+    for legacy_name, canonical in _f06_legacy_file_shim_map():
+        legacy = NEXO_HOME / legacy_name
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+
+        if legacy.is_symlink():
+            try:
+                if legacy.resolve(strict=False) == canonical.resolve(strict=False):
+                    continue
+            except Exception:
+                pass
+            try:
+                legacy.unlink()
+            except Exception as exc:
+                _log(f"[F0.6 shim] could not replace misc file symlink {legacy_name}: {exc}")
+                continue
+
+        if legacy.is_file():
+            if canonical.exists():
+                if _same_file(legacy, canonical):
+                    try:
+                        legacy.unlink()
+                    except Exception:
+                        pass
+                else:
+                    backup_target = _conflict_dir() / "legacy-files"
+                    backup_target.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(legacy), str(backup_target / legacy.name))
+            else:
+                try:
+                    shutil.move(str(legacy), str(canonical))
+                except Exception as exc:
+                    _log(f"[F0.6 shim] move failed for misc flat file {legacy_name}: {exc}")
+                    continue
+        elif legacy.exists():
+            _log(f"[F0.6 shim] legacy misc flat path {legacy_name} is not a file; skipped")
+            continue
+
+        if not canonical.exists():
+            continue
+        try:
+            relative = os.path.relpath(str(canonical), str(legacy.parent))
+            legacy.symlink_to(relative)
+        except Exception as exc:
+            _log(f"[F0.6 shim] misc file symlink create failed for {legacy_name}: {exc}")
+
+    marker = NEXO_HOME / ".structure-version"
+    try:
+        marker.write_text("F0.6\n", encoding="utf-8")
+    except Exception:
+        pass
+    if conflict_root is not None:
+        paths.finalize_backup_snapshot(conflict_root)
+
+
+def _ensure_f06_personal_script_import_shims() -> None:
+    """Expose promoted core helpers to legacy personal scripts.
+
+    Some operator-owned scripts are executed directly from
+    ``NEXO_HOME/personal/scripts`` and therefore only get that directory on
+    ``sys.path``. When Block E.6 promoted ``nexo_personal_automation.py`` into
+    ``core/scripts``, those direct scripts lost the bare import
+    ``from nexo_personal_automation import ...``. Keep the source of truth in
+    core, but add a tiny compatibility entry in personal/scripts.
+    """
+
+    helper_names = ("nexo_personal_automation.py",)
+    core_scripts = NEXO_HOME / "core" / "scripts"
+    personal_scripts = NEXO_HOME / "personal" / "scripts"
+    stub_marker = "# Auto-generated by NEXO F0.6 personal import shim."
+
+    def _same_file(a: Path, b: Path) -> bool:
+        try:
+            return a.is_file() and b.is_file() and a.read_bytes() == b.read_bytes()
+        except Exception:
+            return False
+
+    def _managed_stub(path: Path) -> bool:
+        try:
+            return path.is_file() and path.read_text(encoding="utf-8", errors="ignore").startswith(stub_marker)
+        except Exception:
+            return False
+
+    def _write_stub(shim: Path, target: Path) -> None:
+        relative = os.path.relpath(str(target), str(shim.parent))
+        shim.write_text(
+            f"""{stub_marker}
+from __future__ import annotations
+
+import importlib.util as _importlib_util
+from pathlib import Path as _Path
+
+_TARGET = (_Path(__file__).resolve().parent / {relative!r}).resolve()
+_SPEC = _importlib_util.spec_from_file_location("_nexo_core_personal_automation", _TARGET)
+if _SPEC is None or _SPEC.loader is None:
+    raise ImportError(f"Cannot load NEXO core helper at {{_TARGET}}")
+_MODULE = _importlib_util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(_MODULE)
+__all__ = getattr(_MODULE, "__all__", [name for name in vars(_MODULE) if not name.startswith("_")])
+globals().update({{name: getattr(_MODULE, name) for name in __all__}})
+""",
+            encoding="utf-8",
+        )
+
+    try:
+        personal_scripts.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        _log(f"[F0.6 shim] could not create personal/scripts for import shims: {exc}")
+        return
+
+    for name in helper_names:
+        target = core_scripts / name
+        if not target.is_file():
+            continue
+        shim = personal_scripts / name
+
+        if shim.is_symlink():
+            try:
+                if shim.resolve(strict=False) == target.resolve(strict=False):
+                    continue
+            except Exception:
+                pass
+            try:
+                shim.unlink()
+            except Exception as exc:
+                _log(f"[F0.6 shim] could not replace personal import symlink {name}: {exc}")
+                continue
+
+        if shim.exists():
+            if shim.is_file() and (_same_file(shim, target) or _managed_stub(shim)):
+                try:
+                    shim.unlink()
+                except Exception as exc:
+                    _log(f"[F0.6 shim] could not replace personal import copy {name}: {exc}")
+                    continue
+            else:
+                _log(f"[F0.6 shim] preserving distinct personal import helper {shim}")
+                continue
+
+        try:
+            relative = os.path.relpath(str(target), str(shim.parent))
+            shim.symlink_to(relative)
+            continue
+        except Exception as exc:
+            _log(f"[F0.6 shim] symlink create failed for personal import helper {name}: {exc}")
+
+        try:
+            _write_stub(shim, target)
+        except Exception as exc:
+            _log(f"[F0.6 shim] stub create failed for personal import helper {name}: {exc}")
+
+
+def _rewrite_f06_launch_agents() -> int:
+    """Rewrite lingering LaunchAgent paths to canonical F0.6 locations."""
+    import re as _re
+
+    la_dir = Path.home() / "Library" / "LaunchAgents"
+    if not la_dir.is_dir():
+        return 0
+    rewrites = 0
+    replacements = {
+        f"{NEXO_HOME}/scripts/": f"{NEXO_HOME}/core/scripts/",
+        f"{NEXO_HOME}/brain/": f"{NEXO_HOME}/personal/brain/",
+        f"{NEXO_HOME}/config/": f"{NEXO_HOME}/personal/config/",
+        f"{NEXO_HOME}/logs/": f"{NEXO_HOME}/runtime/logs/",
+        f"{NEXO_HOME}/data/": f"{NEXO_HOME}/runtime/data/",
+        f"{NEXO_HOME}/operations/": f"{NEXO_HOME}/runtime/operations/",
+        f"{NEXO_HOME}/coordination/": f"{NEXO_HOME}/runtime/coordination/",
+        f"{NEXO_HOME}/nexo-email/": f"{NEXO_HOME}/runtime/nexo-email/",
+    }
+    for plist in sorted(la_dir.glob("com.nexo.*.plist")):
+        try:
+            text = plist.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        original = text
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+        # Clean doubled slashes that can appear after manual edits.
+        text = _re.sub(r"(/Users/[^<]+?)/{2,}", r"\1/", text)
+        if text == original:
+            continue
+        plist.write_text(text, encoding="utf-8")
+        rewrites += 1
+    return rewrites
+
+
+def _cleanup_f06_root_residue() -> None:
+    """Remove root-level cache artifacts that should not survive in F0.6 installs."""
+    residue_targets = [
+        NEXO_HOME / "__pycache__",
+    ]
+    for target in residue_targets:
+        try:
+            if not target.exists() and not target.is_symlink():
+                continue
+            if target.is_symlink() or target.is_file():
+                target.unlink(missing_ok=True)
+                continue
+            shutil.rmtree(target, ignore_errors=True)
+        except Exception as exc:
+            _log(f"[F0.6] residue cleanup skipped for {target}: {exc}")
+
+
+def _heal_misplaced_personal_watchdog_runtime_files() -> list[str]:
+    """Move/remove watchdog runtime artifacts that ended up in personal/scripts.
+
+    These files are runtime state for the core watchdog and must live under
+    ``core/scripts``. Older migrations or manual copies could leave stale
+    duplicates under ``personal/scripts``; that pollutes the personal surface
+    and makes clean installs look dirtier than they are.
+    """
+    actions: list[str] = []
+    personal_scripts = paths.personal_scripts_dir()
+    core_scripts = paths.core_scripts_dir()
+    try:
+        core_scripts.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return actions
+
+    for name in sorted(_CORE_SCRIPT_RUNTIME_FILES):
+        personal = personal_scripts / name
+        if not personal.exists():
+            continue
+        core = core_scripts / name
+        try:
+            if not core.exists():
+                shutil.move(str(personal), str(core))
+                actions.append(f"watchdog-runtime-file-moved:{name}")
+                continue
+            if name == ".watchdog-nexo-repair.lock":
+                personal.unlink(missing_ok=True)
+                actions.append(f"watchdog-runtime-file-pruned:{name}")
+                continue
+            try:
+                personal_mtime = personal.stat().st_mtime
+                core_mtime = core.stat().st_mtime
+            except OSError:
+                personal_mtime = core_mtime = 0
+            if personal_mtime > core_mtime:
+                shutil.move(str(personal), str(core))
+                actions.append(f"watchdog-runtime-file-promoted:{name}")
+            else:
+                personal.unlink(missing_ok=True)
+                actions.append(f"watchdog-runtime-file-pruned:{name}")
+        except Exception as exc:
+            actions.append(f"watchdog-runtime-file-warning:{name}:{exc.__class__.__name__}")
+    return actions
+
+
+def _maybe_migrate_to_f06_layout() -> None:
+    """Plan F0.6 — one-shot physical layout migration. Idempotent.
+
+    Pre-condition: ``~/.nexo/.structure-version`` is absent or its content
+    is not ``F0.6``. After running, every dir from the flat layout
+    (``~/.nexo/scripts/``, ``brain/``, ``data/``, ``operations/``, ...)
+    has been moved to its post-F0.6 home (``~/.nexo/{core,personal,runtime}/<X>/``),
+    ``personal_scripts.path`` rows point at the new locations, every
+    ``com.nexo.*.plist`` LaunchAgent has been rewritten to use the new
+    paths, and ``~/.nexo/.structure-version`` is set to ``F0.6``.
+
+    A snapshot is taken before the move at ``~/.nexo-pre-f06-snapshot/``
+    so a complete rollback is ``mv ~/.nexo-pre-f06-snapshot ~/.nexo``.
+
+    Failures are non-fatal — the helper logs and returns; the operator
+    can re-run ``nexo update`` later.
+    """
+    try:
+        marker = NEXO_HOME / ".structure-version"
+        try:
+            current = marker.read_text(encoding="utf-8").strip()
+        except Exception:
+            current = ""
+        if current == "F0.6":
+            _promote_packaged_runtime_code_to_core()
+            if _f06_live_legacy_paths():
+                _ensure_f06_legacy_shims()
+            _ensure_f06_personal_script_import_shims()
+            _cleanup_f06_root_residue()
+            try:
+                _rewrite_f06_launch_agents()
+            except Exception:
+                pass
+            return  # already migrated
+        # Refuse to migrate from a non-NEXO_HOME or a fresh install
+        # without legacy dirs to move.
+        present = _f06_live_legacy_paths()
+        if not present:
+            # Fresh install — write marker and return.
+            try:
+                marker.write_text("F0.6\n", encoding="utf-8")
+            except Exception:
+                pass
+            return
+
+        _log("[F0.6] starting layout migration...")
+        import shutil
+        import sqlite3
+        import re as _re
+        # 1. Snapshot
+        snapshot = Path(str(NEXO_HOME) + "-pre-f06-snapshot")
+        if not snapshot.exists():
+            try:
+                shutil.copytree(NEXO_HOME, snapshot, symlinks=True, ignore_dangling_symlinks=True)
+                _log(f"[F0.6] snapshot at {snapshot}")
+            except Exception as e:
+                _log(f"[F0.6] snapshot failed (non-fatal): {e}")
+
+        # 2. Ensure target dirs
+        for sub in ("core/scripts", "core-dev/scripts", "personal/scripts",
+                    "core/db", "core/cognitive", "core/doctor", "core/dashboard", "core/skills",
+                    "personal/brain", "personal/skills", "personal/config",
+                    "personal/lib", "personal/lib/generated",
+                    "core/plugins", "core/hooks", "core/rules",
+                    "runtime/data", "runtime/logs", "runtime/operations", "runtime/state",
+                    "runtime/backups", "runtime/memory",
+                    "runtime/coordination", "runtime/exports",
+                    "runtime/nexo-email",
+                    "runtime/snapshots", "runtime/crons"):
+            (NEXO_HOME / sub).mkdir(parents=True, exist_ok=True)
+
+        _promote_packaged_runtime_code_to_core()
+
+        # 3. Classify scripts: load core names from packaged manifest
+        core_names: set[str] = set()
+        for artifacts in _runtime_core_artifacts_candidates(NEXO_HOME):
+            if not artifacts.exists():
+                continue
+            try:
+                data = json.loads(artifacts.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            for name in data.get("script_names", []):
+                core_names.add(name)
+            if core_names:
+                break
+        for f in (NEXO_HOME / "core" / "scripts").iterdir() if (NEXO_HOME / "core" / "scripts").is_dir() else []:
+            core_names.add(f.name)
+        dev_names: set[str] = set()
+        if (NEXO_HOME / "core-dev" / "scripts").is_dir():
+            for f in (NEXO_HOME / "core-dev" / "scripts").iterdir():
+                dev_names.add(f.name)
+
+        def _classify(name: str) -> str:
+            if name in dev_names:
+                return "core-dev"
+            if name in _CORE_SCRIPT_RUNTIME_FILES:
+                return "core"
+            if name in core_names:
+                return "core"
+            return "personal"
+
+        # 4. Move script files (handle existing F0.3/0.4 symlinks)
+        legacy_scripts = NEXO_HOME / "scripts"
+        if legacy_scripts.is_dir() and not legacy_scripts.is_symlink():
+            for f in sorted(legacy_scripts.iterdir()):
+                if not f.is_file():
+                    continue
+                cls = _classify(f.name)
+                root = {
+                    "core": NEXO_HOME / "core" / "scripts",
+                    "personal": NEXO_HOME / "personal" / "scripts",
+                    "core-dev": NEXO_HOME / "core-dev" / "scripts",
+                }[cls]
+                dst = root / f.name
+                if dst.is_symlink():
+                    target = dst.resolve()
+                    if target == f.resolve():
+                        dst.unlink()
+                if dst.exists():
+                    if dst.is_file() and f.is_file() and dst.read_bytes() == f.read_bytes():
+                        f.unlink()
+                        continue
+                    dst.rename(dst.with_suffix(dst.suffix + ".f06bak"))
+                shutil.move(str(f), str(dst))
+
+        # 5. Move tree dirs (brain, data, logs, ...)
+        TREE_MAP = [
+            ("brain", NEXO_HOME / "personal" / "brain"),
+            ("config", NEXO_HOME / "personal" / "config"),
+            ("data", NEXO_HOME / "runtime" / "data"),
+            ("logs", NEXO_HOME / "runtime" / "logs"),
+            ("operations", NEXO_HOME / "runtime" / "operations"),
+            ("state", NEXO_HOME / "runtime" / "state"),
+            ("backups", NEXO_HOME / "runtime" / "backups"),
+            ("memory", NEXO_HOME / "runtime" / "memory"),
+            ("cognitive", NEXO_HOME / "core" / "cognitive"),
+            ("coordination", NEXO_HOME / "runtime" / "coordination"),
+            ("exports", NEXO_HOME / "runtime" / "exports"),
+            ("nexo-email", NEXO_HOME / "runtime" / "nexo-email"),
+            ("doctor", NEXO_HOME / "core" / "doctor"),
+            ("snapshots", NEXO_HOME / "runtime" / "snapshots"),
+            ("crons", NEXO_HOME / "runtime" / "crons"),
+            ("skills", NEXO_HOME / "personal" / "skills"),
+            ("plugins", NEXO_HOME / "core" / "plugins"),
+            ("hooks", NEXO_HOME / "core" / "hooks"),
+            ("rules", NEXO_HOME / "core" / "rules"),
+            ("workdir", paths.personal_lib_dir() / "workdir"),
+            ("working", paths.personal_lib_dir() / "working"),
+        ]
+        for legacy_name, new_dir in TREE_MAP:
+            legacy = NEXO_HOME / legacy_name
+            if not legacy.is_dir() or legacy.is_symlink():
+                continue
+            new_dir.parent.mkdir(parents=True, exist_ok=True)
+            # Per-item move so we don't kill files via symlink-loop.
+            for item in list(legacy.iterdir()):
+                target = new_dir / item.name
+                if target.is_symlink() and target.resolve() == item.resolve():
+                    target.unlink()
+                if target.exists():
+                    if item.is_file() and target.is_file() and item.stat().st_size == target.stat().st_size:
+                        try:
+                            item.unlink()
+                            continue
+                        except Exception:
+                            pass
+                    # Backup conflict and proceed
+                    try:
+                        target.rename(target.with_suffix(target.suffix + ".f06bak"))
+                    except Exception:
+                        continue
+                try:
+                    shutil.move(str(item), str(target))
+                except Exception as e:
+                    _log(f"[F0.6] move {item} -> {target} failed: {e}")
+            try:
+                legacy.rmdir()
+            except OSError:
+                pass
+
+        # 6. UPDATE personal_scripts.path
+        try:
+            db = NEXO_HOME / "runtime" / "data" / "nexo.db"
+            if not db.is_file():
+                db = NEXO_HOME / "data" / "nexo.db"
+            if db.is_file():
+                conn = sqlite3.connect(str(db))
+                rows = conn.execute("SELECT id, path FROM personal_scripts").fetchall()
+                updates = []
+                legacy_root = str(NEXO_HOME / "scripts") + "/"
+                for row_id, old_path in rows:
+                    if not old_path or not old_path.startswith(legacy_root):
+                        continue
+                    name = Path(old_path).name
+                    cls = _classify(name)
+                    new_root = {
+                        "core": NEXO_HOME / "core" / "scripts",
+                        "personal": NEXO_HOME / "personal" / "scripts",
+                        "core-dev": NEXO_HOME / "core-dev" / "scripts",
+                    }[cls]
+                    updates.append((str(new_root / name), row_id))
+                if updates:
+                    conn.executemany("UPDATE personal_scripts SET path = ? WHERE id = ?", updates)
+                    conn.commit()
+                    _log(f"[F0.6] UPDATEd {len(updates)} personal_scripts.path rows")
+                conn.close()
+        except Exception as e:
+            _log(f"[F0.6] DB UPDATE failed (non-fatal): {e}")
+
+        # 7. Rewrite LaunchAgent plists
+        try:
+            la_dir = Path.home() / "Library" / "LaunchAgents"
+            count = 0
+            if la_dir.is_dir():
+                for plist in sorted(la_dir.glob("com.nexo.*.plist")):
+                    try:
+                        text = plist.read_text(encoding="utf-8")
+                    except Exception:
+                        continue
+                    original = text
+                    def _repl_script(m):
+                        full = m.group(0)
+                        name = Path(full).name
+                        cls = _classify(name)
+                        new_root = {
+                            "core": NEXO_HOME / "core" / "scripts",
+                            "personal": NEXO_HOME / "personal" / "scripts",
+                            "core-dev": NEXO_HOME / "core-dev" / "scripts",
+                        }[cls]
+                        return str(new_root / name)
+                    text = _re.sub(rf"{_re.escape(str(NEXO_HOME))}/scripts/[\w\-\.]+\.(py|sh|js)", _repl_script, text)
+                    text = text.replace(f"{NEXO_HOME}/logs/", f"{NEXO_HOME}/runtime/logs/")
+                    if text != original:
+                        plist.write_text(text, encoding="utf-8")
+                        count += 1
+                _log(f"[F0.6] rewrote {count} LaunchAgent plists")
+        except Exception as e:
+            _log(f"[F0.6] plist rewrite failed (non-fatal): {e}")
+
+        # 8. Write marker
+        try:
+            marker.write_text("F0.6\n", encoding="utf-8")
+            _log("[F0.6] marker written: ~/.nexo/.structure-version = F0.6")
+        except Exception as e:
+            _log(f"[F0.6] marker write failed: {e}")
+        _ensure_f06_legacy_shims()
+        _ensure_f06_personal_script_import_shims()
+        _cleanup_f06_root_residue()
+        try:
+            rewritten = _rewrite_f06_launch_agents()
+            if rewritten:
+                _log(f"[F0.6] rewrote {rewritten} LaunchAgent plists")
+        except Exception as e:
+            _log(f"[F0.6] plist rewrite failed (non-fatal): {e}")
+        _log("[F0.6] migration done")
+    except Exception as e:
+        _log(f"[F0.6] unexpected error (non-fatal, runtime keeps working): {e}")
+
+
+def _check_npm_version() -> str | None:
+    """For non-git installs: check npm registry for a newer version. Returns notification or None."""
+    current = _read_package_version()
+    if current == "unknown":
+        return None
+
+    pkg_name = "nexo-brain"
+    try:
+        pkg = REPO_DIR / "package.json"
+        if pkg.exists():
+            data = json.loads(pkg.read_text())
+            pkg_name = data.get("name", pkg_name)
+    except Exception:
+        pass
+
+    try:
+        result = subprocess.run(
+            ["npm", "view", pkg_name, "version"],
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+        if result.returncode != 0:
+            return None
+        latest = result.stdout.strip()
+        if not latest:
+            return None
+        if latest != current and not current.endswith(latest):
+            try:
+                from user_context import get_context, DEFAULT_ASSISTANT_NAME
+                _name = get_context().assistant_name or DEFAULT_ASSISTANT_NAME
+            except Exception:
+                from user_context import DEFAULT_ASSISTANT_NAME
+                _name = DEFAULT_ASSISTANT_NAME
+            return f"{_name} update available: {current} -> {latest}. Run: npm update -g {pkg_name}"
+    except Exception:
+        pass
+    return None
+
+
+# ── External CLI auto-update (Claude Code, Codex) ────────────────────
+# Keep this list aligned with the third-party CLIs that NEXO drives end-to-end.
+# Adding a new CLI here makes `nexo update` auto-install/bump it unless the
+# caller passes include_clis=False. Learning #323: use canonical npm names.
+_EXTERNAL_CLIS: tuple[str, ...] = (
+    "@anthropic-ai/claude-code",
+    "@openai/codex",
+)
+
+
+def _update_external_clis(progress_fn=None) -> dict:
+    """Detect and update NEXO's external terminal CLIs.
+
+    For each package in :data:`_EXTERNAL_CLIS`:
+      1. Read the installed global version via ``npm list -g --json --depth=0``.
+      2. Fetch the latest version from the npm registry via ``npm view <pkg> version``.
+      3. When newer, run ``npm install -g <pkg>@latest``.
+
+    Silently skips packages that are not installed globally — NEXO does not
+    push unsolicited installs of third-party CLIs onto operators.
+
+    Returns a dict keyed by package name. Each entry shape::
+
+        {
+            "old": "2.1.109" | None,
+            "new": "2.1.115" | None,
+            "updated": True | False,
+            "status": "updated" | "already_latest" | "not_installed"
+                      | "skipped" | "failed",
+            "error": "<message>"           # only when status == "failed"/"skipped"
+        }
+    """
+    # Reuse the npm helpers already hardened in plugins/update.py (version
+    # parsing, TimeoutExpired handling, invalid-name validation). Falling back
+    # to "skipped" keeps a partially-copied runtime from crashing the update.
+    try:
+        from plugins.update import (
+            _get_npm_global_version,
+            _get_npm_registry_version,
+            _validate_npm_name,
+        )
+    except Exception as e:  # pragma: no cover — only mid-upgrade installs hit this
+        return {
+            cli: {
+                "old": None,
+                "new": None,
+                "updated": False,
+                "status": "skipped",
+                "error": f"plugins.update helpers unavailable: {e}",
+            }
+            for cli in _EXTERNAL_CLIS
+        }
+
+    results: dict[str, dict] = {}
+
+    for pkg in _EXTERNAL_CLIS:
+        entry: dict = {"old": None, "new": None, "updated": False, "status": "unknown"}
+
+        if not _validate_npm_name(pkg):
+            entry.update({"status": "failed", "error": f"invalid npm name: {pkg!r}"})
+            results[pkg] = entry
+            continue
+
+        old_version = _get_npm_global_version(pkg)
+        if old_version is None:
+            # Not installed globally — don't auto-install third-party CLIs the
+            # operator didn't opt into. Silent skip in the final summary.
+            entry["status"] = "not_installed"
+            results[pkg] = entry
+            continue
+
+        entry["old"] = old_version
+
+        latest = _get_npm_registry_version(pkg)
+        if latest is None:
+            entry.update({
+                "new": old_version,
+                "status": "failed",
+                "error": "npm registry lookup failed",
+            })
+            results[pkg] = entry
+            continue
+
+        if old_version == latest:
+            entry.update({"new": old_version, "status": "already_latest"})
+            results[pkg] = entry
+            continue
+
+        if progress_fn is not None:
+            try:
+                progress_fn(f"Updating {pkg}: {old_version} -> {latest}...")
+            except Exception:
+                pass
+
+        try:
+            r = subprocess.run(
+                ["npm", "install", "-g", f"{pkg}@latest"],
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+        except subprocess.TimeoutExpired:
+            # Learning #294: always capture TimeoutExpired explicitly.
+            entry.update({
+                "new": old_version,
+                "status": "failed",
+                "error": "npm install timed out after 180s",
+            })
+            results[pkg] = entry
+            continue
+        except FileNotFoundError:
+            # npm itself missing — no Node.js on PATH. Mark the rest as skipped
+            # and bail: no point retrying subsequent packages.
+            entry.update({
+                "new": old_version,
+                "status": "skipped",
+                "error": "npm not found on PATH",
+            })
+            results[pkg] = entry
+            for remaining in _EXTERNAL_CLIS:
+                results.setdefault(remaining, {
+                    "old": None,
+                    "new": None,
+                    "updated": False,
+                    "status": "skipped",
+                    "error": "npm not found on PATH",
+                })
+            return results
+        except Exception as e:  # pragma: no cover — defensive
+            entry.update({
+                "new": old_version,
+                "status": "failed",
+                "error": str(e)[:500],
+            })
+            results[pkg] = entry
+            continue
+
+        if r.returncode != 0:
+            entry.update({
+                "new": old_version,
+                "status": "failed",
+                "error": (r.stderr or r.stdout or "npm install failed").strip()[:500],
+            })
+            results[pkg] = entry
+            continue
+
+        new_version = _get_npm_global_version(pkg) or latest
+        entry.update({
+            "new": new_version,
+            "updated": new_version != old_version,
+            "status": "updated" if new_version != old_version else "already_latest",
+        })
+        results[pkg] = entry
+
+    return results
+
+
+def _format_external_clis_results(results: dict) -> list[str]:
+    """Render CLI update results as lines for the ``nexo update`` summary.
+
+    Emits a visible warning per bumped CLI (operator must restart the terminal
+    for the new version to take effect), a warning per failure, and a single
+    informational line when nothing changed but something was checked.
+    """
+    if not results:
+        return []
+
+    lines: list[str] = []
+    any_updated = False
+    any_failed = False
+    any_checked_latest = False
+
+    for pkg, entry in results.items():
+        status = entry.get("status")
+        if status == "updated":
+            any_updated = True
+            lines.append(
+                f"  CLI updated: {pkg} {entry.get('old')} -> {entry.get('new')} "
+                f"— restart the terminal to activate"
+            )
+        elif status == "already_latest":
+            any_checked_latest = True
+        elif status == "failed":
+            any_failed = True
+            lines.append(
+                f"  WARNING: CLI {pkg} update failed: {entry.get('error', 'unknown')}"
+            )
+        # "not_installed" and "skipped" are intentionally silent — third-party
+        # CLIs that the operator never installed shouldn't spam the summary.
+
+    if not any_updated and not any_failed and any_checked_latest:
+        lines.append("  External CLIs: already on latest versions")
+
+    return lines
+
+
+# ── File-based migrations (migrations/ directory) ────────────────────
+
+def _get_applied_migration_version() -> int:
+    """Read the last applied file-migration version from disk."""
+    try:
+        if MIGRATION_VERSION_FILE.exists():
+            return int(MIGRATION_VERSION_FILE.read_text().strip())
+    except (ValueError, OSError):
+        pass
+    return 0
+
+
+def _set_migration_version(version: int):
+    """Write the current file-migration version to disk."""
+    try:
+        MIGRATION_VERSION_FILE.write_text(str(version))
+    except Exception as e:
+        _log(f"Failed to write migration version: {e}")
+
+
+def _discover_migrations() -> list[tuple[int, Path]]:
+    """Find numbered migration files in migrations/ directory.
+
+    Expected naming: NNN_description.ext where ext is .sql, .py, or .sh
+    Example: 001_add_index.sql, 002_backfill_data.py, 003_cleanup.sh
+    """
+    if not MIGRATIONS_DIR.is_dir():
+        return []
+
+    migrations = []
+    for f in MIGRATIONS_DIR.iterdir():
+        if f.is_file() and f.suffix in (".sql", ".py", ".sh"):
+            # Extract leading number from filename
+            parts = f.stem.split("_", 1)
+            if parts and parts[0].isdigit():
+                migrations.append((int(parts[0]), f))
+
+    migrations.sort(key=lambda x: x[0])
+    return migrations
+
+
+def _run_file_migration(path: Path) -> tuple[bool, str]:
+    """Execute a single migration file. Returns (success, message)."""
+    ext = path.suffix
+
+    try:
+        if ext == ".sql":
+            sql = path.read_text()
+            from db._core import get_db
+            conn = get_db()
+            conn.executescript(sql)
+            conn.commit()
+            return True, "OK"
+
+        elif ext == ".py":
+            result = subprocess.run(
+                [sys.executable, str(path)],
+                cwd=str(SRC_DIR),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env={**os.environ, "NEXO_HOME": str(NEXO_HOME)},
+            )
+            if result.returncode != 0:
+                return False, result.stderr or result.stdout or "non-zero exit"
+            return True, "OK"
+
+        elif ext == ".sh":
+            result = subprocess.run(
+                ["bash", str(path)],
+                cwd=str(REPO_DIR),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env={**os.environ, "NEXO_HOME": str(NEXO_HOME)},
+            )
+            if result.returncode != 0:
+                return False, result.stderr or result.stdout or "non-zero exit"
+            return True, "OK"
+
+        else:
+            return False, f"unknown extension: {ext}"
+
+    except Exception as e:
+        return False, str(e)
+
+
+def run_file_migrations() -> list[dict]:
+    """Run any pending file-based migrations from the migrations/ directory.
+
+    Migrations are ordered and sequential: if migration N fails, all subsequent
+    migrations are skipped so that N is retried on the next startup and no
+    migration is permanently skipped by a version-pointer gap.
+
+    Returns list of results: [{"version": N, "file": "...", "status": "ok"|"failed", "message": "..."}]
+    """
+    current_version = _get_applied_migration_version()
+    migrations = _discover_migrations()
+    results = []
+
+    for version, path in migrations:
+        if version <= current_version:
+            continue
+
+        success, message = _run_file_migration(path)
+
+        if success:
+            _set_migration_version(version)
+            results.append({
+                "version": version,
+                "file": path.name,
+                "status": "ok",
+                "message": message,
+            })
+            _log(f"Migration {path.name}: OK")
+        else:
+            results.append({
+                "version": version,
+                "file": path.name,
+                "status": "failed",
+                "message": message,
+            })
+            _log(f"Migration {path.name}: FAILED — {message}")
+            break  # Stop on first failure so it retries next startup
+
+    return results
+
+
+# ── CLAUDE.md version-tracked migration ─────────────────────────────
+
+
+def _read_template_version() -> str | None:
+    """Extract version from the <!-- nexo-claude-md-version: X.Y.Z --> comment in the template."""
+    if not TEMPLATE_FILE.exists():
+        return None
+    first_line = TEMPLATE_FILE.read_text().split("\n", 1)[0]
+    m = re.search(r"nexo-claude-md-version:\s*([\d.]+)", first_line)
+    return m.group(1) if m else None
+
+
+def _read_installed_claude_md_version() -> str | None:
+    """Read the CLAUDE.md version currently installed for this user."""
+    try:
+        if CLAUDE_MD_VERSION_FILE.exists():
+            return CLAUDE_MD_VERSION_FILE.read_text().strip()
+    except OSError:
+        pass
+    return None
+
+
+def _write_installed_claude_md_version(version: str):
+    """Persist the installed CLAUDE.md version."""
+    try:
+        CLAUDE_MD_VERSION_FILE.write_text(version)
+    except Exception as e:
+        _log(f"Failed to write CLAUDE.md version file: {e}")
+
+
+def _find_user_claude_md() -> Path | None:
+    """Locate the user's CLAUDE.md (typically ~/.claude/CLAUDE.md)."""
+    candidate = Path.home() / ".claude" / "CLAUDE.md"
+    if candidate.exists():
+        return candidate
+    # Fallback: check NEXO_HOME
+    candidate2 = NEXO_HOME / "CLAUDE.md"
+    if candidate2.exists():
+        return candidate2
+    return None
+
+
+def _resolve_placeholders(template_text: str) -> str:
+    """Fill {{NAME}} and {{NEXO_HOME}} from the user's existing CLAUDE.md or config."""
+    # Read operator name from calibration/version. The fallback must never be a
+    # reserved product identity ("NEXO", "NEXO Brain", "NEXO Desktop"); those
+    # are rejected by desktop_bridge.RESERVED_ASSISTANT_NAME_VALUES and leaking
+    # them into the managed CLAUDE.md would conflate the agent (Nova/Nero/etc.)
+    # with the product itself.
+    try:
+        from user_context import get_context, DEFAULT_ASSISTANT_NAME
+        name = get_context().assistant_name or DEFAULT_ASSISTANT_NAME
+    except Exception:
+        from user_context import DEFAULT_ASSISTANT_NAME
+        name = DEFAULT_ASSISTANT_NAME
+
+    return (
+        template_text
+        .replace("{{NAME}}", name)
+        .replace("{{NEXO_HOME}}", str(NEXO_HOME))
+    )
+
+
+def _extract_section(text: str, section_id: str) -> str | None:
+    """Extract content between <!-- nexo:start:ID --> and <!-- nexo:end:ID --> markers (inclusive)."""
+    pattern = re.compile(
+        rf"(<!-- nexo:start:{re.escape(section_id)} -->.*?<!-- nexo:end:{re.escape(section_id)} -->)",
+        re.DOTALL,
+    )
+    m = pattern.search(text)
+    return m.group(1) if m else None
+
+
+def _list_section_ids(text: str) -> list[str]:
+    """Return all section IDs found in the text, in order."""
+    return re.findall(r"<!-- nexo:start:(\w+) -->", text)
+
+
+def _migrate_claude_md() -> str | None:
+    """Sync the managed Claude bootstrap into ~/.claude/CLAUDE.md."""
+    try:
+        from bootstrap_docs import sync_client_bootstrap
+    except Exception as exc:
+        _log(f"CLAUDE.md migration import error: {exc}")
+        return None
+
+    result = sync_client_bootstrap(
+        "claude_code",
+        nexo_home=NEXO_HOME,
+        operator_name="",
+        user_home=Path.home(),
+    )
+    if not result.get("ok"):
+        _log(f"CLAUDE.md migration failed: {result.get('error', 'unknown error')}")
+        return None
+    version = result.get("version", "")
+    if version:
+        _write_installed_claude_md_version(version)
+    action = result.get("action", "updated")
+    if action == "unchanged":
+        return f"CLAUDE.md v{version}: already current"
+    msg = f"CLAUDE.md v{version}: {action}"
+    _log(msg)
+    return msg
+
+
+def _sync_client_bootstraps(preferences: dict | None = None) -> list[str]:
+    try:
+        from bootstrap_docs import sync_enabled_bootstraps
+    except Exception as exc:
+        _log(f"Client bootstrap sync import error: {exc}")
+        return []
+
+    results = sync_enabled_bootstraps(
+        nexo_home=NEXO_HOME,
+        operator_name="",
+        user_home=Path.home(),
+        preferences=preferences,
+    )
+    messages: list[str] = []
+    for client_key, item in results.items():
+        if item.get("skipped"):
+            continue
+        if not item.get("ok"):
+            _log(f"{client_key} bootstrap sync failed: {item.get('error', 'unknown error')}")
+            continue
+        action = item.get("action", "updated")
+        version = item.get("version", "")
+        label = "Codex AGENTS.md" if client_key == "codex" else "CLAUDE.md"
+        if action == "unchanged":
+            messages.append(f"{label} v{version}: already current")
+        else:
+            messages.append(f"{label} v{version}: {action}")
+    return messages
+
+
+# ── Main entry point ─────────────────────────────────────────────────
+
+_AUTO_UPDATE_LOCK_FILE = paths.operations_dir() / ".auto_update.lock"
+_AUTO_UPDATE_LOCK_STALE_SECONDS = 600  # 10 minutes
+
+
+def _acquire_auto_update_lock() -> tuple[bool, object | None, str]:
+    """Acquire an exclusive non-blocking lock on the auto_update lockfile.
+
+    Closes NF-AUDIT-2026-04-11-UPDATE-LOCK. Two NEXO terminals starting at
+    the same moment after a version bump used to race on
+    auto_update_check(): they would both run run_migrations(),
+    _check_git_updates(), and the file/hooks sync, occasionally tripping
+    UNIQUE constraints on schema_migrations or producing torn writes on
+    shared files.
+
+    The lock uses fcntl.flock(LOCK_EX | LOCK_NB) so the second caller
+    returns instantly with a clean "skipped_reason=locked_by_other_process"
+    rather than blocking the server startup. The lock file persists across
+    crashes — we treat any lock older than 10 minutes as stale and steal
+    it, so a hard kill mid-update never wedges future runs forever.
+
+    Returns:
+        (acquired, fh, reason)
+        - acquired: True if we now hold the lock, False otherwise.
+        - fh: the open file handle (caller MUST close it after release).
+        - reason: human-readable explanation when not acquired.
+    """
+    try:
+        _AUTO_UPDATE_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        return False, None, f"cannot create lock directory: {e}"
+
+    # Steal stale locks: if the lockfile exists and was last modified more
+    # than 10 minutes ago, assume the previous holder crashed and reset it.
+    try:
+        if _AUTO_UPDATE_LOCK_FILE.exists():
+            age = time.time() - _AUTO_UPDATE_LOCK_FILE.stat().st_mtime
+            if age > _AUTO_UPDATE_LOCK_STALE_SECONDS:
+                try:
+                    _AUTO_UPDATE_LOCK_FILE.unlink()
+                except Exception:
+                    pass  # Will fall through to the open below
+    except Exception:
+        pass
+
+    try:
+        fh = open(_AUTO_UPDATE_LOCK_FILE, "a+")
+    except Exception as e:
+        return False, None, f"cannot open lock file: {e}"
+
+    try:
+        import fcntl
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except ImportError:
+        # Non-POSIX platform. Best-effort: write a PID stamp and proceed.
+        try:
+            fh.seek(0)
+            fh.truncate()
+            fh.write(f"{os.getpid()}:{time.time()}\n")
+            fh.flush()
+        except Exception:
+            pass
+        return True, fh, ""
+    except (OSError, BlockingIOError):
+        try:
+            fh.close()
+        except Exception:
+            pass
+        return False, None, "locked_by_other_process"
+
+    # We have the lock. Stamp PID + timestamp so observers can see who.
+    try:
+        fh.seek(0)
+        fh.truncate()
+        fh.write(f"{os.getpid()}:{time.time()}\n")
+        fh.flush()
+    except Exception:
+        pass
+    return True, fh, ""
+
+
+def _release_auto_update_lock(fh: object | None) -> None:
+    """Release the lock acquired by _acquire_auto_update_lock and close the fd."""
+    if fh is None:
+        return
+    try:
+        import fcntl
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        fh.close()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def auto_update_check() -> dict:
+    """Run the full auto-update check at server startup.
+
+    NEVER raises an exception — always returns a dict.
+
+    Phase 1 (local, safe, no network):
+        - DB schema migrations
+        - File-based migrations
+        - managed client bootstrap migration
+
+    Phase 2 (network, wrapped in try/except):
+        - git fetch/pull (if git repo)
+        - npm version check (if non-git install)
+
+    Concurrency:
+        Wrapped in a non-blocking exclusive flock so a second concurrent
+        terminal returns instantly with skipped_reason='locked_by_other_process'
+        instead of racing on run_migrations / git pull / file sync. Stale
+        locks (>10 minutes) are auto-stolen.
+
+    Returns a dict with:
+        - checked: bool — whether a network check was actually performed
+        - git_update: str|None — git update status message
+        - npm_notice: str|None — npm upgrade notice for non-git installs
+        - claude_md_update: str|None — CLAUDE.md migration status
+        - client_bootstrap_updates: list[str] — Codex/Claude bootstrap sync statuses
+        - migrations: list — file-based migration results
+        - db_migrations: int — number of DB schema migrations applied
+        - skipped_reason: str|None — why the network check was skipped (cooldown, locked, etc.)
+        - error: str|None — error message if something failed (informational only)
+    """
+    acquired, lock_fh, lock_reason = _acquire_auto_update_lock()
+    if not acquired:
+        return {
+            "checked": False,
+            "git_update": None,
+            "npm_notice": None,
+            "claude_md_update": None,
+            "client_bootstrap_updates": [],
+            "migrations": [],
+            "db_migrations": 0,
+            "skipped_reason": lock_reason or "locked_by_other_process",
+            "error": None,
+        }
+    try:
+        return _auto_update_check_locked()
+    finally:
+        _release_auto_update_lock(lock_fh)
+
+
+def _auto_update_check_locked() -> dict:
+    """Inner body of auto_update_check, executed while holding the lockfile."""
+    result = {
+        "checked": False,
+        "git_update": None,
+        "npm_notice": None,
+        "claude_md_update": None,
+        "client_bootstrap_updates": [],
+        "migrations": [],
+        "db_migrations": 0,
+        "self_heal": None,
+        "skipped_reason": None,
+        "error": None,
+    }
+
+    # ── Read auto_update flag from schedule.json ────────────────────
+    auto_update_enabled = True
+    try:
+        schedule_file = _runtime_config_dir(NEXO_HOME) / "schedule.json"
+        if schedule_file.exists():
+            schedule_data = json.loads(schedule_file.read_text())
+            auto_update_enabled = schedule_data.get("auto_update", True)
+    except Exception:
+        pass  # Default to enabled on any read error
+
+    # ── Phase 0: Data-loss self-heal (v5.5.5+) ─────────────────────
+    # Runs BEFORE any migration/backfill so a wiped DB is restored from the
+    # hourly backup stream instead of being schema-migrated in place. Caps
+    # itself via a state file so we never loop-heal on a legitimate reset.
+    try:
+        heal_report = _self_heal_if_wiped()
+        if heal_report is not None:
+            result["self_heal"] = heal_report
+    except Exception as e:
+        _log(f"self-heal check error (continuing): {e}")
+
+    # ── Phase 1: Local migrations (safe, no network) ────────────────
+    # These ALWAYS run, regardless of cooldown, network state, or auto_update flag.
+
+    # DB schema migrations
+    try:
+        _run_db_migrations()
+    except Exception as e:
+        _log(f"DB migration error (continuing): {e}")
+
+    # File-based migrations
+    try:
+        result["migrations"] = run_file_migrations()
+    except Exception as e:
+        _log(f"File migration runner error: {e}")
+
+    # Legacy cleanup: keep the objective but migrate old Desktop-disabled
+    # states back to the support-ticket-only Evolution mode.
+    try:
+        evo_obj_path = paths.brain_dir() / "evolution-objective.json"
+        if evo_obj_path.exists():
+            raw_objective = json.loads(evo_obj_path.read_text())
+            if isinstance(raw_objective, dict):
+                raw_objective["evolution_enabled"] = True
+                raw_objective["evolution_mode"] = DESKTOP_EVOLUTION_SUPPORT_MODE
+                raw_objective["desktop_managed"] = True
+                raw_objective["support_ticket_mode"] = True
+                raw_objective.pop("disabled_by", None)
+                raw_objective.pop("disabled_reason", None)
+                raw_objective.pop("removed_at", None)
+                evo_obj_path.write_text(json.dumps(raw_objective, indent=2, ensure_ascii=False) + "\n")
+                _log("Migrated evolution-objective.json to support-ticket mode")
+    except Exception as e:
+        _log(f"legacy evolution cleanup error: {e}")
+
+    try:
+        desktop_contract = enforce_desktop_product_contract(source="auto_update")
+        if desktop_contract.get("applied") and desktop_contract.get("changed_objective"):
+            _log("Desktop product contract enforced: Evolution support-ticket mode")
+    except Exception as e:
+        _log(f"desktop product contract error: {e}")
+
+    # Backfill installed core/scripts/ for existing installs
+    try:
+        scripts_dest = paths.core_scripts_dir()
+        # Deduce NEXO_CODE: env var first, then from __file__ (auto_update.py is in src/)
+        nexo_code = Path(os.environ.get("NEXO_CODE", str(Path(__file__).resolve().parent)))
+        scripts_src = nexo_code / "scripts" if (nexo_code / "scripts").is_dir() else None
+        if scripts_src and not scripts_dest.is_dir():
+            import shutil
+            scripts_dest.mkdir(parents=True, exist_ok=True)
+            for f in scripts_src.iterdir():
+                if f.name.startswith('.') or f.name == '__pycache__' or is_duplicate_artifact_name(f):
+                    continue
+                dest = scripts_dest / f.name
+                if f.is_file() and not dest.exists():
+                    shutil.copy2(str(f), str(dest))
+            _log("Backfilled NEXO_HOME/core/scripts from repo scripts for existing install")
+    except Exception as e:
+        _log(f"scripts backfill error: {e}")
+
+    _sync_watchdog_hash_registry()
+    _warn_protected_runtime_location()
+
+    # Backfill runtime CLI modules for existing installs
+    try:
+        for fname in ("cli.py", "script_registry.py", "skills_runtime.py", "cron_recovery.py", "client_preferences.py", "claude_cli.py", "agent_runner.py", "bootstrap_docs.py", "mcp_required_tools.py", "runtime_service.py"):
+            src_file = SRC_DIR / fname
+            dest_file = NEXO_HOME / fname
+            if src_file.is_file() and (not dest_file.exists() or src_file.stat().st_mtime > dest_file.stat().st_mtime):
+                import shutil
+                shutil.copy2(str(src_file), str(dest_file))
+                _log(f"Backfilled {fname}")
+    except Exception as e:
+        _log(f"CLI backfill error: {e}")
+
+    _ensure_runtime_cli_wrapper()
+    _ensure_runtime_cli_in_shell()
+
+    # Backfill doctor package for existing installs
+    try:
+        doctor_src = SRC_DIR / "doctor"
+        doctor_dest = paths.core_doctor_dir(allow_legacy_fallback=False)
+        if doctor_src.is_dir():
+            import shutil
+            if not doctor_dest.is_dir():
+                shutil.copytree(str(doctor_src), str(doctor_dest), ignore=_runtime_copy_ignore())
+                _log("Backfilled doctor package")
+            else:
+                # Update existing files
+                for root, dirs, files in os.walk(str(doctor_src)):
+                    dirs[:] = [d for d in dirs if d != "__pycache__" and not is_duplicate_artifact_name(Path(root) / d)]
+                    rel = os.path.relpath(root, str(doctor_src))
+                    dest_dir = doctor_dest / rel
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    for f in files:
+                        if f.endswith(".pyc"):
+                            continue
+                        src_f = Path(root) / f
+                        if is_duplicate_artifact_name(src_f):
+                            continue
+                        dst_f = dest_dir / f
+                        if not dst_f.exists() or src_f.stat().st_mtime > dst_f.stat().st_mtime:
+                            shutil.copy2(str(src_f), str(dst_f))
+    except Exception as e:
+        _log(f"Doctor backfill error: {e}")
+
+    # Backfill packaged core skills to a dedicated directory.
+    try:
+        skills_src = SRC_DIR / "skills"
+        skills_dest = paths.core_skills_dir(allow_legacy_fallback=False)
+        if skills_src.is_dir():
+            import shutil
+            if not skills_dest.is_dir():
+                shutil.copytree(str(skills_src), str(skills_dest), ignore=_runtime_copy_ignore())
+                _log("Backfilled skills-core")
+            else:
+                for root, dirs, files in os.walk(str(skills_src)):
+                    dirs[:] = [d for d in dirs if d != "__pycache__" and not is_duplicate_artifact_name(Path(root) / d)]
+                    rel = os.path.relpath(root, str(skills_src))
+                    dest_dir = skills_dest / rel
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    for f in files:
+                        if f.endswith(".pyc"):
+                            continue
+                        src_f = Path(root) / f
+                        if is_duplicate_artifact_name(src_f):
+                            continue
+                        dst_f = dest_dir / f
+                        if not dst_f.exists() or src_f.stat().st_mtime > dst_f.stat().st_mtime:
+                            shutil.copy2(str(src_f), str(dst_f))
+    except Exception as e:
+        _log(f"Skills backfill error: {e}")
+
+    # Backfill MCP doctor plugin so existing installs expose nexo_doctor.
+    try:
+        plugin_src = SRC_DIR / "plugins" / "doctor.py"
+        plugin_dest = paths.core_plugins_dir() / "doctor.py"
+        plugin_dest.parent.mkdir(parents=True, exist_ok=True)
+        if plugin_src.is_file() and (not plugin_dest.exists() or plugin_src.stat().st_mtime > plugin_dest.stat().st_mtime):
+            import shutil
+            shutil.copy2(str(plugin_src), str(plugin_dest))
+            _log("Backfilled doctor plugin")
+    except Exception as e:
+        _log(f"Doctor plugin backfill error: {e}")
+
+    # Backfill all templates for existing installs (no hardcoded list)
+    try:
+        templates_src = _RESOLVED_REPO_DIR / "templates"
+        templates_dest = NEXO_HOME / "templates"
+        templates_dest.mkdir(parents=True, exist_ok=True)
+        import shutil
+        if templates_src.is_dir():
+            for item in templates_src.iterdir():
+                if item.name == "__pycache__" or is_duplicate_artifact_name(item):
+                    continue
+                dest_item = templates_dest / item.name
+                if item.is_file():
+                    if not dest_item.exists() or item.stat().st_mtime > dest_item.stat().st_mtime:
+                        shutil.copy2(str(item), str(dest_item))
+                elif item.is_dir():
+                    dest_item.mkdir(parents=True, exist_ok=True)
+                    for sub in item.iterdir():
+                        if sub.is_file() and not is_duplicate_artifact_name(sub):
+                            dest_sub = dest_item / sub.name
+                            if not dest_sub.exists() or sub.stat().st_mtime > dest_sub.stat().st_mtime:
+                                shutil.copy2(str(sub), str(dest_sub))
+    except Exception as e:
+        _log(f"Template backfill error: {e}")
+
+    # Managed client bootstrap migration
+    try:
+        bootstrap_messages = _sync_client_bootstraps(schedule_data if "schedule_data" in locals() else None)
+        result["client_bootstrap_updates"] = bootstrap_messages
+        result["claude_md_update"] = next((msg for msg in bootstrap_messages if msg.startswith("CLAUDE.md")), None)
+    except Exception as e:
+        _log(f"Client bootstrap migration error: {e}")
+
+    # ── Phase 2: Network operations (wrapped, never fatal) ──────────
+    # Skip entirely if auto_update is disabled in schedule.json
+    if not auto_update_enabled:
+        result["skipped_reason"] = "auto_update disabled in schedule.json"
+        _log("Network updates disabled (auto_update: false in schedule.json)")
+        return result
+
+    # Check cooldown for git/npm checks
+    try:
+        last_check = _read_last_check()
+        last_ts = last_check.get("timestamp", 0)
+        now = time.time()
+
+        if now - last_ts < CHECK_COOLDOWN_SECONDS:
+            result["skipped_reason"] = "cooldown"
+            return result
+
+        result["checked"] = True
+
+        is_git = _is_git_repo()
+
+        if is_git:
+            result["git_update"] = _check_git_updates()
+        else:
+            # Non-git install — check npm for newer version
+            version_json = _RESOLVED_REPO_DIR / "version.json"
+            pkg_json = _RESOLVED_REPO_DIR / "package.json"
+            if version_json.exists() or pkg_json.exists():
+                result["npm_notice"] = _check_npm_version()
+
+        # Save timestamp
+        _write_last_check({
+            "timestamp": now,
+            "is_git": is_git,
+            "git_update": result["git_update"],
+            "npm_notice": result["npm_notice"],
+        })
+
+    except Exception as e:
+        error_msg = f"Update check failed: {e}. Running current version."
+        _log(error_msg)
+        result["error"] = error_msg
+
+    return result
+
+
+UPDATE_SUMMARY_FILE = paths.logs_dir() / "update-last-summary.json"
+UPDATE_HISTORY_FILE = paths.logs_dir() / "update-history.jsonl"
+
+
+def _resolve_sync_source() -> tuple[Path | None, Path | None]:
+    dest = NEXO_HOME
+
+    def _is_relative_to(path: Path, parent: Path) -> bool:
+        try:
+            path.relative_to(parent)
+            return True
+        except Exception:
+            return False
+
+    def _runtime_version_source() -> Path | None:
+        for version_file in (NEXO_HOME / "version.json", NEXO_HOME / "core" / "version.json"):
+            if not version_file.is_file():
+                continue
+            try:
+                data = json.loads(version_file.read_text())
+            except Exception:
+                continue
+            source = str(data.get("source", "")).strip()
+            if not source:
+                continue
+            candidate = Path(source).expanduser()
+            if (candidate / "src").is_dir() and (candidate / "package.json").is_file():
+                return candidate
+        return None
+
+    try:
+        runtime_core = (dest / "core").resolve()
+        runtime_versions = (runtime_core / "versions").resolve(strict=False)
+        code_resolved = NEXO_CODE.resolve()
+    except Exception:
+        runtime_core = dest / "core"
+        runtime_versions = runtime_core / "versions"
+        code_resolved = NEXO_CODE
+
+    # Packaged/runtime-only installs resolve the launcher to ``~/.nexo/core``.
+    # Those must use the packaged updater path instead of treating the managed
+    # runtime itself as a mutable source repository. That also applies once the
+    # launcher resolves through ``core/current`` into ``core/versions/X.Y.Z``:
+    # the active snapshot is still managed runtime state, not a dev checkout.
+    # Only a recorded external source repo in ``version.json`` should
+    # reactivate source-sync mode.
+    if code_resolved == runtime_core or _is_relative_to(code_resolved, runtime_versions):
+        version_source = _runtime_version_source()
+        if version_source:
+            return version_source / "src", version_source
+        return None, None
+
+    try:
+        same_as_runtime = NEXO_CODE.resolve() == dest.resolve()
+    except Exception:
+        same_as_runtime = NEXO_CODE == dest
+
+    if (
+        not same_as_runtime
+        and (NEXO_CODE / "db").is_dir()
+    ):
+        if (NEXO_CODE.parent / "package.json").is_file():
+            return NEXO_CODE, NEXO_CODE.parent
+        if (NEXO_CODE / "package.json").is_file():
+            return NEXO_CODE, NEXO_CODE
+
+    version_source = _runtime_version_source()
+    if version_source:
+        return version_source / "src", version_source
+    return None, None
+
+
+def _git_in_repo(repo_dir: Path, *args, timeout: int = 10) -> tuple[int, str, str]:
+    try:
+        result = subprocess.run(
+            ["git"] + list(args),
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return result.returncode, result.stdout.strip(), result.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 128, "", f"git {' '.join(str(a) for a in args)} timed out after {timeout}s"
+
+
+def _source_repo_status(repo_dir: Path) -> dict:
+    if not (repo_dir / ".git").exists() and not (repo_dir / ".git").is_file():
+        return {"is_git": False, "dirty": False, "behind": False, "diverged": False, "ahead": False}
+
+    rc, dirty_out, dirty_err = _git_in_repo(repo_dir, "status", "--porcelain")
+    dirty = rc == 0 and bool(dirty_out.strip())
+    if rc != 0:
+        return {
+            "is_git": True,
+            "dirty": True,
+            "behind": False,
+            "diverged": False,
+            "ahead": False,
+            "error": dirty_err or "git status failed",
+        }
+
+    rc, _, fetch_err = _git_in_repo(repo_dir, "fetch", "--quiet")
+    if rc != 0:
+        return {
+            "is_git": True,
+            "dirty": dirty,
+            "behind": False,
+            "diverged": False,
+            "ahead": False,
+            "error": fetch_err or "git fetch failed",
+        }
+
+    rc, local_head, _ = _git_in_repo(repo_dir, "rev-parse", "HEAD")
+    rc2, remote_head, remote_err = _git_in_repo(repo_dir, "rev-parse", "@{u}")
+    if rc != 0 or rc2 != 0:
+        return {
+            "is_git": True,
+            "dirty": dirty,
+            "behind": False,
+            "diverged": False,
+            "ahead": False,
+            "error": remote_err or "no upstream configured",
+        }
+    rc, merge_base, merge_err = _git_in_repo(repo_dir, "merge-base", "HEAD", "@{u}")
+    if rc != 0:
+        return {
+            "is_git": True,
+            "dirty": dirty,
+            "behind": False,
+            "diverged": False,
+            "ahead": False,
+            "error": merge_err or "merge-base failed",
+        }
+    return {
+        "is_git": True,
+        "dirty": dirty,
+        "behind": local_head != remote_head and merge_base == local_head,
+        "ahead": local_head != remote_head and merge_base == remote_head,
+        "diverged": merge_base not in {local_head, remote_head},
+        "local_head": local_head,
+        "remote_head": remote_head,
+    }
+
+
+def _discover_runtime_root_python_modules(base_dir: Path) -> list[str]:
+    """Return every top-level runtime `.py` module in the source/runtime root."""
+    if not base_dir.is_dir():
+        return []
+    modules: list[str] = []
+    for item in sorted(base_dir.iterdir(), key=lambda path: path.name):
+        if not item.is_file() or item.suffix != ".py":
+            continue
+        if item.name.startswith(".") or item.name == "__init__.py":
+            continue
+        if is_duplicate_artifact_name(item):
+            continue
+        modules.append(item.name)
+    return modules
+
+
+def _runtime_flat_files(base_dir: Path) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    json_contracts = [
+        item.name
+        for item in sorted(base_dir.iterdir(), key=lambda p: p.name)
+        if item.is_file()
+        and re.search(r"(?:_defaults|_manifest|_tiers)\.json$", item.name)
+        and not is_duplicate_artifact_name(item.name)
+    ]
+    for name in _discover_runtime_root_python_modules(base_dir) + json_contracts + ["requirements.txt", "package.json", "version.json"]:
+        if name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+    return ordered
+
+
+_RUNTIME_RESOURCE_DIRS = {"crons", "hooks", "managed_mcp", "presets"}
+_RUNTIME_PACKAGE_IGNORE_DIRS = {
+    "__pycache__",
+    "bin",
+    "node_modules",
+    "scripts",
+    "skills",
+    "skills-core",
+    "skills-runtime",
+    "templates",
+    "test",
+    "tests",
+    "vendor",
+}
+
+
+def _pyproject_top_level_packages(repo_dir: Path, src_dir: Path) -> set[str]:
+    pyproject = repo_dir / "pyproject.toml"
+    if not pyproject.is_file():
+        return set()
+    try:
+        text = pyproject.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return set()
+    packages: set[str] = set()
+    for match in re.finditer(r'["\']([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*)["\']', text):
+        top = match.group(1).split(".", 1)[0]
+        if top in _RUNTIME_PACKAGE_IGNORE_DIRS:
+            continue
+        if (src_dir / top).is_dir():
+            packages.add(top)
+    return packages
+
+
+def _runtime_package_dirs(src_dir: Path, repo_dir: Path | None = None) -> list[str]:
+    packages: set[str] = set()
+    if src_dir.is_dir():
+        for child in sorted(src_dir.iterdir(), key=lambda path: path.name):
+            if not child.is_dir() or child.name.startswith(".") or child.name in _RUNTIME_PACKAGE_IGNORE_DIRS:
+                continue
+            if (child / "__init__.py").is_file():
+                packages.add(child.name)
+        if repo_dir is not None:
+            packages.update(_pyproject_top_level_packages(repo_dir, src_dir))
+    packages.update(dirname for dirname in _RUNTIME_RESOURCE_DIRS if (src_dir / dirname).is_dir())
+    return sorted(packages)
+
+
+def _installed_scripts_classification(dest: Path) -> dict[str, str]:
+    scripts_dest = dest / "scripts"
+    if dest != NEXO_HOME or not scripts_dest.is_dir():
+        return {}
+    try:
+        from script_registry import classify_scripts_dir
+
+        entries = classify_scripts_dir().get("entries", [])
+    except Exception as e:
+        _log(f"script ownership inspection skipped: {e}")
+        return {}
+
+    ownership: dict[str, str] = {}
+    for entry in entries:
+        path_value = entry.get("path")
+        classification = str(entry.get("classification", "") or "")
+        if not path_value or not classification:
+            continue
+        ownership[Path(str(path_value)).name] = classification
+    return ownership
+
+
+def _backup_runtime_tree(dest: Path = NEXO_HOME) -> str:
+    backup_dir = paths.create_backup_dir("runtime-tree")
+
+    code_dirs = [
+        *_runtime_package_dirs(dest),
+        "plugins",
+        "scripts",
+        "skills",
+        "skills-core",
+        "skills-runtime",
+        "templates",
+    ]
+    flat_files = _runtime_flat_files(dest)
+    for name in code_dirs:
+        src = dest / name
+        if src.is_dir():
+            import shutil
+            shutil.copytree(str(src), str(backup_dir / name), dirs_exist_ok=True)
+    for name in flat_files:
+        src = dest / name
+        if src.is_file():
+            import shutil
+            shutil.copy2(str(src), str(backup_dir / name))
+    if (dest / "bin").is_dir():
+        import shutil
+        shutil.copytree(str(dest / "bin"), str(backup_dir / "bin"), dirs_exist_ok=True)
+    # Opportunistic rotation: runtime-tree snapshots were accumulating forever
+    # because nothing ever pruned them. Keep only the N most recent; failures
+    # must never block the runtime-tree caller's rollback flow.
+    try:
+        _rotate_auto_update_backups("runtime-tree-")
+    except Exception as e:
+        _log(f"Backup rotation warning (runtime-tree): {e}")
+    paths.finalize_backup_snapshot(backup_dir)
+    return str(backup_dir)
+
+
+def _remove_runtime_copy_target(target: Path) -> None:
+    """Remove a runtime copy destination, handling symlinks explicitly.
+
+    F0.6 installs keep compatibility shims such as ``~/.nexo/db ->
+    ~/.nexo/core/db``. ``shutil.rmtree(..., ignore_errors=True)`` does not
+    remove those symlinks, which makes subsequent ``copytree(...)`` calls fail
+    with ``FileExistsError`` during ``nexo update``. This helper treats
+    symlink/file targets differently from real directories so runtime sync and
+    rollback can replace shim paths safely.
+    """
+    import shutil
+
+    try:
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+            return
+        if target.is_dir():
+            shutil.rmtree(str(target), ignore_errors=True)
+            return
+        if target.exists():
+            target.unlink()
+    except FileNotFoundError:
+        return
+
+
+def _restore_runtime_tree(backup_dir: str, dest: Path = NEXO_HOME) -> None:
+    import shutil
+
+    bdir = Path(backup_dir)
+    if not bdir.is_dir():
+        return
+    for item in bdir.iterdir():
+        target = dest / item.name
+        if item.is_dir():
+            _remove_runtime_copy_target(target)
+            shutil.copytree(str(item), str(target))
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _remove_runtime_copy_target(target)
+            shutil.copy2(str(item), str(target))
+
+
+def _copy_runtime_from_source(src_dir: Path, repo_dir: Path, dest: Path = NEXO_HOME, progress_fn=None) -> dict:
+    import shutil
+
+    packages = _runtime_package_dirs(src_dir, repo_dir)
+    flat_files = _runtime_flat_files(src_dir)
+    copied_packages = 0
+    copied_files = 0
+    copied_scripts = 0
+    script_conflicts: list[dict[str, str]] = []
+    installed_script_classes = _installed_scripts_classification(dest)
+
+    def _preserve_f06_legacy_shims() -> bool:
+        if dest != NEXO_HOME:
+            return False
+        try:
+            return (dest / ".structure-version").read_text(encoding="utf-8").strip() == "F0.6"
+        except Exception:
+            return False
+
+    for dirname in ("bin", "skills", "skills-core", "skills-runtime", "templates"):
+        (dest / dirname).mkdir(parents=True, exist_ok=True)
+
+    _emit_progress(progress_fn, "Copying core packages...")
+    for pkg in packages:
+        pkg_src = src_dir / pkg
+        pkg_dest = dest / pkg
+        if pkg_src.is_dir():
+            _remove_runtime_copy_target(pkg_dest)
+            shutil.copytree(
+                str(pkg_src),
+                str(pkg_dest),
+                ignore=_runtime_copy_ignore(),
+            )
+            copied_packages += 1
+
+    _emit_progress(progress_fn, "Copying core modules...")
+    for name in flat_files:
+        src_file = src_dir / name
+        if src_file.is_file():
+            target = dest / name
+            _remove_runtime_copy_target(target)
+            shutil.copy2(str(src_file), str(target))
+            copied_files += 1
+
+    _emit_progress(progress_fn, "Copying plugin modules...")
+    plugins_src = src_dir / "plugins"
+    plugins_dest = dest / "plugins"
+    if plugins_src.is_dir():
+        if plugins_dest.is_symlink():
+            _remove_runtime_copy_target(plugins_dest)
+        plugins_dest.mkdir(parents=True, exist_ok=True)
+        for item in plugins_src.iterdir():
+            if item.is_file() and item.suffix == ".py" and not is_duplicate_artifact_name(item):
+                target = plugins_dest / item.name
+                _remove_runtime_copy_target(target)
+                shutil.copy2(str(item), str(target))
+
+    _emit_progress(progress_fn, "Copying scripts...")
+    scripts_src = src_dir / "scripts"
+    scripts_dest = dest / "scripts"
+    if scripts_src.is_dir():
+        if scripts_dest.is_symlink():
+            if _preserve_f06_legacy_shims():
+                scripts_dest = scripts_dest.resolve(strict=False)
+            else:
+                _remove_runtime_copy_target(scripts_dest)
+        scripts_dest.mkdir(parents=True, exist_ok=True)
+        for item in scripts_src.iterdir():
+            if item.name == "__pycache__" or item.name.startswith(".") or is_duplicate_artifact_name(item):
+                continue
+            dst = scripts_dest / item.name
+            if item.is_dir():
+                _remove_runtime_copy_target(dst)
+                shutil.copytree(str(item), str(dst), ignore=_runtime_copy_ignore())
+            elif item.is_file():
+                existing_class = installed_script_classes.get(item.name, "")
+                if dst.exists() and existing_class == "personal":
+                    script_conflicts.append(
+                        {
+                            "name": item.name,
+                            "path": str(dst),
+                            "classification": existing_class,
+                            "reason": "existing runtime entry is not core-managed",
+                        }
+                    )
+                    continue
+                shutil.copy2(str(item), str(dst))
+                if item.suffix == ".sh":
+                    dst.chmod(0o755)
+                copied_scripts += 1
+
+    if script_conflicts:
+        _emit_progress(
+            progress_fn,
+            f"Preserved {len(script_conflicts)} personal runtime script collision(s); core scripts were not overwritten.",
+        )
+
+    _emit_progress(progress_fn, "Copying templates and version metadata...")
+    templates_src = repo_dir / "templates"
+    templates_dest = dest / "templates"
+    if templates_src.is_dir():
+        if templates_dest.is_symlink():
+            _remove_runtime_copy_target(templates_dest)
+        templates_dest.mkdir(parents=True, exist_ok=True)
+        for item in templates_src.iterdir():
+            if item.name == "__pycache__" or is_duplicate_artifact_name(item):
+                continue
+            if item.is_file():
+                target = templates_dest / item.name
+                _remove_runtime_copy_target(target)
+                shutil.copy2(str(item), str(target))
+            elif item.is_dir():
+                sub_dest = templates_dest / item.name
+                if sub_dest.is_symlink():
+                    _remove_runtime_copy_target(sub_dest)
+                sub_dest.mkdir(parents=True, exist_ok=True)
+                for sub in item.iterdir():
+                    if sub.is_file() and not is_duplicate_artifact_name(sub):
+                        target = sub_dest / sub.name
+                        _remove_runtime_copy_target(target)
+                        shutil.copy2(str(sub), str(target))
+
+    package_json = repo_dir / "package.json"
+    if package_json.is_file():
+        package_target = dest / "package.json"
+        _remove_runtime_copy_target(package_target)
+        shutil.copy2(str(package_json), str(package_target))
+        try:
+            pkg = json.loads(package_json.read_text())
+            version_target = dest / "version.json"
+            _remove_runtime_copy_target(version_target)
+            version_target.write_text(json.dumps({
+                "version": pkg.get("version", "?"),
+                "source": str(repo_dir),
+            }, indent=2))
+        except Exception:
+            pass
+
+    _emit_progress(progress_fn, "Copying core skills and runtime wrapper...")
+    skills_src = src_dir / "skills"
+    skills_dest = dest / "skills-core"
+    if skills_src.is_dir():
+        _remove_runtime_copy_target(skills_dest)
+        shutil.copytree(str(skills_src), str(skills_dest), ignore=_runtime_copy_ignore())
+
+    bin_dir = dest / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    wrapper = bin_dir / "nexo"
+    wrapper.write_text(_runtime_cli_wrapper_text())
+    wrapper.chmod(0o755)
+    managed_mcp_src = repo_dir / "bin" / "nexo-managed-mcp.js"
+    if managed_mcp_src.is_file():
+        managed_mcp_target = bin_dir / "nexo-managed-mcp"
+        _remove_runtime_copy_target(managed_mcp_target)
+        shutil.copy2(str(managed_mcp_src), str(managed_mcp_target))
+        managed_mcp_target.chmod(0o755)
+
+    return {
+        "packages": copied_packages,
+        "files": copied_files,
+        "scripts": copied_scripts,
+        "script_conflicts": script_conflicts,
+        "source": str(src_dir),
+        "repo": str(repo_dir),
+    }
+
+
+def _reinstall_runtime_pip_deps(runtime_root: Path = NEXO_HOME) -> bool:
+    req_file = runtime_root / "requirements.txt"
+    if not req_file.exists():
+        return True
+    venv_python = _ensure_runtime_venv(runtime_root)
+    venv_pip = _venv_pip_path(runtime_root)
+    if not venv_pip.exists() and sys.platform != "win32":
+        alt_pip = runtime_root / ".venv" / "bin" / "pip3"
+        if alt_pip.exists():
+            venv_pip = alt_pip
+    try:
+        if venv_pip.exists():
+            result = subprocess.run(
+                [str(venv_pip), "install", "--quiet", "-r", str(req_file)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        elif not desktop_product_requested():
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--quiet", "-r", str(req_file), "--break-system-packages"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        else:
+            _log(f"managed venv unavailable for Desktop runtime dependency repair: {venv_python}")
+            return False
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _run_runtime_post_sync(dest: Path = NEXO_HOME, progress_fn=None) -> tuple[bool, list[str]]:
+    actions: list[str] = []
+    env = {**os.environ, "NEXO_HOME": str(dest), "NEXO_CODE": str(dest)}
+    try:
+        _emit_progress(progress_fn, "Initializing database and reconciling personal schedules...")
+        init_result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import json; "
+                    "import db; "
+                    "init_db = getattr(db, 'init_db', None); "
+                    "init_db() if callable(init_db) else None; "
+                    "import script_registry; "
+                    "retire_scripts = getattr(script_registry, 'retire_superseded_personal_scripts', None); "
+                    "retired = retire_scripts(dry_run=False) if callable(retire_scripts) else {}; "
+                    "retire_skills = getattr(db, 'retire_superseded_personal_skills', None); "
+                    "retired_skills = retire_skills(dry_run=False) if callable(retire_skills) else {}; "
+                    "sync_skills = getattr(db, 'sync_skill_directories', None); "
+                    "sync_skills() if callable(sync_skills) else None; "
+                    "reconcile_scripts = getattr(script_registry, 'reconcile_personal_scripts', None); "
+                    "result = reconcile_scripts(dry_run=False) if callable(reconcile_scripts) else {}; "
+                    "result = result if isinstance(result, dict) else {}; "
+                    "exec(\"try:\\n"
+                    " import memory_fabric\\n"
+                    " result['memory_fabric'] = memory_fabric.repair_memory_fabric(transcript_limit=1000, backup_limit=5000)\\n"
+                    "except Exception as exc:\\n"
+                    " result['memory_fabric_error'] = repr(exc)\"); "
+                    "result['retired_superseded_scripts'] = retired; "
+                    "result['retired_superseded_skills'] = retired_skills; "
+                    "print(json.dumps(result))"
+                ),
+            ],
+            cwd=str(dest),
+            capture_output=True,
+            text=True,
+            timeout=RUNTIME_POST_SYNC_TIMEOUT_SECONDS,
+            env=env,
+        )
+        if init_result.returncode != 0:
+            return False, [init_result.stderr.strip() or init_result.stdout.strip() or "runtime init failed"]
+        actions.append("db+personal-sync")
+        reconcile_payload = _parse_runtime_init_payload(init_result.stdout or "")
+        extra_actions, reconcile_message = _personal_schedule_reconcile_summary(reconcile_payload)
+        actions.extend(extra_actions)
+        memory_fabric_result = reconcile_payload.get("memory_fabric")
+        if isinstance(memory_fabric_result, dict):
+            transcript_indexed = int((memory_fabric_result.get("transcripts") or {}).get("indexed") or 0)
+            historical_inserted = int((memory_fabric_result.get("backups") or {}).get("inserted") or 0)
+            health = memory_fabric_result.get("health") or {}
+            health_issues = health.get("issues") or []
+            historical_health = health.get("historical_diaries") or {}
+            unreconciled = int(historical_health.get("backup_rows_unreconciled") or 0)
+            if transcript_indexed or historical_inserted:
+                actions.append(f"memory-fabric-repaired:{transcript_indexed + historical_inserted}")
+                _emit_progress(
+                    progress_fn,
+                    f"Memory Fabric: indexed {transcript_indexed} transcript(s), reconciled {historical_inserted} historical diary row(s).",
+                )
+            else:
+                actions.append("memory-fabric-checked")
+            if unreconciled:
+                actions.append(f"memory-fabric-unreconciled:{unreconciled}")
+            if memory_fabric_result.get("ok") is False or any(
+                isinstance(issue, dict) and issue.get("code") == "backup_diaries_not_reconciled"
+                for issue in health_issues
+            ):
+                actions.append("memory-fabric-warning")
+        elif reconcile_payload.get("memory_fabric_error"):
+            actions.append("memory-fabric-warning")
+        if reconcile_message:
+            _emit_progress(progress_fn, reconcile_message)
+    except Exception as e:
+        return False, [f"runtime init error: {e}"]
+
+    try:
+        _emit_progress(progress_fn, "Canonicalizing packaged runtime layout...")
+        _maybe_migrate_to_f06_layout()
+        try:
+            _rewrite_f06_launch_agents()
+        except Exception:
+            pass
+        actions.append("layout-heal")
+    except Exception as exc:
+        actions.append(f"layout-heal-warning:{exc.__class__.__name__}")
+
+    try:
+        legacy_db_cleanup = _cleanup_legacy_root_db_stubs(dest, dry_run=False)
+        archived = len(legacy_db_cleanup.get("archived", []) or [])
+        if archived:
+            actions.append(f"legacy-root-db-stubs-archived:{archived}")
+    except Exception as exc:
+        actions.append(f"legacy-root-db-stubs-warning:{exc.__class__.__name__}")
+
+    try:
+        personal_brain_cleanup = _cleanup_empty_personal_brain_db_stubs(dest, dry_run=False)
+        archived = len(personal_brain_cleanup.get("archived", []) or [])
+        if archived:
+            actions.append(f"legacy-personal-brain-db-stubs-archived:{archived}")
+    except Exception as exc:
+        actions.append(f"legacy-personal-brain-db-stubs-warning:{exc.__class__.__name__}")
+
+    try:
+        cognitive_cleanup = cleanup_legacy_cognitive_db_artifacts(dry_run=False)
+        removed = len(cognitive_cleanup.get("removed", []) or [])
+        archived = len(cognitive_cleanup.get("archived", []) or [])
+        if removed:
+            actions.append(f"legacy-cognitive-db-duplicates-removed:{removed}")
+        if archived:
+            actions.append(f"legacy-cognitive-db-archived:{archived}")
+    except Exception as exc:
+        actions.append(f"legacy-cognitive-db-warning:{exc.__class__.__name__}")
+
+    try:
+        _emit_progress(progress_fn, "Applying Desktop product contract...")
+        contract = enforce_desktop_product_contract(source="runtime_post_sync")
+        if contract.get("applied"):
+            actions.append("desktop-product-contract")
+    except Exception as exc:
+        actions.append(f"desktop-product-contract-warning:{exc.__class__.__name__}")
+
+    code_root = _runtime_code_dir(dest)
+    env = {**os.environ, "NEXO_HOME": str(dest), "NEXO_CODE": str(code_root)}
+
+    _emit_progress(progress_fn, "Reconciling Python dependencies...")
+    if _reinstall_runtime_pip_deps(dest):
+        actions.append("pip-deps")
+    else:
+        actions.append("pip-deps-warning")
+
+    sync_path = dest / "crons" / "sync.py"
+    if sync_path.is_file():
+        try:
+            _emit_progress(progress_fn, "Syncing core cron definitions...")
+            sync_result = subprocess.run(
+                [sys.executable, str(sync_path)],
+                cwd=str(dest),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+            if sync_result.returncode != 0:
+                return False, [sync_result.stderr.strip() or sync_result.stdout.strip() or "cron sync failed"]
+            actions.append("cron-sync")
+        except Exception as e:
+            return False, [f"cron sync error: {e}"]
+
+    from runtime_power import apply_power_policy
+
+    _emit_progress(progress_fn, "Refreshing runtime power helper...")
+    power_result = apply_power_policy()
+    if power_result.get("ok"):
+        actions.append(f"power:{power_result.get('action')}")
+
+    _emit_progress(progress_fn, "Refreshing shared client configs...")
+    try:
+        from client_sync import sync_all_clients
+        from client_preferences import normalize_client_preferences
+        from model_defaults import heal_runtime_profiles
+
+        schedule_path = _runtime_config_dir(dest) / "schedule.json"
+        schedule_payload = json.loads(schedule_path.read_text()) if schedule_path.exists() else {}
+        # Heal Claude-family models written into Codex runtime profile by
+        # earlier buggy versions (DEFAULT_CODEX_MODEL was aliased to Claude).
+        existing_profiles = schedule_payload.get("client_runtime_profiles") or {}
+        healed_profiles, heal_messages = heal_runtime_profiles(existing_profiles)
+        if heal_messages:
+            schedule_payload["client_runtime_profiles"] = healed_profiles
+            for msg in heal_messages:
+                _emit_progress(progress_fn, msg)
+                actions.append("model-heal")
+            # Claude Code reads the default model from ~/.claude/settings.json,
+            # not from client_runtime_profiles. If the heal migrated the
+            # claude_code model (e.g. Opus 4.6 → 4.7) the internal profile is
+            # now correct but Claude Code keeps booting on the old model until
+            # settings.json is also updated. Propagate conservatively: only
+            # touch settings.json when it already has a "model" field.
+            existing_cc = existing_profiles.get("claude_code") if isinstance(existing_profiles.get("claude_code"), dict) else None
+            healed_cc = healed_profiles.get("claude_code") if isinstance(healed_profiles.get("claude_code"), dict) else None
+            old_cc_model = str((existing_cc or {}).get("model") or "")
+            new_cc_model = str((healed_cc or {}).get("model") or "")
+            if new_cc_model and new_cc_model != old_cc_model:
+                try:
+                    from client_sync import sync_claude_code_model
+                    sync_result = sync_claude_code_model(new_cc_model)
+                    if sync_result.get("action") == "updated":
+                        _emit_progress(
+                            progress_fn,
+                            f"Synced Claude Code settings.json model → '{new_cc_model}'.",
+                        )
+                        actions.append("claude-settings-model")
+                    elif not sync_result.get("ok"):
+                        actions.append(
+                            f"claude-settings-model-warning:{sync_result.get('reason', 'unknown')}"
+                        )
+                except Exception as e:
+                    actions.append(f"claude-settings-model-warning:{e}")
+        normalized_preferences = normalize_client_preferences(schedule_payload)
+        if normalized_preferences != {
+            key: schedule_payload.get(key)
+            for key in normalized_preferences
+        }:
+            merged_schedule = dict(schedule_payload)
+            merged_schedule.update(normalized_preferences)
+            schedule_path.parent.mkdir(parents=True, exist_ok=True)
+            schedule_path.write_text(json.dumps(merged_schedule, indent=2, ensure_ascii=False) + "\n")
+        client_sync_result = sync_all_clients(
+            nexo_home=dest,
+            runtime_root=code_root,
+            preferences=normalized_preferences,
+            auto_install_missing_claude=True,
+        )
+        if client_sync_result.get("ok"):
+            actions.append("client-sync")
+        else:
+            actions.append("client-sync-warning")
+    except Exception as e:
+        actions.append(f"client-sync-warning:{e}")
+
+    # Heal deep-sleep residue from older buggy runtimes. Idempotent + safe:
+    # no-op if the runtime is already clean.
+    try:
+        _emit_progress(progress_fn, "Healing deep-sleep runtime state...")
+        heal_actions = _heal_deep_sleep_runtime(dest)
+        for action in heal_actions:
+            actions.append(f"deep-sleep-heal:{action}")
+    except Exception as exc:
+        actions.append(f"deep-sleep-heal-warning:{exc.__class__.__name__}")
+
+    try:
+        _emit_progress(progress_fn, "Cleaning misplaced watchdog runtime files...")
+        misplaced_actions = _heal_misplaced_personal_watchdog_runtime_files()
+        for action in misplaced_actions:
+            actions.append(action)
+    except Exception as exc:
+        actions.append(f"watchdog-runtime-file-warning:{exc.__class__.__name__}")
+
+    # Recover the user's legacy reasoning_effort preference into the new
+    # default_resonance knob. v5.10.0 left this gap — users who had
+    # `reasoning_effort="max"` in schedule.json silently degraded to
+    # DEFAULT_RESONANCE=alto when the resonance map took over. This
+    # migration restores their choice exactly once.
+    try:
+        _emit_progress(progress_fn, "Migrating legacy effort preference to resonance...")
+        mig_actions = _migrate_effort_to_resonance(dest)
+        for action in mig_actions:
+            actions.append(action)
+    except Exception as exc:
+        actions.append(f"resonance-migration-warning:{exc.__class__.__name__}")
+
+    try:
+        _emit_progress(progress_fn, "Bootstrapping profile.json from calibration...")
+        boot_actions = _bootstrap_profile_from_calibration_meta(dest)
+        for action in boot_actions:
+            actions.append(action)
+    except Exception as exc:
+        actions.append(f"profile-bootstrap-warning:{exc.__class__.__name__}")
+
+    # v6.0.3 — relocate resonance_tiers.json from NEXO_HOME root (pre-v6.0.3
+    # layout) to NEXO_HOME/brain/ (public contract path consumed by
+    # NEXO Desktop). Idempotent; safe no-op once the move is done.
+    try:
+        _emit_progress(progress_fn, "Relocating resonance_tiers contract to brain/...")
+        reloc_actions = _relocate_resonance_tiers_contract(dest)
+        for action in reloc_actions:
+            actions.append(action)
+        refresh_actions = _refresh_resonance_tiers_model_defaults(dest)
+        for action in refresh_actions:
+            actions.append(action)
+    except Exception as exc:
+        actions.append(f"resonance-contract-relocate-warning:{exc.__class__.__name__}")
+
+    # v6.0.0 purge — drop legacy fields that moved elsewhere in v6.
+    # client_runtime_profiles.*.{model,reasoning_effort} → resonance_tiers.json.
+    # preferences.protocol_strictness → TTY/no-TTY detection.
+    # preferences.show_pending_at_start → NEXO Desktop electron-store.
+    # Never re-raises: the update must finish even if purge fails.
+    try:
+        _emit_progress(progress_fn, "Applying v6.0.0 calibration purge...")
+        from calibration_migration import apply_v6_purge
+        v6_result = apply_v6_purge(nexo_home=dest)
+        if v6_result.get("calibration_changed"):
+            actions.append("v6-purge:calibration")
+        if v6_result.get("schedule_changed"):
+            actions.append("v6-purge:schedule")
+        if v6_result.get("seeded_default_resonance"):
+            actions.append("v6-purge:seeded-default-resonance-alto")
+        if v6_result.get("status") == "noop":
+            actions.append("v6-purge:noop")
+    except Exception as exc:
+        actions.append(f"v6-purge-warning:{exc.__class__.__name__}")
+
+    try:
+        _emit_progress(progress_fn, "Cleaning legacy email routing overrides...")
+        email_actions = _cleanup_legacy_email_routing_config(dest)
+        for action in email_actions:
+            actions.append(action)
+    except Exception as exc:
+        actions.append(f"email-routing-cleanup-warning:{exc.__class__.__name__}")
+
+    try:
+        _emit_progress(progress_fn, "Ensuring local classifier baseline...")
+        if _is_ephemeral_runtime_install(dest):
+            _write_classifier_install_log(
+                f"[classifier-install] skipped on ephemeral runtime: {dest}"
+            )
+        else:
+            _maybe_install_local_classifier()
+        actions.append("classifier-install")
+    except Exception as exc:
+        actions.append(f"classifier-install-warning:{exc.__class__.__name__}")
+
+    # v7.3.0 fix for the post-v7.2.0 bug: ``_run_runtime_post_sync`` was
+    # invoking post-install hooks directly against the ``auto_update``
+    # module already loaded in this process (the OLD code). Any function
+    # added to auto_update in the CURRENT release therefore never ran on
+    # the first ``nexo update`` that introduced it — only on the next
+    # one. Exhibit A: v7.2.0 shipped ``_persist_guardian_hard_defaults``
+    # and ``_maybe_promote_adaptive_weights_empirically`` but
+    # ``guardian-runtime-overrides.json`` was not written on the operator's
+    # first upgrade until the functions were invoked manually.
+    #
+    # The fix runs those post-install hooks inside a clean Python
+    # subprocess that imports from the freshly-copied tree at
+    # ``dest/core`` (packaged) or ``dest`` (dev/legacy layout). The
+    # subprocess emits a single JSON line so the parent process can
+    # record each hook's outcome in ``actions``.
+    try:
+        _emit_progress(progress_fn, "Running post-install hooks from fresh code...")
+        fresh_actions = _run_post_install_hooks_fresh(dest, env=env)
+        actions.extend(fresh_actions)
+    except Exception as exc:
+        actions.append(f"post-install-hooks-fresh-warning:{exc.__class__.__name__}")
+
+    _emit_progress(progress_fn, "Verifying runtime imports...")
+    verify = subprocess.run(
+        [sys.executable, "-c", "import server"],
+        cwd=str(dest),
+        capture_output=True,
+        text=True,
+        timeout=20,
+        env=env,
+    )
+    if verify.returncode != 0:
+        return False, [verify.stderr.strip() or verify.stdout.strip() or "import verify failed"]
+    actions.append("verify")
+    try:
+        actions.append(_stamp_runtime_repair_baseline(dest))
+    except Exception as exc:
+        actions.append(f"runtime-repair-baseline-warning:{exc.__class__.__name__}")
+    return True, actions
+
+
+def _runtime_busy_reason() -> str | None:
+    try:
+        from db import get_active_sessions
+        active = get_active_sessions()
+    except Exception:
+        return None
+    if active:
+        return f"active sessions: {len(active)}"
+    return None
+
+
+def _write_update_summary(summary: dict):
+    try:
+        logs_dir = paths.logs_dir()
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        payload = dict(summary)
+        payload.setdefault("timestamp", time.strftime("%Y-%m-%dT%H:%M:%S"))
+        UPDATE_SUMMARY_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+        with UPDATE_HISTORY_FILE.open("a") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as e:
+        _log(f"Failed to write update summary: {e}")
+
+
+def _emit_progress(progress_fn, message: str) -> None:
+    if callable(progress_fn):
+        try:
+            progress_fn(message)
+        except Exception:
+            pass
+
+
+_GUARDIAN_PERSIST_HARD_DEFAULTS = {
+    "G1_ENFORCER_ACTIVE": "hard",
+    "G3_ENFORCE_DESTRUCTIVE": "hard",
+    "G3_SSH_ENFORCE_REMOTE_WRITE": "hard",
+    "G4_ENFORCE_GUARD_CHECK": "hard",
+}
+
+
+def _persist_guardian_hard_defaults(dest: Path) -> tuple[bool, str | None]:
+    """Write ``~/.nexo/config/guardian-runtime-overrides.json`` with the
+    v7.2.0 "Guardian-on by default" matrix so operators get the active
+    enforcer experience without setting env vars every shell.
+
+    Returns (persisted, message). ``persisted`` is True when the file was
+    written or updated during this call; False when we left it alone
+    (operator opt-out, or file already matches the defaults).
+
+    Contract:
+        - Operator opt-out with ``NEXO_GUARDIAN_PERSIST_HARD=off`` in env
+          at update time: leave the file untouched.
+        - Ephemeral runtimes: skip.
+        - Never overwrite a key the operator already customized to a
+          non-default value (``shadow`` / ``off`` / anything else). Only
+          fills missing keys or upgrades explicit defaults.
+    """
+    def _join_messages(*messages: str | None) -> str | None:
+        parts = [str(message) for message in messages if str(message or "").strip()]
+        return ";".join(parts) if parts else None
+
+    repair_message = None
+    try:
+        _repair_changed, repair_message = _run_f06_post_update_repairs(dest)
+    except Exception as exc:
+        repair_message = f"f06-post-update-repair-warning:{exc.__class__.__name__}"
+
+    if _is_ephemeral_runtime_install(dest):
+        return False, _join_messages("guardian-hard-persist-skipped:ephemeral", repair_message)
+    if os.environ.get("NEXO_GUARDIAN_PERSIST_HARD", "").strip().lower() == "off":
+        return False, _join_messages("guardian-hard-persist-skipped:operator-opt-out", repair_message)
+
+    config_path = dest / "personal" / "config" / "guardian-runtime-overrides.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    current: dict[str, str] = {}
+    if config_path.is_file():
+        try:
+            raw = json.loads(config_path.read_text())
+            if isinstance(raw, dict):
+                current = {str(k): str(v) for k, v in raw.items()}
+        except Exception:
+            # Malformed file — treat as empty. We write the fresh defaults
+            # and keep the malformed copy for the operator to inspect.
+            try:
+                config_path.rename(
+                    config_path.with_suffix(
+                        config_path.suffix + f".broken-{int(time.time())}"
+                    )
+                )
+            except Exception:
+                pass
+            current = {}
+
+    original = dict(current)
+    for key, default in _GUARDIAN_PERSIST_HARD_DEFAULTS.items():
+        if key not in current:
+            current[key] = default
+
+    if current == original and config_path.is_file():
+        return False, repair_message
+
+    try:
+        tmp_path = config_path.with_suffix(config_path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(current, indent=2, ensure_ascii=False) + "\n")
+        tmp_path.replace(config_path)
+    except Exception as exc:  # pragma: no cover - filesystem failures
+        return False, _join_messages(f"guardian-hard-persist-error:{exc.__class__.__name__}", repair_message)
+
+    return True, repair_message
+
+
+from datetime import datetime as _adaptive_datetime  # isolated alias; other modules use ``time.time()``
+
+_ADAPTIVE_PROMOTE_MIN_SAMPLES = 200
+_ADAPTIVE_PROMOTE_MIN_DAYS = 2
+
+
+def _maybe_promote_adaptive_weights_empirically(dest: Path) -> tuple[bool, str | None]:
+    """Promote ``shadow_weights`` to ``learned_weights`` during ``nexo update``
+    when the install already has enough empirical signal.
+
+    Mirrors the empirical path in ``adaptive_mode.learn_weights`` (the
+    background learner cron). Without this, operators upgrading to v7.2.0
+    with a mature shadow dataset would still have to wait for the next
+    learner tick to feel the calibration — which can be hours or days.
+
+    Conditions to promote:
+        - adaptive_state.json exists and parses.
+        - ``shadow_weights`` dict is present.
+        - ``shadow_weights_samples >= 200`` AND the learner has been
+          running for at least 2 calendar days
+          (``learned_weights_first_date`` ≥ 2 days ago).
+        - ``learned_weights`` is absent or empty (never overwrite an
+          already-active set of weights).
+        - Operator opt-out flag ``NEXO_ADAPTIVE_EMPIRICAL_PROMOTION=off``
+          is NOT set. Same flag the learner already honours, so
+          operators who opted out stay opted out everywhere.
+
+    Returns ``(promoted, message)``:
+        - ``(True, None)``: weights were promoted, audit trail written.
+        - ``(False, None)``: no-op (no shadow data, not enough samples,
+          already promoted, or ephemeral install).
+        - ``(False, "adaptive-promote-skipped:<reason>")``: explicit skip
+          for the install log.
+    """
+    if _is_ephemeral_runtime_install(dest):
+        return False, "adaptive-promote-skipped:ephemeral"
+    if os.environ.get("NEXO_ADAPTIVE_EMPIRICAL_PROMOTION", "").strip().lower() == "off":
+        return False, "adaptive-promote-skipped:operator-opt-out"
+
+    state_path = dest / "personal" / "brain" / "adaptive_state.json"
+    if not state_path.is_file():
+        # Fall back to the legacy pre-F0.6 location for half-migrated
+        # installs; the migrator will eventually move it.
+        legacy = dest / "brain" / "adaptive_state.json"
+        if legacy.is_file():
+            state_path = legacy
+        else:
+            return False, None  # no data yet — nothing to promote
+
+    try:
+        raw = json.loads(state_path.read_text())
+    except Exception:
+        return False, "adaptive-promote-skipped:state-parse-error"
+    if not isinstance(raw, dict):
+        return False, "adaptive-promote-skipped:state-not-dict"
+
+    learned = raw.get("learned_weights")
+    if isinstance(learned, dict) and learned:
+        return False, None  # already active — nothing to do
+
+    shadow = raw.get("shadow_weights")
+    if not isinstance(shadow, dict) or not shadow:
+        return False, None  # no shadow data yet
+
+    samples = 0
+    try:
+        samples = int(raw.get("shadow_weights_samples", 0) or 0)
+    except (TypeError, ValueError):
+        samples = 0
+    if samples < _ADAPTIVE_PROMOTE_MIN_SAMPLES:
+        return False, None
+
+    first_date_raw = str(raw.get("learned_weights_first_date") or "").strip()
+    if not first_date_raw:
+        return False, None
+    try:
+        first_dt = _adaptive_datetime.strptime(first_date_raw[:19], "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return False, "adaptive-promote-skipped:first-date-parse-error"
+    days_since_first = (_adaptive_datetime.utcnow() - first_dt).days
+    if days_since_first < _ADAPTIVE_PROMOTE_MIN_DAYS:
+        return False, None
+
+    # Promote — deep-copy so callers holding references to the original
+    # dict don't see phantom mutations mid-update.
+    raw["learned_weights"] = {str(k): v for k, v in shadow.items()}
+    raw["learned_weights_date"] = _adaptive_datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+    raw["learned_weights_samples"] = samples
+    raw["learned_weights_promoted_by"] = "nexo_update_empirical_v7_2_0"
+    raw["learned_weights_promoted_at"] = _adaptive_datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+
+    try:
+        tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(raw, indent=2, ensure_ascii=False) + "\n")
+        tmp_path.replace(state_path)
+    except Exception as exc:  # pragma: no cover - filesystem failures
+        return False, f"adaptive-promote-error:{exc.__class__.__name__}"
+
+    return True, None
+
+
+def _promote_f06_core_scripts_from_latest_legacy_conflict(dest: Path) -> tuple[bool, str | None]:
+    """Recover core script updates archived by the pre-fix F0.6 shim path.
+
+    Older updaters copied packaged scripts into ``NEXO_HOME/scripts`` after
+    breaking the F0.6 compatibility symlink. The subsequent shim reconciliation
+    saw those fresh scripts as legacy conflicts and archived them under
+    ``runtime/backups/legacy-shim-conflicts-*`` instead of replacing
+    ``core/scripts``. This hook runs from the freshly-copied release tree, so it
+    can repair the first upgrade that introduces the updater fix.
+    """
+    try:
+        marker = (dest / ".structure-version").read_text(encoding="utf-8").strip()
+    except Exception:
+        marker = ""
+    if marker != "F0.6":
+        return False, None
+
+    core_scripts = dest / "core" / "scripts"
+    backups_dir = dest / "runtime" / "backups"
+    if not core_scripts.is_dir() or not backups_dir.is_dir():
+        return False, None
+
+    try:
+        candidates = sorted(
+            [p for p in backups_dir.glob("legacy-shim-conflicts-*") if (p / "scripts").is_dir()],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except Exception:
+        return False, "f06-core-scripts-promote-warning:scan"
+
+    if not candidates:
+        return False, None
+
+    def _should_skip(path: Path) -> bool:
+        return (
+            path.name == "__pycache__"
+            or path.name.startswith(".")
+            or is_duplicate_artifact_name(path)
+        )
+
+    def _source_is_not_older(src: Path, dst: Path) -> bool:
+        if not dst.exists() and not dst.is_symlink():
+            return True
+        try:
+            return src.stat().st_mtime >= dst.stat().st_mtime
+        except Exception:
+            return False
+
+    copied = 0
+
+    def _copy_entry(src: Path, dst: Path) -> None:
+        nonlocal copied
+        if _should_skip(src):
+            return
+        if src.is_dir():
+            dst.mkdir(parents=True, exist_ok=True)
+            for child in src.iterdir():
+                _copy_entry(child, dst / child.name)
+            return
+        if not src.is_file() or not _source_is_not_older(src, dst):
+            return
+        try:
+            if dst.exists() and dst.is_file() and src.read_bytes() == dst.read_bytes():
+                return
+        except Exception:
+            pass
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(src), str(dst))
+        if src.suffix == ".sh":
+            dst.chmod(0o755)
+        copied += 1
+
+    for backup_root in candidates[:3]:
+        scripts_backup = backup_root / "scripts"
+        try:
+            for item in scripts_backup.iterdir():
+                _copy_entry(item, core_scripts / item.name)
+        except Exception as exc:
+            return False, f"f06-core-scripts-promote-warning:{exc.__class__.__name__}"
+        if copied:
+            return True, f"f06-core-scripts-promoted:{copied}"
+
+    return False, None
+
+
+def _refresh_active_versioned_runtime_snapshot(dest: Path) -> tuple[bool, str | None]:
+    """Rebuild ``core/current`` from ``core`` after an update.
+
+    Version equality is not enough evidence that the active snapshot contains
+    the same bytes as ``core``: a same-version repair can update ``core/scripts``
+    after ``core/current`` was already activated. Refreshing the snapshot keeps
+    Desktop/CLI clients that resolve through ``core/current`` on the repaired
+    runtime tree.
+    """
+    core_root = dest / "core"
+    if not core_root.is_dir() or not (core_root / "cli.py").is_file():
+        return False, None
+    try:
+        from runtime_versioning import activate_versioned_runtime_snapshot, read_version_for_path
+
+        version = str(read_version_for_path(core_root) or "").strip()
+        if not version:
+            return False, "runtime-snapshot-refresh-skipped:missing-version"
+        result = activate_versioned_runtime_snapshot(source_root=core_root, version=version)
+    except Exception as exc:
+        return False, f"runtime-snapshot-refresh-warning:{exc.__class__.__name__}"
+    if not result.get("ok"):
+        return False, f"runtime-snapshot-refresh-warning:{result.get('error', 'unknown')}"
+    return True, f"runtime-snapshot-refreshed:{version}"
+
+
+def _run_f06_post_update_repairs(dest: Path) -> tuple[bool, str | None]:
+    changed = False
+    messages: list[str] = []
+    for repair in (
+        _promote_f06_core_scripts_from_latest_legacy_conflict,
+        _refresh_active_versioned_runtime_snapshot,
+    ):
+        repair_changed, repair_message = repair(dest)
+        changed = changed or repair_changed
+        if repair_message:
+            messages.append(repair_message)
+    return changed, ";".join(messages) if messages else None
+
+
+# Whitelist of post-install hooks to invoke from the fresh tree. Each entry
+# is the function name inside ``auto_update.py`` of the freshly-copied
+# code. The subprocess resolves them on the NEW module and calls
+# ``fn(dest)`` returning ``(bool, str | None)``. New hooks added in
+# future releases only need an entry here — no extra wiring.
+_POST_INSTALL_FRESH_HOOKS = (
+    ("f06-post-update-repairs", "_run_f06_post_update_repairs"),
+    ("f06-core-scripts-promoted", "_promote_f06_core_scripts_from_latest_legacy_conflict"),
+    ("runtime-snapshot-refreshed", "_refresh_active_versioned_runtime_snapshot"),
+    ("guardian-hard-persisted", "_persist_guardian_hard_defaults"),
+    ("adaptive-weights-promoted", "_maybe_promote_adaptive_weights_empirically"),
+)
+
+
+def _run_post_install_hooks_fresh(dest: Path, *, env: dict | None = None) -> list[str]:
+    """Execute post-install hooks from the freshly-copied code, not the old
+    module already loaded in this process.
+
+    Without this, any function added to ``auto_update.py`` in the current
+    release never runs on the first ``nexo update`` — only on the next
+    one. See the post-v7.2.0 bug: ``_persist_guardian_hard_defaults`` and
+    ``_maybe_promote_adaptive_weights_empirically`` both shipped in
+    v7.2.0 but neither fired until the operator ran the functions
+    manually.
+
+    Resolution order for the fresh code root:
+        1. ``<dest>/core`` (packaged/F0.6 layout).
+        2. ``<dest>`` (legacy/dev layout).
+
+    Subprocess contract: emits a single JSON line on stdout with per-hook
+    ``{"action": ..., "ok": bool, "changed": bool, "message": str|null}``.
+    Returns a list of action strings mirroring the shape the old in-process
+    path used, so callers that read ``actions`` keep working unchanged.
+    """
+    code_root = dest / "core"
+    if not code_root.is_dir():
+        code_root = dest
+    hook_specs = list(_POST_INSTALL_FRESH_HOOKS)
+    hook_specs_json = json.dumps(hook_specs)
+    dest_str = str(dest)
+    script = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {repr(str(code_root))})\n"
+        "fallback_hooks = json.loads(" + repr(hook_specs_json) + ")\n"
+        f"dest = Path({repr(dest_str)})\n"
+        "results = []\n"
+        "try:\n"
+        "    import auto_update as fresh\n"
+        "except Exception as exc:\n"
+        "    print(json.dumps({'error': 'import_auto_update_failed', 'detail': repr(exc)}))\n"
+        "    sys.exit(0)\n"
+        "fresh_hooks = getattr(fresh, '_POST_INSTALL_FRESH_HOOKS', None)\n"
+        "if isinstance(fresh_hooks, (list, tuple)) and fresh_hooks:\n"
+        "    hooks = [(str(tag), str(fn)) for tag, fn in fresh_hooks]\n"
+        "else:\n"
+        "    hooks = fallback_hooks\n"
+        "for tag, fn_name in hooks:\n"
+        "    fn = getattr(fresh, fn_name, None)\n"
+        "    if fn is None:\n"
+        "        results.append({'action': tag, 'ok': False, 'changed': False, 'message': 'fn_missing:' + fn_name})\n"
+        "        continue\n"
+        "    try:\n"
+        "        changed, message = fn(dest)\n"
+        "        results.append({'action': tag, 'ok': True, 'changed': bool(changed), 'message': message})\n"
+        "    except Exception as exc:\n"
+        "        results.append({'action': tag, 'ok': False, 'changed': False, 'message': 'error:' + exc.__class__.__name__})\n"
+        "print(json.dumps({'hooks': results}))\n"
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env or os.environ.copy(),
+        )
+    except subprocess.TimeoutExpired:
+        return ["post-install-hooks-fresh-warning:timeout"]
+    except Exception as exc:
+        return [f"post-install-hooks-fresh-warning:{exc.__class__.__name__}"]
+
+    if proc.returncode != 0:
+        return [f"post-install-hooks-fresh-warning:exit-{proc.returncode}"]
+
+    stdout = (proc.stdout or "").strip()
+    payload = None
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+            break
+        except Exception:
+            continue
+    if not isinstance(payload, dict):
+        return ["post-install-hooks-fresh-warning:no-json-line"]
+    if "error" in payload:
+        return [f"post-install-hooks-fresh-warning:{payload['error']}"]
+
+    actions: list[str] = []
+    hooks_out = payload.get("hooks")
+    if not isinstance(hooks_out, list):
+        return ["post-install-hooks-fresh-warning:bad-shape"]
+    for entry in hooks_out:
+        if not isinstance(entry, dict):
+            continue
+        tag = str(entry.get("action") or "")
+        if entry.get("ok") and entry.get("changed"):
+            actions.append(tag)
+        message = entry.get("message")
+        if message:
+            actions.append(str(message))
+    return actions
+
+
+def _parse_runtime_init_payload(stdout: str) -> dict:
+    """Extract the JSON payload emitted by the runtime init helper."""
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    for line in reversed(lines):
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return {}
+
+
+def _personal_schedule_reconcile_summary(reconcile_result: dict) -> tuple[list[str], str | None]:
+    """Turn reconcile_personal_scripts() output into stable update actions."""
+    if not isinstance(reconcile_result, dict):
+        return [], None
+
+    actions: list[str] = []
+    parts: list[str] = []
+
+    renamed = reconcile_result.get("renamed_legacy_filenames", {})
+    if isinstance(renamed, dict):
+        renamed_count = len(renamed.get("renamed", []) or [])
+        if renamed_count:
+            actions.append(f"personal-script-filenames-renamed:{renamed_count}")
+            parts.append(f"{renamed_count} legacy personal filenames normalized")
+
+    retired = reconcile_result.get("retired_superseded_scripts", {})
+    if isinstance(retired, dict):
+        archived = len(retired.get("archived", []) or [])
+        if archived:
+            actions.append(f"personal-scripts-retired:{archived}")
+            parts.append(f"{archived} superseded personal scripts archived")
+
+    retired_skills = reconcile_result.get("retired_superseded_skills", {})
+    if isinstance(retired_skills, dict):
+        archived = len(retired_skills.get("archived", []) or [])
+        if archived:
+            actions.append(f"personal-skills-retired:{archived}")
+            parts.append(f"{archived} superseded personal skills archived")
+
+    ensured = reconcile_result.get("ensure_schedules", {})
+    if not isinstance(ensured, dict):
+        return actions, "Personal cleanup: " + ", ".join(parts) + "." if parts else None
+
+    created = len(ensured.get("created", []) or [])
+    repaired = len(ensured.get("repaired", []) or [])
+    invalid = len(ensured.get("invalid", []) or [])
+
+    if created or repaired:
+        actions.append(f"personal-schedules-healed:{created + repaired}")
+        parts.append(f"{created} created")
+        parts.append(f"{repaired} repaired")
+    if invalid:
+        actions.append(f"personal-schedules-invalid:{invalid}")
+        parts.append(f"{invalid} invalid")
+    if not parts:
+        return [], None
+    if any(part.endswith("archived") for part in parts):
+        return actions, "Personal cleanup: " + ", ".join(parts) + "."
+    return actions, "Personal schedules: " + ", ".join(parts) + "."
+
+
+def manual_sync_update(
+    *,
+    interactive: bool = False,
+    allow_source_pull: bool = True,
+    progress_fn=None,
+    include_clis: bool = True,
+) -> dict:
+    src_dir, repo_dir = _resolve_sync_source()
+    if src_dir is None or repo_dir is None:
+        return {"ok": False, "mode": "sync", "error": "No source repo recorded for this runtime."}
+
+    _emit_progress(progress_fn, "Checking recorded source repository...")
+    source_status = _source_repo_status(repo_dir)
+    pulled = False
+    old_head = source_status.get("local_head")
+    if allow_source_pull and source_status.get("is_git"):
+        if source_status.get("dirty"):
+            _log("Source repo has local changes; syncing local tree without remote pull.")
+        elif source_status.get("diverged"):
+            _log("Source repo diverged; syncing local tree without remote pull.")
+        elif source_status.get("behind"):
+            _emit_progress(progress_fn, "Pulling latest source changes...")
+            rc, _, pull_err = _git_in_repo(repo_dir, "pull", "--ff-only", timeout=60)
+            if rc != 0:
+                return {"ok": False, "mode": "sync", "error": pull_err or "git pull failed"}
+            pulled = True
+
+    _emit_progress(progress_fn, "Creating runtime backups...")
+    db_backup_dir, backup_report = _create_validated_db_backup()
+    if backup_report is not None and not backup_report["ok"]:
+        return {
+            "ok": False,
+            "mode": "sync",
+            "error": "DB backup validation failed before runtime sync.",
+            "backup_dir": db_backup_dir,
+        }
+    tree_backup_dir = _backup_runtime_tree(NEXO_HOME)
+    sync_result = {"ok": False, "mode": "sync", "pulled_source": pulled, "backup_dir": db_backup_dir, "tree_backup": tree_backup_dir}
+    try:
+        _emit_progress(progress_fn, "Syncing runtime files...")
+        copy_stats = _copy_runtime_from_source(src_dir, repo_dir, NEXO_HOME, progress_fn=progress_fn)
+        _emit_progress(progress_fn, "Reconciling runtime state...")
+        ok, actions = _run_runtime_post_sync(NEXO_HOME, progress_fn=progress_fn)
+        if not ok:
+            raise RuntimeError("; ".join(actions))
+        sync_result.update({
+            "ok": True,
+            "updated": True,
+            "packages": copy_stats["packages"],
+            "files": copy_stats["files"],
+            "scripts": copy_stats.get("scripts", 0),
+            "actions": actions,
+            "warnings": [],
+            "script_conflicts": copy_stats.get("script_conflicts", []),
+            "source": copy_stats["source"],
+            "repo": copy_stats["repo"],
+        })
+        if copy_stats.get("script_conflicts"):
+            sync_result["actions"].append(f"preserved-personal-scripts:{len(copy_stats['script_conflicts'])}")
+            sync_result["warnings"].append(
+                f"Preserved {len(copy_stats['script_conflicts'])} personal runtime script collision(s) in NEXO_HOME/personal/scripts"
+            )
+        # Update runtime dependencies (best-effort)
+        try:
+            from plugins.update import _update_runtime_dependencies, _format_dep_results
+            dep_results = _update_runtime_dependencies(progress_fn=progress_fn)
+            sync_result["runtime_dependencies"] = dep_results
+        except Exception:
+            pass  # Non-critical
+
+        # Auto-update external terminal CLIs (Claude Code, Codex). Best-effort:
+        # a failed third-party install never aborts the NEXO sync itself.
+        if include_clis:
+            try:
+                _emit_progress(progress_fn, "Checking external CLI updates...")
+                cli_results = _update_external_clis(progress_fn=progress_fn)
+                sync_result["external_clis"] = cli_results
+            except Exception as e:
+                sync_result.setdefault("warnings", []).append(
+                    f"external CLI update skipped: {e}"
+                )
+
+        _emit_progress(progress_fn, "Runtime update completed.")
+    except Exception as e:
+        _emit_progress(progress_fn, "Update failed; restoring previous runtime state...")
+        _restore_runtime_tree(tree_backup_dir, NEXO_HOME)
+        if db_backup_dir:
+            _restore_dbs(db_backup_dir)
+        _reinstall_runtime_pip_deps(NEXO_HOME)
+        if pulled and old_head:
+            _git_in_repo(repo_dir, "reset", "--hard", old_head, timeout=60)
+        sync_result.update({"error": str(e), "rolled_back": True})
+    _write_update_summary(sync_result)
+    return sync_result
+
+
+def startup_preflight(*, entrypoint: str, interactive: bool = False) -> dict:
+    result = {
+        "entrypoint": entrypoint,
+        "checked": False,
+        "updated": False,
+        "actions": [],
+        "skipped_reason": None,
+        "deferred_reason": None,
+        "git_update": None,
+        "npm_notice": None,
+        "claude_md_update": None,
+        "client_bootstrap_updates": [],
+        "migrations": [],
+        "power_policy": None,
+        "power_message": None,
+        "full_disk_access_status": None,
+        "full_disk_access_message": None,
+        "error": None,
+    }
+
+    from runtime_power import (
+        apply_power_policy,
+        ensure_power_policy_choice,
+        get_power_policy,
+        ensure_full_disk_access_choice,
+        get_full_disk_access_status,
+    )
+
+    choice = ensure_power_policy_choice(interactive=interactive, reason=entrypoint)
+    power_result = apply_power_policy(choice.get("policy"))
+    fda_choice = ensure_full_disk_access_choice(interactive=interactive, reason=entrypoint)
+    result["power_policy"] = choice.get("policy") or get_power_policy()
+    result["power_message"] = power_result.get("message")
+    result["full_disk_access_status"] = fda_choice.get("status") or get_full_disk_access_status()
+    result["full_disk_access_message"] = fda_choice.get("message")
+    if power_result.get("ok"):
+        result["actions"].append(f"power:{power_result.get('action')}")
+
+    src_dir, repo_dir = _resolve_sync_source()
+    if src_dir is not None and repo_dir is not None:
+        try:
+            from db import init_db
+            from script_registry import reconcile_personal_scripts
+
+            _run_db_migrations()
+            result["migrations"] = run_file_migrations()
+            bootstrap_messages = _sync_client_bootstraps()
+            result["client_bootstrap_updates"] = bootstrap_messages
+            result["claude_md_update"] = next((msg for msg in bootstrap_messages if msg.startswith("CLAUDE.md")), None)
+            _sync_watchdog_hash_registry()
+            _warn_protected_runtime_location()
+            _ensure_runtime_cli_wrapper()
+            _ensure_runtime_cli_in_shell()
+            init_db()
+            reconcile_result = reconcile_personal_scripts(dry_run=False)
+            result["actions"].append("db+personal-sync")
+            extra_actions, reconcile_message = _personal_schedule_reconcile_summary(reconcile_result)
+            result["actions"].extend(extra_actions)
+            if reconcile_message:
+                _log(reconcile_message)
+            # Self-heal: if the managed venv lost a critical importable module
+            # (e.g. pypdf -> PDFs indexed empty), reinstall it automatically. No
+            # user action, no prompt — the runtime repairs itself on startup.
+            try:
+                from doctor.providers.boot import check_managed_venv_modules
+
+                dep_check = check_managed_venv_modules(fix=True)
+                if getattr(dep_check, "fixed", False):
+                    result["actions"].append("venv-deps-repaired")
+                    _log(f"Managed venv dependencies repaired on startup: {dep_check.summary}")
+            except Exception as dep_exc:
+                _log(f"managed venv module check skipped: {dep_exc}")
+        except Exception as e:
+            result["error"] = str(e)
+            _write_update_summary(result)
+            return result
+
+        try:
+            env_auto_update = os.environ.get("NEXO_BRAIN_AUTO_UPDATE", "").strip().lower()
+            if env_auto_update in ("0", "false", "off", "no"):
+                result["skipped_reason"] = "auto_update disabled via NEXO_BRAIN_AUTO_UPDATE env var"
+                _write_update_summary(result)
+                return result
+            last_check = _read_last_check()
+            now = time.time()
+            schedule_file = _runtime_config_dir(NEXO_HOME) / "schedule.json"
+            schedule_data = json.loads(schedule_file.read_text()) if schedule_file.exists() else {}
+            if not schedule_data.get("auto_update", True):
+                result["skipped_reason"] = "auto_update disabled in schedule.json"
+                _write_update_summary(result)
+                return result
+            if now - float(last_check.get("timestamp", 0) or 0) < CHECK_COOLDOWN_SECONDS:
+                result["skipped_reason"] = "cooldown"
+                _write_update_summary(result)
+                return result
+            busy_reason = _runtime_busy_reason()
+            if busy_reason:
+                result["deferred_reason"] = busy_reason
+                _write_last_check({"timestamp": now, "mode": "sync", "deferred_reason": busy_reason})
+                _write_update_summary(result)
+                return result
+
+            source_status = _source_repo_status(repo_dir)
+            if source_status.get("dirty"):
+                result["deferred_reason"] = "source repo has local changes"
+            elif source_status.get("diverged"):
+                result["deferred_reason"] = "source repo diverged from upstream"
+            elif source_status.get("behind"):
+                result["checked"] = True
+                sync_result = manual_sync_update(interactive=False, allow_source_pull=True)
+                result["updated"] = bool(sync_result.get("ok") and sync_result.get("updated"))
+                result["actions"].extend(sync_result.get("actions", []))
+                if sync_result.get("error"):
+                    result["error"] = sync_result["error"]
+            else:
+                result["checked"] = True
+
+            _write_last_check({
+                "timestamp": now,
+                "mode": "sync",
+                "updated": result["updated"],
+                "deferred_reason": result["deferred_reason"],
+            })
+        except Exception as e:
+            result["error"] = f"sync startup preflight failed: {e}"
+        _write_update_summary(result)
+        return result
+
+    result = auto_update_check()
+    result["entrypoint"] = entrypoint
+    result["power_policy"] = choice.get("policy") or get_power_policy()
+    result["power_message"] = power_result.get("message")
+    result["full_disk_access_status"] = fda_choice.get("status") or get_full_disk_access_status()
+    result["full_disk_access_message"] = fda_choice.get("message")
+    if power_result.get("ok"):
+        actions = result.setdefault("actions", [])
+        actions.append(f"power:{power_result.get('action')}")
+    result["updated"] = bool(result.get("git_update"))
+    _write_update_summary(result)
+    return result

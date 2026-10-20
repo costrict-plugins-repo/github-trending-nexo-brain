@@ -1,0 +1,1061 @@
+#!/usr/bin/env python3
+"""Repository-scoped release readiness checks for NEXO.
+
+This is the public counterpart of the local release validator used in day-to-day
+operations. It keeps release discipline inside the repo instead of relying only
+on operator memory or external personal scripts.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+import paths as nexo_paths
+from tree_hygiene import find_duplicate_artifact_paths
+
+PACKAGE_JSON = ROOT / "package.json"
+CHANGELOG = ROOT / "CHANGELOG.md"
+DEFAULT_WEBSITE_ROOT = ROOT.parent / "nexo-gh-pages"
+DEFAULT_CONTRACTS_ROOT = ROOT / "release-contracts"
+DEFAULT_SMOKE_ROOT = DEFAULT_CONTRACTS_ROOT / "smoke"
+DEFAULT_NEXO_HOME_CANDIDATES = (
+    Path.home() / ".nexo",
+    Path.home() / "claude",
+)
+RUNTIME_MEMORY_GATE_ID = "runtime_memory_benchmark"
+RUNTIME_MEMORY_BENCHMARK_SUMMARY = ROOT / "benchmarks" / "runtime_pack" / "results" / "latest_summary.json"
+RUNTIME_MEMORY_REQUIRED_SPEC_REFS = tuple(f"{index:02d}" for index in range(1, 11))
+
+
+def _run(cmd: list[str], *, env: dict[str, str] | None = None) -> None:
+    print(f"[release-readiness] $ {' '.join(cmd)}")
+    result = subprocess.run(cmd, cwd=ROOT, env=env)
+    if result.returncode != 0:
+        raise SystemExit(result.returncode)
+
+
+def _package_manifest() -> dict:
+    payload = json.loads(PACKAGE_JSON.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise SystemExit("[release-readiness] package.json must contain a JSON object")
+    return payload
+
+
+def _package_version(payload: dict | None = None) -> str:
+    payload = payload or _package_manifest()
+    version = str(payload.get("version", "") or "").strip()
+    if not version:
+        raise SystemExit("[release-readiness] package.json missing version")
+    return version
+
+
+def _package_name(payload: dict | None = None) -> str:
+    payload = payload or _package_manifest()
+    name = str(payload.get("name", "") or "").strip()
+    if not name:
+        raise SystemExit("[release-readiness] package.json missing package name")
+    return name
+
+
+def _resolve_repository_slug(payload: dict | None = None) -> str:
+    payload = payload or _package_manifest()
+    repository = payload.get("repository")
+    if isinstance(repository, dict):
+        raw = str(repository.get("url", "") or "").strip()
+    else:
+        raw = str(repository or "").strip()
+    match = re.search(r"github\.com[:/](?P<slug>[^/]+/[^/.]+?)(?:\.git)?$", raw)
+    if not match:
+        raise SystemExit(f"[release-readiness] cannot resolve GitHub repository slug from {raw!r}")
+    return match.group("slug")
+
+
+def _fetch_json(url: str, *, label: str) -> dict:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "nexo-release-readiness",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise SystemExit(f"[release-readiness] {label} HTTP {exc.code}: {url}") from exc
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"[release-readiness] {label} request failed: {exc.reason}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit(f"[release-readiness] {label} must return a JSON object")
+    return payload
+
+
+def _resolve_nexo_home(explicit_home: str = "") -> Path:
+    candidates = []
+    if explicit_home.strip():
+        candidates.append(Path(explicit_home).expanduser())
+    env_home = os.environ.get("NEXO_HOME", "").strip()
+    if env_home:
+        candidates.append(Path(env_home).expanduser())
+    candidates.extend(DEFAULT_NEXO_HOME_CANDIDATES)
+
+    best = candidates[0] if candidates else Path.home() / ".nexo"
+    best_score = -1
+    for candidate in candidates:
+        score = 0
+        if (candidate / "data" / "nexo.db").is_file():
+            score += 2
+        if (candidate / "operations" / "tool-logs").is_dir():
+            score += 1
+        if score > best_score:
+            best = candidate
+            best_score = score
+    return best
+
+
+def _check_changelog(version: str) -> None:
+    text = CHANGELOG.read_text(encoding="utf-8")
+    match = re.search(r"^## \[([^\]]+)\]", text, flags=re.MULTILINE)
+    if not match:
+        raise SystemExit("[release-readiness] CHANGELOG.md missing release headings")
+    top_version = match.group(1).strip()
+    if top_version != version:
+        raise SystemExit(
+            f"[release-readiness] top changelog version {top_version} != package.json {version}"
+        )
+    print(f"[release-readiness] changelog OK ({version})")
+
+
+def _check_duplicate_artifacts(repo_root: Path = ROOT) -> None:
+    duplicates = find_duplicate_artifact_paths(repo_root)
+    if duplicates:
+        rendered = "\n- ".join(str(path.relative_to(repo_root)) for path in duplicates)
+        raise SystemExit("[release-readiness] duplicate artifacts found:\n- " + rendered)
+    print(f"[release-readiness] duplicate artifact hygiene OK ({repo_root})")
+
+
+def _surface_version_markers(version: str) -> list[tuple[str, list[str]]]:
+    version_slug = version.replace(".", "-")
+    version_anchor = version.replace(".", "")
+    return [
+        ("README.md", [f"Version `{version}` is the current packaged-runtime line"]),
+        ("llms.txt", [f"(v{version}).", f"v{version}:"]),
+        (
+            "index.html",
+            [
+                f'id="version-badge">v{version}<',
+                f'"softwareVersion": "{version}"',
+                f'href="/changelog/#v{version_anchor}"',
+            ],
+        ),
+        (
+            "blog/index.html",
+            [
+                f"/blog/nexo-{version_slug}/",
+                f"NEXO {version}:",
+                f'href="/changelog/#v{version_anchor}"',
+            ],
+        ),
+        (
+            "changelog/index.html",
+            [f'id="v{version_anchor}"', f"New in v{version}", f"Start with v{version}"],
+        ),
+        (
+            "sitemap.xml",
+            ["<loc>https://nexo-desktop.com/</loc>", "<loc>https://nexo-desktop.com/downloads/</loc>"],
+        ),
+    ]
+
+
+def _required_public_routes() -> list[str]:
+    return [
+        "features/index.html",
+        "evolution/index.html",
+        "compare/index.html",
+        "blog/index.html",
+        "changelog/index.html",
+        "docs/index.html",
+        "demos/index.html",
+        "solutions/index.html",
+        "watch/index.html",
+    ]
+
+
+def _check_public_surfaces(
+    version: str,
+    root: Path,
+    *,
+    label: str,
+    include_readme: bool,
+    include_well_known: bool,
+) -> None:
+    missing = []
+    for raw_path, markers in _surface_version_markers(version):
+        if raw_path == "README.md" and not include_readme:
+            continue
+        path = root / raw_path
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for marker in markers:
+            if marker not in text:
+                missing.append(f"{path} missing {marker}")
+                break
+
+    if include_well_known:
+        well_known = root / ".well-known" / "llms.txt"
+        if not well_known.is_file():
+            missing.append(f"{well_known} missing file")
+        else:
+            text = well_known.read_text(encoding="utf-8")
+            for marker in (f"(v{version}).", f"v{version}:"):
+                if marker not in text:
+                    missing.append(f"{well_known} missing {marker}")
+                    break
+
+    for raw_path in _required_public_routes():
+        path = root / raw_path
+        if not path.is_file():
+            missing.append(f"{path} missing file")
+
+    if missing:
+        raise SystemExit(f"[release-readiness] {label} drift:\n- " + "\n- ".join(missing))
+    print(f"[release-readiness] {label} OK ({root})")
+
+
+def _check_website(version: str, website_root: Path) -> None:
+    if not website_root.is_dir():
+        print(f"[release-readiness] website skipped (missing {website_root})")
+        return
+    _check_public_surfaces(
+        version,
+        website_root,
+        label="website",
+        include_readme=False,
+        include_well_known=True,
+    )
+    _check_version_blog_post(version, website_root)
+
+
+def _check_version_blog_post(version: str, website_root: Path) -> None:
+    """Fail-hard guard: the per-version blog post directory must exist in main before tag.
+
+    Prior failure mode: v7.9.0 merged with the aggregator linking /blog/nexo-7-9-0/
+    but the actual blog/nexo-7-9-0/index.html was missing (patched afterwards in PR #278).
+    Checking aggregator markers is not enough — the target file must really exist.
+    """
+    version_slug = version.replace(".", "-")
+    blog_post = website_root / "blog" / f"nexo-{version_slug}" / "index.html"
+    if not blog_post.is_file():
+        raise SystemExit(
+            f"[release-readiness] per-version blog post missing: {blog_post}. "
+            f"Create blog/nexo-{version_slug}/index.html in the website tree and merge it "
+            "into main before tagging."
+        )
+    print(f"[release-readiness] per-version blog post OK ({blog_post})")
+
+
+def _check_repo_public_surfaces(version: str, repo_root: Path = ROOT) -> None:
+    _check_public_surfaces(
+        version,
+        repo_root,
+        label="repo public surfaces",
+        include_readme=True,
+        include_well_known=False,
+    )
+
+
+def _parse_iso_timestamp(label: str, raw: str) -> datetime:
+    text = str(raw or "").strip()
+    if not text:
+        raise SystemExit(f"[release-readiness] {label} missing timestamp")
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise SystemExit(f"[release-readiness] invalid {label} timestamp {raw!r}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _load_smoke_artifact(version: str, *, smoke_root: Path = DEFAULT_SMOKE_ROOT) -> tuple[Path, dict]:
+    path = smoke_root / f"v{version}.json"
+    if not path.is_file():
+        raise SystemExit(f"[release-readiness] smoke artifact missing: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"[release-readiness] invalid smoke artifact JSON {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit(f"[release-readiness] smoke artifact must be a JSON object: {path}")
+    return path, payload
+
+
+def _check_smoke_artifact(
+    version: str,
+    *,
+    contract: dict | None = None,
+    smoke_root: Path = DEFAULT_SMOKE_ROOT,
+) -> None:
+    path, payload = _load_smoke_artifact(version, smoke_root=smoke_root)
+    artifact_version = str(payload.get("version", "") or "").strip()
+    if artifact_version != version:
+        raise SystemExit(
+            f"[release-readiness] smoke artifact version {artifact_version!r} != package.json {version}"
+        )
+    if not bool(payload.get("ok")):
+        raise SystemExit(f"[release-readiness] smoke artifact reports failure: {path}")
+
+    groups = payload.get("groups")
+    if not isinstance(groups, list) or not groups:
+        raise SystemExit(f"[release-readiness] smoke artifact has no groups: {path}")
+
+    failed_groups: list[str] = []
+    functional_groups = 0
+    group_map: dict[str, dict] = {}
+    for index, group in enumerate(groups, start=1):
+        if not isinstance(group, dict):
+            raise SystemExit(f"[release-readiness] smoke group #{index} is not an object")
+        group_id = str(group.get("id", "") or "").strip() or f"group-{index}"
+        group_map[group_id] = group
+        command = group.get("command")
+        if isinstance(command, list) and command:
+            functional_groups += 1
+        if not bool(group.get("ok")) or int(group.get("returncode") or 0) != 0:
+            failed_groups.append(group_id)
+    if functional_groups <= 0:
+        raise SystemExit(f"[release-readiness] smoke artifact does not contain a functional command trace: {path}")
+    if failed_groups:
+        raise SystemExit("[release-readiness] smoke artifact has failing groups:\n- " + "\n- ".join(failed_groups))
+
+    smoke_contract = contract.get("smoke") if isinstance(contract, dict) else None
+    if smoke_contract is not None and not isinstance(smoke_contract, dict):
+        raise SystemExit("[release-readiness] contract smoke section must be an object")
+    required_groups = smoke_contract.get("required_groups") if isinstance(smoke_contract, dict) else None
+    if required_groups is not None:
+        if not isinstance(required_groups, list) or not all(isinstance(item, str) and item.strip() for item in required_groups):
+            raise SystemExit("[release-readiness] contract smoke.required_groups must be a list of non-empty strings")
+        missing_groups = [item for item in required_groups if item not in group_map]
+        if missing_groups:
+            raise SystemExit("[release-readiness] required smoke groups missing:\n- " + "\n- ".join(missing_groups))
+    max_age_hours = smoke_contract.get("max_age_hours") if isinstance(smoke_contract, dict) else None
+    if max_age_hours is not None:
+        try:
+            max_age_hours = float(max_age_hours)
+        except (TypeError, ValueError) as exc:
+            raise SystemExit("[release-readiness] contract smoke.max_age_hours must be numeric") from exc
+        generated_at = _parse_iso_timestamp("smoke.generated_at", str(payload.get("generated_at", "") or ""))
+        age_hours = (datetime.now(timezone.utc) - generated_at).total_seconds() / 3600.0
+        if age_hours > max_age_hours:
+            raise SystemExit(
+                f"[release-readiness] smoke artifact is stale ({age_hours:.1f}h > {max_age_hours:.1f}h): {path}"
+            )
+
+    print(f"[release-readiness] smoke artifact OK ({path}, groups={len(groups)})")
+
+
+def _check_github_release(version: str, repository_slug: str) -> None:
+    payload = _fetch_json(
+        f"https://api.github.com/repos/{repository_slug}/releases/tags/v{version}",
+        label="github release",
+    )
+    tag_name = str(payload.get("tag_name", "") or "").strip()
+    if tag_name != f"v{version}":
+        raise SystemExit(
+            f"[release-readiness] GitHub release tag {tag_name!r} != expected v{version}"
+        )
+    html_url = str(payload.get("html_url", "") or "").strip()
+    if not html_url:
+        raise SystemExit("[release-readiness] GitHub release missing html_url")
+    print(f"[release-readiness] github release OK ({html_url})")
+
+
+def _check_npm_package(version: str, package_name: str) -> None:
+    encoded_name = urllib.parse.quote(package_name, safe="@/")
+    payload = _fetch_json(
+        f"https://registry.npmjs.org/{encoded_name}/latest",
+        label="npm registry",
+    )
+    live_version = str(payload.get("version", "") or "").strip()
+    if live_version != version:
+        raise SystemExit(
+            f"[release-readiness] npm latest version {live_version!r} != package.json {version}"
+        )
+    print(f"[release-readiness] npm registry OK ({package_name}@{live_version})")
+
+
+def _load_contract(contract_path: Path) -> dict:
+    if not contract_path.is_file():
+        raise SystemExit(f"[release-readiness] contract missing: {contract_path}")
+    try:
+        payload = json.loads(contract_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"[release-readiness] invalid contract JSON {contract_path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit(f"[release-readiness] contract must be a JSON object: {contract_path}")
+    return payload
+
+
+def _normalize_contract_paths(values: list[str], *, root: Path) -> list[Path]:
+    paths = []
+    for raw in values:
+        if not isinstance(raw, str) or not raw.strip():
+            raise SystemExit("[release-readiness] contract paths must be non-empty strings")
+        path = (root / raw).resolve()
+        if not str(path).startswith(str(root.resolve())):
+            raise SystemExit(f"[release-readiness] contract path escapes repo root: {raw}")
+        paths.append(path)
+    return paths
+
+
+def _resolve_surface_path(
+    raw: str,
+    *,
+    repo_root: Path,
+    website_root: Path,
+    nexo_home: Path,
+) -> Path:
+    try:
+        rendered = raw.format(
+            repo_root=str(repo_root),
+            website_root=str(website_root),
+            nexo_home=str(nexo_home),
+            home=str(Path.home()),
+        )
+    except KeyError as exc:
+        raise SystemExit(f"[release-readiness] unknown placeholder in critical surface path {raw!r}: {exc}") from exc
+    expanded = os.path.expandvars(rendered)
+    candidate = Path(expanded).expanduser()
+    if not candidate.is_absolute():
+        candidate = (repo_root / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    return candidate
+
+
+def _check_critical_surfaces(
+    contract: dict,
+    *,
+    repo_root: Path,
+    website_root: Path,
+    nexo_home: Path,
+) -> None:
+    surfaces = contract.get("critical_surfaces")
+    if surfaces is None:
+        return
+    if not isinstance(surfaces, list):
+        raise SystemExit("[release-readiness] contract critical_surfaces must be a list")
+
+    checked = 0
+    failures: list[str] = []
+    for index, surface in enumerate(surfaces, start=1):
+        if not isinstance(surface, dict):
+            raise SystemExit("[release-readiness] contract critical_surfaces entries must be objects")
+        label = str(surface.get("label", "") or surface.get("id", "") or f"surface-{index}").strip()
+        raw_path = str(surface.get("path", "") or "").strip()
+        if not raw_path:
+            raise SystemExit(f"[release-readiness] critical surface {label!r} missing path")
+        kind = str(surface.get("kind", "file") or "file").strip().lower()
+        if kind not in {"file", "dir"}:
+            raise SystemExit(f"[release-readiness] critical surface {label!r} has invalid kind {kind!r}")
+        must_exist = surface.get("must_exist", True)
+        if not isinstance(must_exist, bool):
+            raise SystemExit(f"[release-readiness] critical surface {label!r} must_exist must be boolean")
+        markers = surface.get("markers") or []
+        if not isinstance(markers, list) or not all(isinstance(item, str) and item.strip() for item in markers):
+            raise SystemExit(f"[release-readiness] critical surface {label!r} markers must be a list of non-empty strings")
+
+        target = _resolve_surface_path(raw_path, repo_root=repo_root, website_root=website_root, nexo_home=nexo_home)
+        checked += 1
+        if not target.exists():
+            if must_exist:
+                failures.append(f"{label}: missing {target}")
+            continue
+        if kind == "file":
+            if not target.is_file():
+                failures.append(f"{label}: expected file at {target}")
+                continue
+            if markers:
+                text = target.read_text(encoding="utf-8")
+                for marker in markers:
+                    if marker not in text:
+                        failures.append(f"{label}: {target} missing marker {marker!r}")
+                        break
+        else:
+            if not target.is_dir():
+                failures.append(f"{label}: expected directory at {target}")
+                continue
+            for marker in markers:
+                if not (target / marker).exists():
+                    failures.append(f"{label}: {target} missing required entry {marker}")
+                    break
+
+    if failures:
+        raise SystemExit("[release-readiness] critical installed surfaces failed:\n- " + "\n- ".join(failures))
+    print(f"[release-readiness] critical installed surfaces OK ({checked})")
+
+
+def _check_required_skills(
+    contract: dict,
+    *,
+    nexo_home: Path,
+    repo_root: Path = ROOT,
+) -> None:
+    """Block release if SK-AUDIT-* skills declared in the contract did not actually run.
+
+    Accepts both an explicit `required_skills` list and bare `SK-AUDIT-*`/`SK-RUN-*-AUDIT`
+    mentions inside gate evidence strings, so operators cannot claim "we ran the audit"
+    with a grep while the skill_usage audit log proves otherwise.
+    """
+    declared: dict[str, dict] = {}
+
+    raw_required = contract.get("required_skills")
+    if raw_required is not None:
+        if not isinstance(raw_required, list) or not raw_required:
+            raise SystemExit("[release-readiness] contract required_skills must be a non-empty list when present")
+        for index, entry in enumerate(raw_required, start=1):
+            if not isinstance(entry, dict):
+                raise SystemExit(f"[release-readiness] required_skills entry #{index} must be an object")
+            skill_id = str(entry.get("id", "") or "").strip()
+            if not skill_id:
+                raise SystemExit(f"[release-readiness] required_skills entry #{index} missing id")
+            min_success_raw = entry.get("min_success", 1)
+            try:
+                min_success = int(min_success_raw)
+            except (TypeError, ValueError) as exc:
+                raise SystemExit(
+                    f"[release-readiness] required_skills[{skill_id}] min_success must be integer"
+                ) from exc
+            if min_success < 1:
+                raise SystemExit(f"[release-readiness] required_skills[{skill_id}] min_success must be >= 1")
+            max_age_raw = entry.get("max_age_hours", 168)
+            try:
+                max_age_hours = float(max_age_raw)
+            except (TypeError, ValueError) as exc:
+                raise SystemExit(
+                    f"[release-readiness] required_skills[{skill_id}] max_age_hours must be numeric"
+                ) from exc
+            if max_age_hours <= 0:
+                raise SystemExit(f"[release-readiness] required_skills[{skill_id}] max_age_hours must be > 0")
+            declared[skill_id] = {"min_success": min_success, "max_age_hours": max_age_hours}
+
+    implicit_pattern = re.compile(r"\bSK-[A-Z0-9-]*AUDIT[A-Z0-9-]*\b")
+
+    def _collect_text(value) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "\n".join(_collect_text(item) for item in value)
+        if isinstance(value, dict):
+            return "\n".join(_collect_text(item) for item in value.values())
+        return ""
+
+    implicit_sources: list[str] = []
+    for key in ("gates", "critical_surfaces", "publication", "description", "notes"):
+        if key in contract:
+            implicit_sources.append(_collect_text(contract.get(key)))
+    implicit_ids = {
+        match.strip()
+        for chunk in implicit_sources
+        for match in implicit_pattern.findall(chunk)
+        if match.strip()
+    }
+    drift = sorted(skill_id for skill_id in implicit_ids if skill_id not in declared)
+    if drift:
+        raise SystemExit(
+            "[release-readiness] contract mentions SK-AUDIT-* skills but they are missing from required_skills:\n- "
+            + "\n- ".join(drift)
+            + "\n  Declare each one in required_skills (id + min_success + max_age_hours) so the audit log gate can enforce real execution."
+        )
+
+    if not declared:
+        return
+
+    db_path = nexo_home / "data" / "nexo.db"
+    if not db_path.is_file():
+        raise SystemExit(
+            f"[release-readiness] cannot verify required_skills: runtime DB missing at {db_path}. "
+            "Set NEXO_HOME or --nexo-home to the live install before re-running."
+        )
+
+    failures: list[str] = []
+    checked = 0
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        try:
+            skill_rows = {
+                str(row["id"]): row
+                for row in conn.execute("SELECT id, name, level FROM skills WHERE id IN (%s)"
+                    % ",".join("?" * len(declared)), tuple(declared.keys())).fetchall()
+            }
+        except sqlite3.OperationalError as exc:
+            raise SystemExit(f"[release-readiness] cannot read skills table: {exc}") from exc
+
+        for skill_id, rules in declared.items():
+            checked += 1
+            if skill_id not in skill_rows:
+                failures.append(f"{skill_id}: not registered in skills table (typo or stale contract)")
+                continue
+            try:
+                usage_rows = conn.execute(
+                    """
+                    SELECT created_at, success, session_id, context
+                    FROM skill_usage
+                    WHERE skill_id = ? AND success = 1
+                    ORDER BY created_at DESC
+                    LIMIT 25
+                    """,
+                    (skill_id,),
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                raise SystemExit(f"[release-readiness] cannot read skill_usage for {skill_id}: {exc}") from exc
+
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=rules["max_age_hours"])
+            fresh: list[sqlite3.Row] = []
+            for row in usage_rows:
+                raw_ts = str(row["created_at"] or "").strip()
+                if not raw_ts:
+                    continue
+                try:
+                    when = _parse_iso_timestamp(f"skill_usage[{skill_id}].created_at", raw_ts)
+                except SystemExit:
+                    candidate = raw_ts
+                    if " " in candidate and "T" not in candidate:
+                        candidate = candidate.replace(" ", "T")
+                    if not candidate.endswith("Z") and "+" not in candidate[10:]:
+                        candidate += "Z"
+                    try:
+                        when = _parse_iso_timestamp(f"skill_usage[{skill_id}].created_at", candidate)
+                    except SystemExit:
+                        continue
+                if when >= cutoff:
+                    fresh.append(row)
+
+            if len(fresh) < rules["min_success"]:
+                most_recent = str(usage_rows[0]["created_at"]) if usage_rows else "never"
+                failures.append(
+                    f"{skill_id}: only {len(fresh)} successful run(s) in the last {rules['max_age_hours']:.0f}h "
+                    f"(need {rules['min_success']}, most recent overall: {most_recent}). "
+                    f"Run the skill or supersede the contract."
+                )
+
+    finally:
+        conn.close()
+
+    if failures:
+        raise SystemExit(
+            "[release-readiness] declared audit skills never ran (skill_usage gate):\n- "
+            + "\n- ".join(failures)
+        )
+    print(f"[release-readiness] required skills OK ({checked} audit skill(s) verified against skill_usage)")
+
+
+def _check_publication_state(contract: dict, *, require_complete: bool) -> None:
+    publication = contract.get("publication")
+    if publication is None:
+        return
+    if not isinstance(publication, dict):
+        raise SystemExit("[release-readiness] contract publication must be an object")
+
+    status = str(publication.get("status", "") or "").strip().lower()
+    allowed_statuses = {"ready", "blocked", "draft", "in_progress"}
+    if status and status not in allowed_statuses:
+        raise SystemExit(f"[release-readiness] invalid publication status {status!r}")
+
+    checklist_complete = publication.get("checklist_complete", None)
+    if checklist_complete is not None and not isinstance(checklist_complete, bool):
+        raise SystemExit("[release-readiness] publication checklist_complete must be boolean")
+
+    blockers = publication.get("blockers") or []
+    if not isinstance(blockers, list):
+        raise SystemExit("[release-readiness] publication blockers must be a list")
+    open_blockers: list[str] = []
+    for index, blocker in enumerate(blockers, start=1):
+        if not isinstance(blocker, dict):
+            raise SystemExit("[release-readiness] publication blockers must be objects")
+        title = str(blocker.get("title", "") or blocker.get("id", "") or f"blocker-{index}").strip()
+        severity = str(blocker.get("severity", "") or "medium").strip().lower()
+        blocker_status = str(blocker.get("status", "") or "open").strip().lower()
+        if severity not in {"low", "medium", "high", "critical"}:
+            raise SystemExit(f"[release-readiness] publication blocker {title!r} has invalid severity {severity!r}")
+        if severity in {"high", "critical"} and blocker_status not in {"resolved", "closed", "done"}:
+            open_blockers.append(f"{title} ({severity}, {blocker_status})")
+    if open_blockers:
+        raise SystemExit("[release-readiness] publication blocked by open high-severity blockers:\n- " + "\n- ".join(open_blockers))
+    if require_complete and checklist_complete is False:
+        raise SystemExit("[release-readiness] publication checklist is incomplete")
+    if require_complete and status and status != "ready":
+        raise SystemExit(f"[release-readiness] publication status is not ready: {status}")
+
+    print(
+        "[release-readiness] publication state OK "
+        f"(status={status or 'unspecified'}, checklist_complete={checklist_complete if checklist_complete is not None else 'unspecified'})"
+    )
+
+
+def _check_literal_conditions_matrix(contract: dict, *, require_complete: bool) -> int:
+    conditions = contract.get("literal_conditions")
+    if not isinstance(conditions, list) or not conditions:
+        raise SystemExit("[release-readiness] contract missing literal_conditions matrix")
+
+    failures: list[str] = []
+    allowed_statuses = {"pending", "in_progress", "verified"}
+    for index, item in enumerate(conditions, start=1):
+        if not isinstance(item, dict):
+            raise SystemExit("[release-readiness] literal_conditions entries must be objects")
+        condition_id = str(item.get("id", "") or f"condition-{index}").strip()
+        literal_text = str(item.get("literal_text", "") or item.get("condition", "") or "").strip()
+        status = str(item.get("status", "") or "").strip().lower()
+        live_evidence = item.get("live_evidence")
+
+        if not literal_text:
+            failures.append(f"{condition_id}: missing literal_text")
+        if status not in allowed_statuses:
+            failures.append(f"{condition_id}: invalid status {status!r}")
+        if not isinstance(live_evidence, list) or not all(isinstance(entry, str) and entry.strip() for entry in live_evidence):
+            failures.append(f"{condition_id}: missing live_evidence list")
+        if require_complete and status != "verified":
+            failures.append(f"{condition_id}: status {status or 'missing'} is not verified")
+
+    if failures:
+        raise SystemExit("[release-readiness] literal conditions matrix failed:\n- " + "\n- ".join(failures))
+    print(f"[release-readiness] literal conditions OK ({len(conditions)})")
+    return len(conditions)
+
+
+def _check_runtime_memory_benchmark_gate(repo_root: Path = ROOT) -> None:
+    summary_path = repo_root / RUNTIME_MEMORY_BENCHMARK_SUMMARY.relative_to(ROOT)
+    if not summary_path.is_file():
+        raise SystemExit(f"[release-readiness] runtime memory benchmark summary missing: {summary_path}")
+
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"[release-readiness] invalid runtime memory benchmark JSON: {exc}") from exc
+    if not isinstance(summary, dict):
+        raise SystemExit("[release-readiness] runtime memory benchmark summary must be a JSON object")
+
+    release_gate = summary.get("release_gate")
+    case_summary = summary.get("case_summary")
+    if not isinstance(release_gate, dict):
+        raise SystemExit("[release-readiness] runtime memory benchmark summary missing release_gate")
+    if not isinstance(case_summary, dict):
+        raise SystemExit("[release-readiness] runtime memory benchmark summary missing case_summary")
+
+    gate_id = str(release_gate.get("id", "") or "").strip()
+    mode = str(release_gate.get("mode", "") or "").strip().lower()
+    status = str(release_gate.get("status", "") or "").strip().lower()
+    if gate_id != RUNTIME_MEMORY_GATE_ID:
+        raise SystemExit(f"[release-readiness] runtime memory benchmark gate id mismatch: {gate_id!r}")
+    if mode != "block":
+        raise SystemExit(f"[release-readiness] runtime memory benchmark must run in block mode for release, found {mode!r}")
+    if status != "pass":
+        raise SystemExit(f"[release-readiness] runtime memory benchmark did not pass: {status or 'missing'}")
+
+    covered = {str(ref).strip() for ref in release_gate.get("covered_spec_refs") or [] if str(ref).strip()}
+    missing = {str(ref).strip() for ref in release_gate.get("missing_spec_refs") or [] if str(ref).strip()}
+    missing.update(str(ref).strip() for ref in case_summary.get("missing_spec_refs") or [] if str(ref).strip())
+    missing.update(ref for ref in RUNTIME_MEMORY_REQUIRED_SPEC_REFS if ref not in covered)
+    if missing:
+        raise SystemExit("[release-readiness] runtime memory benchmark missing spec coverage:\n- " + "\n- ".join(sorted(missing)))
+
+    failures = list(release_gate.get("failures") or []) + list(case_summary.get("failures") or [])
+    if failures:
+        raise SystemExit("[release-readiness] runtime memory benchmark has failures:\n- " + "\n- ".join(map(str, failures)))
+
+    print(
+        "[release-readiness] runtime memory benchmark OK "
+        f"(cases={case_summary.get('case_count', 'unknown')}, summary={summary_path.relative_to(repo_root)})"
+    )
+
+
+def _check_contract(
+    contract: dict,
+    *,
+    contract_path: Path,
+    website_root: Path,
+    nexo_home: Path,
+    require_complete: bool,
+    repo_root: Path = ROOT,
+) -> None:
+    release_line = str(contract.get("release_line", "") or "").strip()
+    target_version = str(contract.get("target_version", "") or "").strip()
+    distribution = contract.get("distribution")
+    repo_files = contract.get("required_repo_files")
+    website_files = contract.get("required_website_files")
+    gates = contract.get("gates")
+
+    if not release_line:
+        raise SystemExit(f"[release-readiness] contract missing release_line: {contract_path}")
+    if not target_version:
+        raise SystemExit(f"[release-readiness] contract missing target_version: {contract_path}")
+    if not isinstance(distribution, dict):
+        raise SystemExit(f"[release-readiness] contract missing distribution map: {contract_path}")
+    if distribution.get("git_updates_on") != "merge_to_main":
+        raise SystemExit("[release-readiness] contract must declare git_updates_on=merge_to_main")
+    if distribution.get("packaged_release_on") != "tag_publish":
+        raise SystemExit("[release-readiness] contract must declare packaged_release_on=tag_publish")
+    if not isinstance(repo_files, list) or not repo_files:
+        raise SystemExit(f"[release-readiness] contract missing required_repo_files: {contract_path}")
+    if not isinstance(website_files, list) or not website_files:
+        raise SystemExit(f"[release-readiness] contract missing required_website_files: {contract_path}")
+    if not isinstance(gates, list) or not gates:
+        raise SystemExit(f"[release-readiness] contract missing gates: {contract_path}")
+    literal_condition_count = _check_literal_conditions_matrix(contract, require_complete=require_complete)
+
+    missing_repo = [
+        str(path.relative_to(repo_root))
+        for path in _normalize_contract_paths(repo_files, root=repo_root)
+        if not path.exists()
+    ]
+    if missing_repo:
+        raise SystemExit("[release-readiness] contract repo artifacts missing:\n- " + "\n- ".join(missing_repo))
+
+    if website_root.is_dir():
+        missing_web = [raw for raw in website_files if not (website_root / raw).is_file()]
+        if missing_web:
+            raise SystemExit("[release-readiness] contract website artifacts missing:\n- " + "\n- ".join(missing_web))
+
+    allowed_statuses = {"pending", "in_progress", "complete"}
+    incomplete = []
+    for gate in gates:
+        if not isinstance(gate, dict):
+            raise SystemExit("[release-readiness] contract gates must be objects")
+        gate_id = str(gate.get("id", "") or "").strip()
+        title = str(gate.get("title", "") or "").strip()
+        status = str(gate.get("status", "") or "").strip()
+        evidence_required = gate.get("evidence_required")
+        if not gate_id or not title:
+            raise SystemExit("[release-readiness] every contract gate needs id and title")
+        if status not in allowed_statuses:
+            raise SystemExit(f"[release-readiness] gate {gate_id} has invalid status {status!r}")
+        if not isinstance(evidence_required, list) or not evidence_required:
+            raise SystemExit(f"[release-readiness] gate {gate_id} missing evidence_required list")
+        if gate_id == RUNTIME_MEMORY_GATE_ID:
+            _check_runtime_memory_benchmark_gate(repo_root=repo_root)
+        if require_complete and status != "complete":
+            incomplete.append(f"{gate_id} ({status})")
+
+    if require_complete and incomplete:
+        raise SystemExit("[release-readiness] contract has incomplete gates:\n- " + "\n- ".join(incomplete))
+
+    _check_critical_surfaces(
+        contract,
+        repo_root=repo_root,
+        website_root=website_root,
+        nexo_home=nexo_home,
+    )
+    _check_required_skills(contract, nexo_home=nexo_home, repo_root=repo_root)
+    _check_publication_state(contract, require_complete=require_complete)
+
+    print(
+        f"[release-readiness] contract OK "
+        f"({contract_path}, release_line={release_line}, target_version={target_version}, "
+        f"gates={len(gates)}, literal_conditions={literal_condition_count})"
+    )
+
+
+def _run_runtime_doctor(nexo_home: Path) -> None:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "src"
+    env["NEXO_CODE"] = str(ROOT)
+    env["NEXO_HOME"] = str(nexo_home)
+    print(f"[release-readiness] runtime doctor home: {nexo_home}")
+    _run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from doctor.orchestrator import run_doctor; "
+                "report = run_doctor(tier='runtime', fix=False, plane='installation_live'); "
+                "import sys; "
+                "bad = [c for c in report.checks if c.status in ('degraded','critical')]; "
+                "blocking = [c for c in report.checks if c.status == 'critical' and getattr(c, 'category', 'installed_product') == 'installed_product']; "
+                "print(f'runtime doctor: {report.overall_status} ({len(bad)} issues, {len(blocking)} blocking)'); "
+                "sys.exit(1 if blocking else 0)"
+            ),
+        ],
+        env=env,
+    )
+
+
+def _run_runtime_update(nexo_home: Path) -> None:
+    node_bin = shutil.which("node")
+    if not node_bin:
+        raise SystemExit("[release-readiness] node is required to run `nexo update`")
+    env = os.environ.copy()
+    env["NEXO_HOME"] = str(nexo_home)
+    env["NEXO_CODE"] = str(ROOT / "src")
+    print(f"[release-readiness] runtime update home: {nexo_home}")
+    _run([node_bin, str(ROOT / "bin" / "nexo.js"), "update"], env=env)
+
+
+def _check_protocol_closeout(nexo_home: Path, task_id: str) -> None:
+    old_home = os.environ.get("NEXO_HOME")
+    os.environ["NEXO_HOME"] = str(nexo_home)
+    try:
+        db_path = nexo_paths.db_path()
+    finally:
+        if old_home is None:
+            os.environ.pop("NEXO_HOME", None)
+        else:
+            os.environ["NEXO_HOME"] = old_home
+    if not db_path.is_file():
+        raise SystemExit(f"[release-readiness] runtime DB missing for protocol closeout: {db_path}")
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        task = conn.execute(
+            """
+            SELECT task_id, status, must_verify, close_evidence, must_change_log, change_log_id
+            FROM protocol_tasks
+            WHERE task_id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        if task is None:
+            raise SystemExit(f"[release-readiness] protocol task not found: {task_id}")
+        if str(task["status"] or "").strip() != "done":
+            raise SystemExit(
+                f"[release-readiness] protocol task {task_id} must be closed as 'done', found {task['status']!r}"
+            )
+        if int(task["must_verify"] or 0) and not str(task["close_evidence"] or "").strip():
+            raise SystemExit(
+                f"[release-readiness] protocol task {task_id} is missing close_evidence"
+            )
+        change_log_id = task["change_log_id"]
+        if int(task["must_change_log"] or 0) and not change_log_id:
+            raise SystemExit(
+                f"[release-readiness] protocol task {task_id} is missing change_log_id"
+            )
+        if change_log_id:
+            change = conn.execute(
+                "SELECT id, what_changed, why, verify FROM change_log WHERE id = ?",
+                (change_log_id,),
+            ).fetchone()
+            if change is None:
+                raise SystemExit(
+                    f"[release-readiness] change_log row {change_log_id} missing for task {task_id}"
+                )
+            if not str(change["what_changed"] or "").strip() or not str(change["why"] or "").strip():
+                raise SystemExit(
+                    f"[release-readiness] change_log row {change_log_id} is missing what_changed/why"
+                )
+        print(
+            f"[release-readiness] protocol closeout OK ({task_id}, change_log_id={change_log_id or 'none'})"
+        )
+    finally:
+        conn.close()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Verify NEXO release readiness.")
+    parser.add_argument(
+        "--ci",
+        action="store_true",
+        help="Run repo-only checks suitable for CI (skip local runtime doctor).",
+    )
+    parser.add_argument(
+        "--website-root",
+        default=str(DEFAULT_WEBSITE_ROOT),
+        help="Path to the website worktree. Skipped if missing.",
+    )
+    parser.add_argument(
+        "--nexo-home",
+        default="",
+        help="Override the runtime NEXO_HOME used by the local doctor check.",
+    )
+    parser.add_argument(
+        "--contract",
+        default="",
+        help="Optional path to a machine-readable release contract JSON file.",
+    )
+    parser.add_argument(
+        "--require-smoke",
+        action="store_true",
+        help="Fail unless a passing smoke artifact exists for the current version.",
+    )
+    parser.add_argument(
+        "--require-contract-complete",
+        action="store_true",
+        help="Fail if any gate in the provided contract is not marked complete.",
+    )
+    parser.add_argument(
+        "--final-closeout",
+        action="store_true",
+        help="Run the final post-publish closeout gate: GitHub Release, npm, runtime update/doctor, and protocol closeout.",
+    )
+    parser.add_argument(
+        "--protocol-task-id",
+        default="",
+        help="Protocol task to verify for change_log/task_close evidence during final closeout.",
+    )
+    args = parser.parse_args()
+
+    if args.final_closeout and args.ci:
+        raise SystemExit("[release-readiness] --final-closeout requires a live runtime; do not combine it with --ci")
+    if args.final_closeout and not args.protocol_task_id.strip():
+        raise SystemExit("[release-readiness] --final-closeout requires --protocol-task-id")
+
+    manifest = _package_manifest()
+    version = _package_version(manifest)
+    package_name = _package_name(manifest)
+    nexo_home = _resolve_nexo_home(args.nexo_home)
+    website_root = Path(args.website_root).expanduser()
+    contract_payload = None
+    contract_path = Path(args.contract).expanduser() if args.contract else None
+    if contract_path is not None:
+        contract_payload = _load_contract(contract_path)
+    _check_changelog(version)
+    _check_repo_public_surfaces(version)
+    _check_duplicate_artifacts()
+    _run([sys.executable, "scripts/sync_release_artifacts.py", "--check"])
+    _run([sys.executable, "scripts/verify_client_parity.py"])
+    _check_website(version, website_root)
+    if args.require_smoke or args.final_closeout:
+        _check_smoke_artifact(version, contract=contract_payload)
+    if contract_payload is not None:
+        _check_contract(
+            contract_payload,
+            contract_path=contract_path,
+            website_root=website_root,
+            nexo_home=nexo_home,
+            require_complete=args.require_contract_complete,
+        )
+    if args.final_closeout:
+        _check_github_release(version, _resolve_repository_slug(manifest))
+        _check_npm_package(version, package_name)
+    if not args.ci:
+        if args.final_closeout:
+            _run_runtime_update(nexo_home)
+        _run_runtime_doctor(nexo_home)
+    if args.final_closeout:
+        _check_protocol_closeout(nexo_home, args.protocol_task_id.strip())
+    print("[release-readiness] OK")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

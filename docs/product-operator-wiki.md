@@ -1,0 +1,143 @@
+# Product Operator Wiki
+
+This is the compact internal wiki for agents operating on NEXO as a product.
+
+Use it before modifying Brain, Desktop, automations, onboarding, release surfaces, or personal artifact flows. The goal is to keep one stable explanation of what each layer is and where extensions belong.
+
+For release closure, product-engineering process, and the "how do I ship or scaffold this safely?" workflow, pair this wiki with `docs/product-engineering-handbook.md`.
+
+## 1. What NEXO Brain is
+
+NEXO Brain is the open-source runtime and source of truth.
+
+- It owns the canonical behavior for runtime paths, automations, prompts, migrations, health checks, portability, rules, and parity contracts.
+- It must remain installable and usable without NEXO Desktop.
+- Product behavior that should ship to every user belongs in the Brain repo, not in personal runtime folders.
+
+## 2. What NEXO Desktop is
+
+NEXO Desktop is the managed product surface on top of NEXO Brain.
+
+- It packages the Brain runtime for non-technical operators.
+- It is responsible for onboarding, managed updates, Claude login flow, product-facing preferences, legal gates, and approachable UI.
+- It should consume Brain as the source of truth instead of re-implementing runtime contracts in parallel.
+
+## 3. Runtime layers you must not mix
+
+Keep these layers separate before making changes:
+
+1. Product source repos:
+   - Brain repo
+   - Desktop repo
+2. Installed runtime:
+   - `~/.nexo/core`
+   - `~/.nexo/runtime`
+3. Operator data:
+   - `~/.nexo/personal/*`
+
+Rules:
+
+- Fix product behavior in source first.
+- Move product code into live installs through release/update, not by editing installed `core/` directly.
+- Preserve personal data when cleaning or migrating installs.
+- Remove superseded personal artifacts only after the core replacement is real, configured, and active.
+
+## 4. Extension map
+
+Use the right surface for the right job:
+
+- Product-wide behavior -> Brain repo change
+- Managed product UX -> Desktop repo change
+- Local automation -> personal script or core automation, depending on whether all users need it
+- Reusable agent procedure -> skill
+- New callable runtime tool -> plugin
+
+Canonical docs for these decisions:
+
+- `docs/product-engineering-handbook.md`
+- `docs/personal-artifacts-manual.md`
+- `docs/runtime-templates.md`
+- `docs/writing-scripts.md`
+- `docs/skills-v2.md`
+
+## 5. Automation contract
+
+The current core product automations are:
+
+- `email-monitor`
+- `followup-runner`
+- `morning-agent`
+- `nexo-send-reply.py` as required helper dependency
+
+Product rules:
+
+- Brain defines the runtime truth.
+- Desktop exposes them as managed product controls.
+- Each automation can be enabled/disabled, scheduled, and given operator extra instructions without editing the master prompt.
+- Health depends on the required email/account configuration being present.
+
+## 6. Identity contract
+
+- The agent presents as the configured assistant name.
+- If architecture context matters, the agent says it runs on NEXO Brain architecture.
+- The agent must not present itself primarily as a generic LLM/model/vendor persona.
+- `NEXO`, `NEXO Brain`, and `NEXO Desktop` are product names, not assistant defaults.
+- Claude Code, Codex, Claude Desktop, and NEXO Desktop must expose the same user-facing identity and continuity contract.
+- Before denying memory, authorship, a prior decision, a sent message, a file change, or a completed task, the agent must inspect available continuity sources and answer from evidence.
+- If a different NEXO client or session produced the verified action, user-facing language treats it as the configured assistant's work, not as "another model" or "another session".
+
+## 6.1 User-facing autonomy and safety
+
+- The agent should try safe local/product paths before handing work back to the operator.
+- Safe autonomy includes file inspection, context search, supported NEXO tools, CLI/API/MCP usage, safe dependency installation, official docs lookup, retries with diagnosis, and small helper scripts.
+- The agent must stop for real decisions, missing credentials, external approvals, payment authorization, destructive actions, or legally/safely required consent.
+- Autonomy never bypasses security, privacy, law, professional boundaries, or user consent.
+- Desktop-facing prompts should keep this contract brief and user-oriented; detailed tool protocol belongs in Brain bootstraps.
+
+## 7. Release contract
+
+When working on product releases:
+
+- Brain and Desktop must stay aligned.
+- Public surfaces must match the actual product state.
+- QA artifacts must stay separate from distributable/public artifacts.
+- Do not treat a local unsigned QA DMG as a public release artifact.
+
+Canonical release surfaces:
+
+- `README.md`
+- `CHANGELOG.md`
+- `llms.txt`
+- `index.html`
+- `blog/`
+- `changelog/`
+- `sitemap.xml`
+
+## 8. Minimum decision order before acting
+
+Use this order every time:
+
+1. Check code/tests for the real runtime contract.
+2. Check `docs/product-engineering-handbook.md`.
+3. Check this wiki.
+4. Check `docs/agent-product-playbook.md`.
+5. Check `docs/personal-artifacts-manual.md` and `docs/runtime-templates.md`.
+6. Check the relevant release/public surfaces if the change is user-visible.
+
+If the answer is still unclear after that, add/update docs before adding more product surface.
+
+## 9. Deferred MCP tools at bootstrap
+
+Claude Code (and similar MCP clients) may list `mcp__nexo__*` tools as **deferred** on fresh installs or after MCP restarts. Deferred means the tool name is surfaced but its JSON schema is not loaded yet — not that the tool is missing. This ambiguity has silently broken bootstrap before (Brain learning #554).
+
+Runbook for agents before declaring NEXO blocked:
+
+1. If an expected `mcp__nexo__*` tool is not directly callable, resolve its schema via the client's discovery path. In Claude Code: run `ToolSearch` with `query="select:mcp__nexo__<name>[,<name>...]"`. After the schema arrives, call the tool normally.
+2. If `nexo_startup` itself is deferred, load it via the same discovery call first — never start a session without a real SID.
+3. Only treat it as a real runtime gap (and surface it as a blocker) after discovery still cannot resolve the tool.
+4. For install-level diagnostics, use `nexo_doctor plane='installation_live'` to inspect client/install surfaces (hooks, MCP registration, managed config). This plane is the canonical place to extend with deferred-vs-loaded tool reporting over time.
+
+Runbook for operators debugging a fresh install:
+
+- If an agent reports that NEXO is missing, confirm first whether the tools are deferred or truly absent. `claude mcp list` shows whether the NEXO MCP server is attached at all.
+- If attached but deferred, the fix is the agent-side discovery call above. The tools are healthy; only the schema load was lazy.

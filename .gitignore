@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+
+# Plan 0.3 / v6.3.1 — operator-specific entity overrides must never be
+# committed. Only the .sample version lives in the repo. Instances drop
+# their real file at ~/.nexo/brain/presets/entities_local.json.
+src/presets/entities_local.json
+.nexo/brain/presets/entities_local.json
+
+# Node
+node_modules/
+package-lock.json
+
+# NEXO runtime (never commit user data)
+*.db
+*.db-wal
+*.db-shm
+session_buffer.jsonl
+*.log
+*.pid
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Secrets
+.env
+*.key
+*.pem
+*_token.txt
+credentials*.json
+.mcpregistry_*
+.clawhub/
+
+# Duplicate artifact copies must stay visible so preflight/release can fail.
+.githooks/

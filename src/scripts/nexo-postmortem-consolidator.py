@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+"""
+NEXO Post-Mortem Consolidator v2 — The brain consolidates memories.
+
+Before: 595 lines of word-overlap at 50% to detect "patterns".
+Now: Collects data, passes them to CLI which UNDERSTANDS what it reads.
+
+Runs daily at 23:30 via LaunchAgent. Reads session diaries from today,
+passes them to the configured automation backend, which decides what deserves permanent memory.
+
+Stage 1 — Data collection (Pure Python):
+  Query session diaries, existing feedbacks, history.
+
+Stage 2 — Intelligence (automation backend):
+  Read diaries, understand patterns, decide what to promote.
+
+Stage 3 — Sensory Register + Force analysis (Pure Python):
+  Process cognitive events. Kept from v1 — genuinely mechanical.
+"""
+
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime, date, timedelta
+from pathlib import Path
+
+HOME = Path.home()
+NEXO_HOME = Path(os.environ.get("NEXO_HOME", str(HOME / ".nexo")))
+
+# Add NEXO_HOME to path for cognitive engine (Stage 3)
+# Auto-detect: if running from repo (src/scripts/), use src/ as NEXO_CODE
+_script_dir = Path(__file__).resolve().parent
+_repo_src = _script_dir.parent  # src/scripts/ -> src/
+NEXO_CODE = Path(os.environ.get("NEXO_CODE", str(_repo_src) if (_repo_src / "server.py").exists() else str(NEXO_HOME)))
+sys.path.insert(0, str(NEXO_CODE))
+
+from agent_runner import AutomationBackendUnavailableError, run_automation_prompt
+from constants import AUTOMATION_SUBPROCESS_TIMEOUT
+from core_prompts import render_core_prompt
+import consolidation_prep
+import paths
+
+try:
+    from client_preferences import resolve_user_model as _resolve_user_model
+    _USER_MODEL = _resolve_user_model()
+except Exception:
+    _USER_MODEL = ""
+
+
+NEXO_DB = paths.db_path()
+# Memory directory — adjust to match your project's memory location
+MEMORY_DIR = paths.memory_dir()
+MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
+HISTORY_FILE = paths.coordination_dir() / "postmortem-history.json"
+CONSOLIDATION_LOG = paths.logs_dir() / "postmortem-consolidation.log"
+SESSION_BUFFER = paths.brain_dir() / "session_buffer.jsonl"
+
+TODAY = date.today()
+TODAY_STR = TODAY.isoformat()
+
+
+def log(msg: str):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+    CONSOLIDATION_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONSOLIDATION_LOG, "a") as f:
+        f.write(line + "\n")
+
+
+def _render_sensory_event_content(event: dict) -> str:
+    source = event.get("source", "")
+    if source == "hook-fallback":
+        task_str = " ".join(event.get("tasks", []))
+        if len(task_str) < 50 or "," in task_str:
+            return ""
+
+    parts = []
+    tool_name = str(event.get("tool") or "").strip()
+    if source == "hook" and tool_name:
+        parts.append(f"Tool activity via hook: {tool_name}")
+
+    for key, label in [("tasks", "Tasks"), ("decisions", "Decisions"),
+                       ("errors_resolved", "Errors"), ("user_patterns", "the user")]:
+        val = event.get(key, [])
+        if val:
+            parts.append(f"{label}: {'; '.join(str(v) for v in val[:3])}")
+
+    critique = event.get("self_critique", "")
+    if critique and "hook-fallback" not in critique:
+        parts.append(f"Self-critique: {critique[:200]}")
+
+    return " | ".join(parts)
+
+
+def _rewrite_session_buffer(lines: list[str]) -> None:
+    payload = "\n".join(lines)
+    if payload:
+        payload += "\n"
+
+    tmp_path = SESSION_BUFFER.with_suffix(SESSION_BUFFER.suffix + ".tmp")
+    tmp_path.write_text(payload)
+    tmp_path.replace(SESSION_BUFFER)
+
+
+# ─── Stage 1: Data Collection (Pure Python) ─────────────────────────────────
+
+def collect_data() -> dict:
+    """Collects all data the CLI will need to decide."""
+    data = {
+        "date": TODAY_STR,
+        "diaries": [],
+        "existing_feedbacks": [],
+        "history_summary": {},
+    }
+
+    if not NEXO_DB.exists():
+        return data
+
+    conn = sqlite3.connect(str(NEXO_DB))
+    conn.row_factory = sqlite3.Row
+
+    # Today's diaries with self-critique.
+    # Filter mirrors db._episodic.read_session_diary(include_automated=False):
+    # keep human-interactive sessions, plus auto-close diaries that captured
+    # real activity (heartbeats > 0, not Minimal). Drops the [auto-close]
+    # placeholder entries that scheduled jobs (deep-sleep, daily-synthesis)
+    # generate without ever calling nexo_session_diary_write — they have no
+    # self-critique to promote and only burn LLM input tokens here.
+    rows = conn.execute(
+        "SELECT id, session_id, summary, self_critique, user_signals, "
+        "mental_state, domain, created_at "
+        "FROM session_diary WHERE date(created_at) = ? "
+        "AND NOT ("
+        "  COALESCE(source, '') = 'auto-close' "
+        "  AND ("
+        "    COALESCE(self_critique, '') LIKE '[auto-close]%' "
+        "    OR COALESCE(mental_state, '') LIKE '%0 heartbeats%' "
+        "    OR COALESCE(mental_state, '') LIKE '%Minimal diary%'"
+        "  )"
+        ") "
+        "ORDER BY created_at",
+        (TODAY_STR,)
+    ).fetchall()
+    data["diaries"] = [dict(r) for r in rows]
+
+    conn.close()
+
+    # Existing postmortem feedbacks (nombres, para no duplicar)
+    data["existing_feedbacks"] = [
+        f.stem for f in MEMORY_DIR.glob("feedback_postmortem_*.md")
+    ]
+
+    # History summary
+    if HISTORY_FILE.exists():
+        try:
+            history = json.loads(HISTORY_FILE.read_text())
+            data["history_summary"] = {
+                "total_permanent_rules": len(history.get("permanent_rules", [])),
+                "days_tracked": len(history.get("days", {})),
+                "recent_rules": history.get("permanent_rules", [])[-10:],
+            }
+        except Exception:
+            pass
+
+    return data
+
+
+# ─── Stage 2: Intelligence (automation backend) ─────────────────────────────
+
+def consolidate_with_cli(data: dict) -> bool:
+    """The brain consolidates — CLI decides what to promote."""
+
+    diaries_with_critique = [
+        d for d in data["diaries"]
+        if d.get("self_critique") and not str(d["self_critique"]).strip().lower().startswith("no self-critique")
+    ]
+
+    if not diaries_with_critique:
+        log("All sessions clean or trivial. Nothing to consolidate.")
+        return True
+
+    # Prepare data for CLI (truncate to avoid exceeding context)
+    diaries_json = json.dumps(diaries_with_critique, ensure_ascii=False, indent=1)
+    if len(diaries_json) > 12000:
+        diaries_json = diaries_json[:12000] + "\n... (truncated)"
+
+    # Precompute ALL corpus-wide mechanical work here (read-only) so the LLM gets
+    # a tiny, bounded brief and never lists the full learnings corpus — which is
+    # what blew up the headless context and caused the exit-124 timeout. Guarded:
+    # any failure degrades to a safe empty brief; the prompt still forbids the LLM
+    # from scanning the corpus, and Stage 3 runs regardless.
+    try:
+        brief = consolidation_prep.build_consolidation_brief(diaries_with_critique)
+        log(
+            f"Stage 2: brief built — corpus_size={brief.get('corpus_size')}, "
+            f"shortlist={len(brief.get('shortlist', []))}, "
+            f"contradictions={len(brief.get('contradiction_pairs', []))}, "
+            f"truncated={brief.get('truncated')}"
+        )
+    except Exception as e:
+        log(f"Stage 2: brief builder failed ({e}); degrading to empty brief")
+        brief = {
+            "corpus_size": None,
+            "today_topics": [],
+            "shortlist": [],
+            "contradiction_pairs": [],
+            "supersession_stubs": [],
+            "stale_candidates": [],
+            "preference_key_dupes": [],
+            "truncated": False,
+            "_helper_error": str(e),
+        }
+    brief_json = json.dumps(brief, ensure_ascii=False)
+
+    prompt = render_core_prompt(
+        "postmortem-consolidator",
+        date=data["date"],
+        session_total=len(data["diaries"]),
+        sessions_with_critique=len(diaries_with_critique),
+        diaries_json=diaries_json,
+        brief_json=brief_json,
+        existing_feedback_count=len(data["existing_feedbacks"]),
+        existing_feedbacks_json=json.dumps(data["existing_feedbacks"][:30], ensure_ascii=False),
+        recent_rules_json=json.dumps(data["history_summary"].get("recent_rules", []), ensure_ascii=False),
+        memory_dir=MEMORY_DIR,
+        postmortem_daily_file=paths.coordination_dir() / "postmortem-daily.md",
+    )
+
+    log(f"Stage 2: Invoking automation backend with {len(diaries_with_critique)} critiques...")
+    try:
+        result = run_automation_prompt(
+            prompt,
+            caller="postmortem_consolidator",
+            timeout=AUTOMATION_SUBPROCESS_TIMEOUT,
+            output_format="text",
+            # Defense in depth: REMOVE the blanket mcp__nexo__* grant so the model
+            # structurally CANNOT call nexo_learning_list / nexo_learning_search and
+            # re-pull the whole corpus into context (the exit-124 root cause). It
+            # keeps only the tools the consolidation actually needs to write its
+            # decisions; all corpus analysis is already precomputed in brief_json.
+            allowed_tools=(
+                "Read,Write,Edit,Glob,Grep,Bash,"
+                "mcp__nexo__nexo_startup,"
+                "mcp__nexo__nexo_learning_add,"
+                "mcp__nexo__nexo_followup_create,"
+                "mcp__nexo__nexo_task_open,"
+                "mcp__nexo__nexo_task_close,"
+                "mcp__nexo__nexo_heartbeat"
+            ),
+        )
+
+        if result.returncode != 0:
+            log(f"Stage 2: CLI error (code {result.returncode}): {(result.stderr or '')[:300]}")
+            return False
+
+        log(f"Stage 2: Completed. Output: {len(result.stdout or '')} chars")
+        # Log last 500 chars of output for debugging
+        if result.stdout:
+            log(f"Stage 2 output tail: {result.stdout[-500:]}")
+        return True
+
+    except AutomationBackendUnavailableError as e:
+        log(f"Stage 2: automation backend unavailable: {e}")
+        return False
+    except subprocess.TimeoutExpired:
+        log("Stage 2: CLI timed out (300s)")
+        return False
+    except Exception as e:
+        log(f"Stage 2: Exception: {e}")
+        return False
+
+
+# ─── Stage 3: Sensory Register + Force Analysis (Pure Python) ───────────────
+# Kept from v1 — these are genuinely mechanical (embedding vectors, DB updates)
+
+def process_sensory_register():
+    """Sensory Register — Atkinson-Shiffrin Layer 1. Embeds events into STM."""
+    log("--- Sensory Register processing ---")
+
+    if not SESSION_BUFFER.exists():
+        log("  No session_buffer.jsonl found, skipping")
+        return
+
+    pending_events = []
+    retained_lines = []
+    try:
+        with open(SESSION_BUFFER) as f:
+            for line in f:
+                raw_line = line.rstrip("\n")
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                    pending_events.append((event, line))
+                except json.JSONDecodeError:
+                    retained_lines.append(raw_line)
+    except Exception as e:
+        log(f"  Error reading session_buffer: {e}")
+        return
+
+    if not pending_events:
+        log("  No pending events")
+        return
+
+    log(f"  Found {len(pending_events)} pending events")
+
+    try:
+        import cognitive
+    except ImportError as e:
+        log(f"  Cannot import cognitive: {e}")
+        return
+
+    ingested = 0
+    processed_events = 0
+    kept_events = 0
+    for event, raw_line in pending_events:
+        content = _render_sensory_event_content(event)
+        if not content or len(content) < 20:
+            retained_lines.append(raw_line)
+            kept_events += 1
+            continue
+
+        try:
+            domain = ""
+            lower = content.lower()
+            # Add your project keywords for domain detection
+            for keyword, dom in [("nexo", "nexo")]:
+                if keyword in lower:
+                    domain = dom
+                    break
+
+            cognitive.ingest_sensory(
+                content=content, source_id=f"buffer#{event.get('ts', '')}",
+                domain=domain, created_at=event.get("ts", "")
+            )
+            ingested += 1
+            processed_events += 1
+        except Exception as e:
+            log(f"  Error embedding: {e}")
+            retained_lines.append(raw_line)
+
+    try:
+        _rewrite_session_buffer(retained_lines)
+    except Exception as e:
+        log(f"  Error rewriting session_buffer: {e}")
+
+    log(
+        f"  Ingested {ingested} sensory events into STM "
+        f"(processed: {processed_events}, retained: {len(retained_lines)} incl kept={kept_events})"
+    )
+
+
+def analyze_force_events():
+    """Analyze --force dissonance resolutions from today."""
+    log("--- Force event analysis ---")
+
+    try:
+        import cognitive
+    except ImportError:
+        log("  Cannot import cognitive, skipping")
+        return
+
+    db = cognitive._get_db()
+    today_forces = db.execute(
+        """SELECT memory_id, context, created_at FROM memory_corrections
+           WHERE correction_type = 'exception' AND context LIKE '%[FORCE]%'
+             AND date(created_at) = ? ORDER BY created_at""",
+        (TODAY_STR,)
+    ).fetchall()
+
+    if not today_forces:
+        log("  No --force events today")
+        return
+
+    log(f"  {len(today_forces)} --force events")
+
+    from collections import Counter
+
+    memory_counts = Counter(r["memory_id"] for r in today_forces)
+    for mem_id, count in memory_counts.most_common():
+        mem = db.execute(
+            "SELECT content, strength FROM ltm_memories WHERE id = ?", (mem_id,)
+        ).fetchone()
+        if not mem:
+            continue
+
+        total = db.execute(
+            "SELECT COUNT(*) FROM memory_corrections WHERE memory_id = ? AND context LIKE '%[FORCE]%'",
+            (mem_id,)
+        ).fetchone()[0]
+
+        if total >= 3:
+            log(f"  PARADIGM SHIFT: LTM #{mem_id} overridden {total}x → decay to 0.3")
+            db.execute(
+                "UPDATE ltm_memories SET strength = 0.3, "
+                "tags = CASE WHEN tags LIKE '%paradigm_candidate%' THEN tags "
+                "ELSE tags || ',paradigm_candidate' END WHERE id = ?",
+                (mem_id,)
+            )
+        elif count >= 2:
+            log(f"  WATCH: LTM #{mem_id} overridden {count}x today")
+
+    db.commit()
+
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+def already_ran_today() -> bool:
+    """Prevent running twice on the same day."""
+    marker = paths.coordination_dir() / "postmortem-last-run"
+    if marker.exists():
+        try:
+            return marker.read_text().strip() == TODAY_STR
+        except Exception:
+            return False
+    return False
+
+
+def mark_done():
+    marker = paths.coordination_dir() / "postmortem-last-run"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(TODAY_STR)
+
+
+def main():
+    if already_ran_today():
+        log("Already ran today. Skipping.")
+        return
+
+    log("=== NEXO Post-Mortem Consolidator v2 starting ===")
+    had_errors = False
+
+    # Stage 1: Collect data
+    data = collect_data()
+    log(f"Stage 1: {len(data['diaries'])} diaries, {len(data['existing_feedbacks'])} existing feedbacks")
+
+    if not data["diaries"]:
+        log("No session diaries today. Nothing to consolidate.")
+    else:
+        # Stage 2: CLI intelligence (graceful fallback: Stage 3 still runs)
+        success = consolidate_with_cli(data)
+        if not success:
+            log("Stage 2 failed (CLI unavailable or error). "
+                "Skipping intelligent consolidation. Stage 3 (sensory + force) will still run.")
+            had_errors = True
+
+    # Stage 3: Sensory Register (mechanical, kept from v1)
+    try:
+        process_sensory_register()
+    except Exception as e:
+        log(f"Sensory register failed: {e}")
+        had_errors = True
+
+    # Stage 3b: Force analysis (mechanical, kept from v1)
+    try:
+        analyze_force_events()
+    except Exception as e:
+        log(f"Force analysis failed: {e}")
+        had_errors = True
+
+    # Register successful run only if no stages failed
+    if not had_errors:
+        try:
+            state_file = paths.operations_dir() / ".catchup-state.json"
+            state = json.loads(state_file.read_text()) if state_file.exists() else {}
+            state["postmortem"] = datetime.now().isoformat()
+            state_file.write_text(json.dumps(state, indent=2))
+        except Exception:
+            pass
+
+    mark_done()
+    log("=== Consolidation v2 complete ===")
+
+
+if __name__ == "__main__":
+    main()

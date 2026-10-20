@@ -1,0 +1,58 @@
+{
+  "id": "SK-RUN-NEXO-CORE-FIX-CYCLE",
+  "name": "Run NEXO Core Fix Cycle",
+  "description": "Map impacted core surfaces and run focused verification for small NEXO fix cycles without mixing the public repo, runtime, and unverified claims.",
+  "level": "published",
+  "mode": "hybrid",
+  "source_kind": "core",
+  "execution_level": "read-only",
+  "approval_required": false,
+  "tags": [
+    "nexo",
+    "core",
+    "fix",
+    "protocol",
+    "plane",
+    "verification"
+  ],
+  "trigger_patterns": [
+    "two nexo core fixes",
+    "core fix cycle",
+    "protocol enforcement",
+    "plane before diagnosis",
+    "nexo core fix cycle"
+  ],
+  "params_schema": {
+    "areas": {
+      "type": "string",
+      "required": false,
+      "default": "protocol,plane"
+    },
+    "run_tests": {
+      "type": "boolean",
+      "required": false,
+      "default": true
+    },
+    "repo_root": {
+      "type": "string",
+      "required": false,
+      "default": ""
+    },
+    "nexo_home": {
+      "type": "string",
+      "required": false,
+      "default": ""
+    }
+  },
+  "command_template": {
+    "argv": [
+      "{{file_path}}",
+      "{{areas}}",
+      "{{run_tests}}",
+      "{{repo_root}}",
+      "{{nexo_home}}"
+    ]
+  },
+  "executable_entry": "script.py",
+  "stable_after_uses": 5
+}

@@ -1,0 +1,369 @@
+"""NEXO Helper — vendorable utility for personal scripts.
+
+Provides stable access to NEXO MCP tools via the CLI.
+Copy this file next to your script or keep it in NEXO_HOME/templates/.
+
+This module does NOT import any NEXO internals (db, server, cognitive).
+All communication goes through the stable `nexo scripts call` CLI.
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+def _detect_nexo_home() -> Path:
+    env_home = os.environ.get("NEXO_HOME", "").strip()
+    if env_home:
+        return Path(env_home).expanduser()
+
+    helper_path = Path(__file__).resolve()
+    inferred_home = helper_path.parent.parent
+    if (
+        helper_path.parent.name == "templates"
+        and (
+            ((inferred_home / "core" / "scripts").is_dir() and (inferred_home / "personal" / "config").is_dir())
+            or ((inferred_home / "scripts").is_dir() and (inferred_home / "config").is_dir())
+        )
+    ):
+        return inferred_home
+
+    default_home = Path.home() / ".nexo"
+    if default_home.is_dir():
+        return default_home
+
+    claude_home = Path.home() / "claude"
+    if claude_home.is_dir():
+        return claude_home
+
+    return default_home
+
+
+NEXO_HOME = _detect_nexo_home()
+DEFAULT_ALLOWED_TOOLS = "Read,Write,Edit,Glob,Grep,Bash,mcp__nexo__*"
+DEFAULT_NEXO_TIMEOUT_SECONDS = max(15, int(os.environ.get("NEXO_HELPER_TIMEOUT", "90")))
+
+
+def _load_schedule() -> dict:
+    candidates = [
+        NEXO_HOME / "personal" / "config" / "schedule.json",
+        NEXO_HOME / "config" / "schedule.json",
+    ]
+    for schedule_path in candidates:
+        if not schedule_path.is_file():
+            continue
+        try:
+            return json.loads(schedule_path.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def _resolve_core_runner(script_name: str) -> Path:
+    candidates = [
+        NEXO_HOME / "core" / "scripts" / script_name,
+        NEXO_HOME / "scripts" / script_name,
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
+def _resolve_automation_backend() -> str:
+    data = _load_schedule()
+    provider_runtime = data.get("provider_runtime") if isinstance(data.get("provider_runtime"), dict) else {}
+    selected = str(provider_runtime.get("selected_chat_provider") or "").strip().lower()
+    backend_raw = str(provider_runtime.get("automation_backend") or data.get("automation_backend") or "claude_code").strip().lower()
+    provider_raw = str(provider_runtime.get("automation_provider") or "").strip().lower()
+    automation_enabled = data.get("automation_enabled", True) is not False
+    if (
+        not automation_enabled
+        or backend_raw in {"none", "off", "disabled", "false", "0"}
+        or provider_raw in {"none", "off", "disabled", "false", "0"}
+    ):
+        return "none"
+    provider = (
+        {"anthropic": "anthropic", "openai": "openai"}.get(selected)
+        or {"anthropic": "anthropic", "openai": "openai"}.get(provider_raw)
+        or {"claude_code": "anthropic", "codex": "openai"}.get(backend_raw)
+        or "anthropic"
+    )
+    return {"anthropic": "claude_code", "openai": "codex"}.get(provider, "claude_code")
+
+
+def _load_bootstrap_prompt() -> str:
+    backend = _resolve_automation_backend()
+    if backend == "codex":
+        path = Path.home() / ".codex" / "AGENTS.md"
+    else:
+        path = Path.home() / ".claude" / "CLAUDE.md"
+    if not path.is_file():
+        return ""
+    try:
+        return path.read_text()
+    except Exception:
+        return ""
+
+
+def _resolve_nexo_cli() -> str:
+    candidates = []
+
+    env_cli = os.environ.get("NEXO_BIN", "").strip()
+    if env_cli:
+        candidates.append(Path(env_cli).expanduser())
+
+    candidates.extend(
+        [
+            NEXO_HOME / "bin" / "nexo",
+            Path.home() / ".local" / "bin" / "nexo",
+            Path.home() / "bin" / "nexo",
+        ]
+    )
+
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        except OSError:
+            continue
+
+    return shutil.which("nexo") or "nexo"
+
+
+def run_nexo(args: list[str]) -> str:
+    """Run a nexo CLI command and return stdout.
+
+    Raises RuntimeError on non-zero exit.
+    """
+    env = os.environ.copy()
+    env.setdefault("NEXO_HOME", str(NEXO_HOME))
+    result = subprocess.run(
+        [_resolve_nexo_cli(), *args],
+        capture_output=True,
+        text=True,
+        timeout=DEFAULT_NEXO_TIMEOUT_SECONDS,
+        env=env,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"nexo exited {result.returncode}")
+    return result.stdout
+
+
+def call_tool(name: str, payload: dict | None = None) -> str:
+    """Call a NEXO MCP tool by name. Returns raw text output."""
+    args = ["scripts", "call", name, "--input", json.dumps(payload or {})]
+    return run_nexo(args)
+
+
+def call_tool_text(name: str, payload: dict | None = None) -> str:
+    """Call a NEXO MCP tool and return text output."""
+    return call_tool(name, payload)
+
+
+def call_tool_json(name: str, payload: dict | None = None) -> dict:
+    """Call a NEXO MCP tool and return parsed JSON output."""
+    args = ["scripts", "call", name, "--input", json.dumps(payload or {}), "--json-output"]
+    out = run_nexo(args)
+    return json.loads(out)
+
+
+def _extract_json_object(text: str) -> dict:
+    raw = str(text or "").strip()
+    if not raw:
+        raise RuntimeError("Automation backend returned empty output.")
+
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if len(lines) >= 2:
+            end = len(lines)
+            for i in range(len(lines) - 1, 0, -1):
+                if lines[i].strip() == "```":
+                    end = i
+                    break
+            raw = "\n".join(lines[1:end]).strip()
+
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    start = raw.find("{")
+    if start < 0:
+        raise RuntimeError("Automation backend did not return a JSON object.")
+
+    depth = 0
+    in_string = False
+    escape = False
+    for idx in range(start, len(raw)):
+        ch = raw[idx]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = raw[start : idx + 1]
+                try:
+                    parsed = json.loads(candidate)
+                except Exception as exc:
+                    raise RuntimeError(f"Automation backend returned invalid JSON object: {exc}") from exc
+                if isinstance(parsed, dict):
+                    return parsed
+                break
+
+    raise RuntimeError("Automation backend did not return a parseable JSON object.")
+
+
+def run_automation_text(
+    prompt: str,
+    *,
+    model: str = "",
+    reasoning_effort: str = "",
+    cwd: str = "",
+    timeout: int | None = None,
+    allowed_tools: str = DEFAULT_ALLOWED_TOOLS,
+    append_system_prompt: str = "",
+    include_bootstrap: bool = True,
+    caller: str = "",
+    tier: str = "",
+    bare_mode: bool | None = None,
+) -> str:
+    """Run the configured NEXO automation backend and return text output.
+
+    This avoids hardcoding provider CLIs such as `claude -p` inside personal
+    scripts. The runtime routes the call through the selected backend and its
+    configured model profile.
+
+    Personal scripts (those living in ``~/.nexo/personal/scripts/``) should pass
+    ``caller="personal/<descriptive-id>"`` and optionally ``tier="alto"``
+    (or another canonical tier) to pick their resonance without editing the
+    NEXO Brain repo. See ``docs/personal-scripts-guide.md`` for the rules.
+    """
+    runner = _resolve_core_runner("nexo-agent-run.py")
+    if not runner.exists():
+        raise RuntimeError(f"Automation runner not found: {runner}")
+
+    cmd = [sys.executable, str(runner), "--prompt", prompt, "--output-format", "text"]
+    if caller:
+        cmd.extend(["--caller", caller])
+    if tier:
+        cmd.extend(["--tier", tier])
+    if model:
+        cmd.extend(["--model", model])
+    if reasoning_effort:
+        cmd.extend(["--reasoning-effort", reasoning_effort])
+    if cwd:
+        cmd.extend(["--cwd", cwd])
+    merged_system_prompt = []
+    if include_bootstrap:
+        bootstrap = _load_bootstrap_prompt()
+        if bootstrap:
+            merged_system_prompt.append(bootstrap)
+    if append_system_prompt:
+        merged_system_prompt.append(append_system_prompt)
+    if merged_system_prompt:
+        cmd.extend(["--append-system-prompt", "\n\n".join(merged_system_prompt)])
+    if allowed_tools:
+        cmd.extend(["--allowed-tools", allowed_tools])
+    if bare_mode is True:
+        cmd.extend(["--bare-mode", "on"])
+    elif bare_mode is False:
+        cmd.extend(["--bare-mode", "off"])
+
+    env = os.environ.copy()
+    env.setdefault("NEXO_HOME", str(NEXO_HOME))
+    env.setdefault("NEXO_CODE", env.get("NEXO_CODE", str(NEXO_HOME)))
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=(int(timeout) if timeout else None),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"automation backend exited {result.returncode}")
+    return result.stdout
+
+
+def run_automation_json(
+    prompt: str,
+    *,
+    model: str = "",
+    reasoning_effort: str = "",
+    cwd: str = "",
+    timeout: int | None = None,
+    allowed_tools: str = DEFAULT_ALLOWED_TOOLS,
+    append_system_prompt: str = "",
+    include_bootstrap: bool = True,
+    caller: str = "",
+    tier: str = "",
+    bare_mode: bool | None = None,
+) -> dict:
+    """Run the configured backend and return a parsed JSON object.
+
+    v6.0.2 adds ``caller`` and ``tier`` kwargs so personal scripts
+    (``~/.nexo/personal/scripts/``) can identify themselves and pick a resonance
+    without registering in the core repo. See
+    ``docs/personal-scripts-guide.md``.
+    """
+    runner = _resolve_core_runner("nexo-agent-run.py")
+    if not runner.exists():
+        raise RuntimeError(f"Automation runner not found: {runner}")
+
+    cmd = [sys.executable, str(runner), "--prompt", prompt, "--output-format", "json"]
+    if caller:
+        cmd.extend(["--caller", caller])
+    if tier:
+        cmd.extend(["--tier", tier])
+    if model:
+        cmd.extend(["--model", model])
+    if reasoning_effort:
+        cmd.extend(["--reasoning-effort", reasoning_effort])
+    if cwd:
+        cmd.extend(["--cwd", cwd])
+    merged_system_prompt = []
+    if include_bootstrap:
+        bootstrap = _load_bootstrap_prompt()
+        if bootstrap:
+            merged_system_prompt.append(bootstrap)
+    if append_system_prompt:
+        merged_system_prompt.append(append_system_prompt)
+    if merged_system_prompt:
+        cmd.extend(["--append-system-prompt", "\n\n".join(merged_system_prompt)])
+    if allowed_tools:
+        cmd.extend(["--allowed-tools", allowed_tools])
+    if bare_mode is True:
+        cmd.extend(["--bare-mode", "on"])
+    elif bare_mode is False:
+        cmd.extend(["--bare-mode", "off"])
+
+    env = os.environ.copy()
+    env.setdefault("NEXO_HOME", str(NEXO_HOME))
+    env.setdefault("NEXO_CODE", env.get("NEXO_CODE", str(NEXO_HOME)))
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=(int(timeout) if timeout else None),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"automation backend exited {result.returncode}")
+    return _extract_json_object(result.stdout)

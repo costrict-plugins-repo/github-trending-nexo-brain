@@ -1,0 +1,5165 @@
+#!/usr/bin/env python3
+"""NEXO Runtime CLI — operational commands for scripts and diagnostics.
+
+Entry points:
+  nexo chat [PATH]
+  nexo --version [--json]
+  nexo export [PATH] [--json]
+  nexo import-inspect PATH [--json]
+  nexo import PATH [--json]
+  nexo scripts list [--all] [--json]
+  nexo scripts create NAME [--runtime python|shell] [--description TEXT]
+  nexo scripts classify [--json]
+  nexo scripts sync [--json]
+  nexo scripts reconcile [--dry-run] [--json]
+  nexo scripts ensure-schedules [--dry-run] [--json]
+  nexo scripts schedules [--json]
+  nexo scripts unschedule NAME [--json]
+  nexo scripts schedule NAME (--every-minutes N | --every-seconds N | --reset) [--json]
+  nexo scripts remove NAME [--keep-file] [--json]
+  nexo scripts run NAME_OR_PATH [-- args...]
+  nexo scripts doctor [NAME_OR_PATH] [--json]
+  nexo scripts call TOOL --input JSON [--json-output]
+  nexo agents list|create|status|enable|disable|schedule|archive|run [--json]
+  nexo pre-answer route [--json] [--payload JSON|--payload-file PATH|--payload-stdin] [--query TEXT]
+  nexo cognitive-control observatory [--json]
+  nexo memory-observations process|intraday [--json]
+  nexo local-context status|run-once|reconcile|pause|resume|roots|exclusions|query|diagnostics|models [--json]
+  nexo automations reactivate NAME [--test-run] [--json]
+  nexo skills list [--level ...] [--source-kind ...] [--json]
+  nexo skills get ID [--json]
+  nexo skills apply ID [--params JSON] [--mode ...] [--dry-run] [--json]
+  nexo skills sync [--json]
+  nexo skills approve ID [--execution-level ...] [--approved-by ...] [--json]
+  nexo skills featured [--limit N] [--json]
+  nexo skills evolution [--json]
+  nexo clients sync [--json]
+  nexo contributor status|on|off [--json]
+  nexo doctor [--tier boot|runtime|deep|all] [--plane runtime_personal|installation_live|database_real] [--json] [--fix]
+  nexo support-snapshot [--json] [--include-doctor] [--log-lines N]
+  nexo uninstall [--dry-run] [--delete-data] [--json]
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import io
+import json
+import os
+import paths
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+try:
+    from cognitive_paths import resolve_cognitive_db
+except ModuleNotFoundError as exc:
+    if getattr(exc, "name", "") != "cognitive_paths":
+        raise
+
+    def resolve_cognitive_db(*, for_write: bool = True, **_kwargs) -> Path:
+        """Fallback for older installed runtimes before update copies cognitive_paths.py."""
+        override = os.environ.get("NEXO_COGNITIVE_DB", "").strip()
+        if override:
+            return Path(override).expanduser()
+        target = paths.runtime_dir() / "cognitive" / "cognitive.db"
+        if for_write:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        return target
+from runtime_home import export_resolved_nexo_home
+from runtime_versioning import build_mcp_status, clear_restart_required_marker, record_mcp_client_probe
+try:
+    from mcp_required_tools import BOOTSTRAP_REQUIRED_MCP_TOOLS, missing_required_tools
+except ModuleNotFoundError as exc:
+    if getattr(exc, "name", "") != "mcp_required_tools":
+        raise
+    # Older installed runtimes can be missing modules added after their CLI was
+    # copied. Keep `nexo update` bootable so the sync can repair the runtime.
+    BOOTSTRAP_REQUIRED_MCP_TOOLS: tuple[str, ...] = ()
+
+    def missing_required_tools(_tool_names):
+        return []
+
+NEXO_HOME = export_resolved_nexo_home()
+NEXO_CODE = Path(os.environ.get("NEXO_CODE", str(Path(__file__).resolve().parent)))
+TERMINAL_CLIENT_LABELS = {
+    "claude_code": "Claude Code",
+    "codex": "Codex",
+}
+TERMINAL_CLIENT_ORDER = ("claude_code", "codex")
+VERSION_STATUS_CACHE = paths.config_dir() / "cli-version-status.json"
+LATEST_NPM_PACKAGE = "nexo-brain"
+
+
+def _get_version() -> str:
+    """Read version from runtime version.json or package.json automatically."""
+    json_candidates = [
+        (NEXO_HOME / "version.json", "version"),
+        (NEXO_CODE.parent / "version.json", "version"),
+        (NEXO_CODE.parent / "package.json", "version"),
+        (NEXO_HOME / "package.json", "version"),
+    ]
+    for candidate, key in json_candidates:
+        try:
+            if candidate.is_file():
+                return json.loads(candidate.read_text()).get(key, "?")
+        except Exception:
+            continue
+    return "?"
+
+
+def _load_latest_version_cache(max_age_seconds: int = 6 * 3600) -> str | None:
+    try:
+        payload = json.loads(VERSION_STATUS_CACHE.read_text())
+    except Exception:
+        return None
+    version = str(payload.get("latest", "")).strip()
+    checked_at = float(payload.get("checked_at", 0) or 0)
+    if not version:
+        return None
+    if checked_at and (time.time() - checked_at) > max_age_seconds:
+        return None
+    return version
+
+
+def _save_latest_version_cache(version: str) -> None:
+    VERSION_STATUS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    VERSION_STATUS_CACHE.write_text(json.dumps({
+        "latest": version,
+        "checked_at": time.time(),
+    }))
+
+
+def _fetch_latest_version(timeout_seconds: int = 2) -> str | None:
+    try:
+        result = subprocess.run(
+            ["npm", "view", LATEST_NPM_PACKAGE, "version"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    latest = result.stdout.strip()
+    if not latest:
+        return None
+    try:
+        _save_latest_version_cache(latest)
+    except Exception:
+        pass
+    return latest
+
+
+def _print_json_or_text(payload: dict, *, as_json: bool = False) -> int:
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0 if payload.get("ok", True) else 1
+
+
+def _mcp_status(args) -> int:
+    return _print_json_or_text(
+        build_mcp_status(client=getattr(args, "client", "") or ""),
+        as_json=bool(getattr(args, "json", False)),
+    )
+
+
+def _closure(args) -> int:
+    from closure_plane import closure_next, closure_snapshot, closure_status, refresh_closure_items
+    from db import get_db
+    from db._schema import run_migrations
+
+    conn = get_db()
+    run_migrations(conn)
+    command = str(getattr(args, "closure_command", "") or "status")
+    if command == "status":
+        payload = closure_status(
+            conn,
+            refresh=not bool(getattr(args, "no_refresh", False)),
+            limit=max(1, min(int(getattr(args, "limit", 10) or 10), 100)),
+        )
+    elif command == "next":
+        if bool(getattr(args, "refresh", False)):
+            refresh_closure_items(conn)
+        payload = {
+            "ok": True,
+            "items": closure_next(
+                conn,
+                limit=max(1, min(int(getattr(args, "limit", 10) or 10), 100)),
+                include_waiting=bool(getattr(args, "include_waiting", False)),
+                source=str(getattr(args, "source", "") or ""),
+                kind=str(getattr(args, "kind", "") or ""),
+                state=str(getattr(args, "state", "") or ""),
+                max_risk=getattr(args, "max_risk", 0.0),
+                area=str(getattr(args, "area", "") or ""),
+            ),
+        }
+    elif command == "snapshot":
+        payload = closure_snapshot(
+            conn,
+            refresh=not bool(getattr(args, "no_refresh", False)),
+            snapshot_date=str(getattr(args, "date", "") or ""),
+            limit=max(1, min(int(getattr(args, "limit", 10) or 10), 100)),
+        )
+    else:
+        payload = {"ok": False, "error": "unsupported closure command"}
+    return _print_json_or_text(payload, as_json=bool(getattr(args, "json", False)))
+
+
+def _mcp_write_message(stdin, payload: dict) -> None:
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    stdin.write(raw + b"\n")
+    stdin.flush()
+
+
+def _mcp_reader(stdout, queue) -> None:
+    while True:
+        try:
+            line = stdout.readline()
+            if not line:
+                return
+            text = line.decode("utf-8", errors="replace").strip()
+            if not text:
+                continue
+            queue.put(json.loads(text))
+        except Exception as exc:
+            queue.put({"_reader_error": str(exc)})
+            return
+
+
+def _stderr_reader(stderr, lines: list[str]) -> None:
+    while True:
+        chunk = stderr.readline()
+        if not chunk:
+            return
+        try:
+            lines.append(chunk.decode("utf-8", errors="replace").rstrip())
+        except Exception:
+            lines.append(repr(chunk))
+        del lines[:-80]
+
+
+def _mcp_wait_for_response(queue, request_id: int, timeout_seconds: float) -> dict:
+    import queue as queue_module
+
+    deadline = time.monotonic() + max(timeout_seconds, 0.1)
+    while time.monotonic() < deadline:
+        remaining = max(deadline - time.monotonic(), 0.05)
+        try:
+            message = queue.get(timeout=remaining)
+        except queue_module.Empty:
+            break
+        if message.get("_reader_error"):
+            raise RuntimeError(message["_reader_error"])
+        if message.get("id") == request_id:
+            return message
+    raise TimeoutError(f"MCP response {request_id} timed out")
+
+
+def _mcp_probe(args) -> int:
+    import queue as queue_module
+    import threading
+
+    timeout_ms = int(getattr(args, "timeout_ms", 8000) or 8000)
+    timeout_seconds = max(timeout_ms / 1000.0, 1.0)
+    started_at = time.monotonic()
+    server_path = NEXO_CODE / "server.py"
+    env = os.environ.copy()
+    env["NEXO_MCP_PROBE"] = "1"
+    # Probe must be deterministic: inherited env from an older Desktop/runtime
+    # must not force plugin loading or startup preflight and turn this into a
+    # slow/false-negative health check.
+    env["NEXO_MCP_PLUGIN_MODE"] = getattr(args, "plugin_mode", None) or "none"
+    env["NEXO_MCP_RUN_STARTUP_PREFLIGHT"] = "0"
+    client = str(getattr(args, "client", "") or "").strip()
+    if client:
+        env["NEXO_MCP_CLIENT"] = client
+
+    proc = None
+    stderr_lines: list[str] = []
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(server_path)],
+            cwd=str(NEXO_CODE),
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+        )
+        responses = queue_module.Queue()
+        threading.Thread(target=_mcp_reader, args=(proc.stdout, responses), daemon=True).start()
+        threading.Thread(target=_stderr_reader, args=(proc.stderr, stderr_lines), daemon=True).start()
+
+        _mcp_write_message(proc.stdin, {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "nexo-mcp-probe", "version": _get_version()},
+            },
+        })
+        init_response = _mcp_wait_for_response(responses, 1, timeout_seconds)
+        if init_response.get("error"):
+            raise RuntimeError(f"MCP initialize failed: {init_response['error']}")
+
+        _mcp_write_message(proc.stdin, {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        })
+        _mcp_write_message(proc.stdin, {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {},
+        })
+        tools_response = _mcp_wait_for_response(responses, 2, timeout_seconds)
+        if tools_response.get("error"):
+            raise RuntimeError(f"MCP tools/list failed: {tools_response['error']}")
+        tools = ((tools_response.get("result") or {}).get("tools") or [])
+        tool_names = [
+            str(tool.get("name") or "")
+            for tool in tools
+            if isinstance(tool, dict) and tool.get("name")
+        ]
+        required = list(BOOTSTRAP_REQUIRED_MCP_TOOLS)
+        missing = missing_required_tools(tool_names)
+        ok = not missing and len(tool_names) > 0
+        payload = {
+            "ok": ok,
+            "mcp_ready": ok,
+            "probe_ok": ok,
+            "tools_available": len(tool_names) > 0,
+            "tool_count": len(tool_names),
+            "required_tools": required,
+            "required_tool_count": len(required),
+            "required_tools_present": not missing,
+            "missing_required_tools": missing,
+            "client": client,
+            "plugin_mode": env.get("NEXO_MCP_PLUGIN_MODE"),
+            "elapsed_ms": int((time.monotonic() - started_at) * 1000),
+            "stderr_tail": "\n".join(stderr_lines[-12:]),
+        }
+        recorded = record_mcp_client_probe(client=client, probe=payload)
+        if recorded.get("ok"):
+            payload["client_ready"] = bool(recorded.get("last_probe_ok"))
+            payload["client_action"] = recorded.get("client_action", "ready")
+            payload["reason_code"] = recorded.get("reason_code", "ready")
+            payload["runtime_generation"] = recorded.get("last_seen_generation", "")
+        return _print_json_or_text(payload, as_json=bool(getattr(args, "json", False)))
+    except Exception as exc:
+        payload = {
+            "ok": False,
+            "mcp_ready": False,
+            "probe_ok": False,
+            "error": "mcp_probe_failed",
+            "message": str(exc),
+            "client": client,
+            "elapsed_ms": int((time.monotonic() - started_at) * 1000),
+            "stderr_tail": "\n".join(stderr_lines[-20:]),
+        }
+        recorded = record_mcp_client_probe(client=client, probe=payload)
+        if recorded.get("ok"):
+            payload["client_ready"] = False
+            payload["client_action"] = recorded.get("client_action", "reprobe")
+            payload["reason_code"] = recorded.get("reason_code", "mcp_probe_failed")
+            payload["runtime_generation"] = recorded.get("last_seen_generation", "")
+        return _print_json_or_text(payload, as_json=bool(getattr(args, "json", False)))
+    finally:
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+
+def _mcp_clear_restart(args) -> int:
+    return _print_json_or_text(
+        clear_restart_required_marker(
+            client=getattr(args, "client", "") or "",
+            installed_version=getattr(args, "installed_version", "") or "",
+            process_version=getattr(args, "process_version", "") or "",
+            installed_fingerprint=getattr(args, "installed_fingerprint", "") or "",
+            process_fingerprint=getattr(args, "process_fingerprint", "") or "",
+        ),
+        as_json=bool(getattr(args, "json", False)),
+    )
+
+
+def _continuity_snapshot_write(args) -> int:
+    from continuity import write_snapshot
+
+    result = write_snapshot(
+        conversation_id=args.conversation_id,
+        session_id=args.session_id or "",
+        external_session_id=args.external_session_id or "",
+        client=args.client or "",
+        event_type=args.event_type or "turn_end",
+        payload=args.payload or "",
+        trace_id=args.trace_id or "",
+        idempotency_key=args.idempotency_key or "",
+    )
+    return _print_json_or_text(result, as_json=bool(getattr(args, "json", False)))
+
+
+def _continuity_snapshot_read(args) -> int:
+    from continuity import read_snapshot
+
+    result = read_snapshot(
+        conversation_id=args.conversation_id or "",
+        session_id=args.session_id or "",
+        limit=args.limit or 20,
+    )
+    return _print_json_or_text(result, as_json=bool(getattr(args, "json", False)))
+
+
+def _continuity_resume_bundle(args) -> int:
+    from continuity import build_resume_bundle
+
+    result = build_resume_bundle(
+        conversation_id=args.conversation_id or "",
+        session_id=args.session_id or "",
+        external_session_id=args.external_session_id or "",
+        client=args.client or "",
+        token_budget=args.token_budget or 2000,
+    )
+    return _print_json_or_text(result, as_json=bool(getattr(args, "json", False)))
+
+
+def _continuity_audit(args) -> int:
+    from continuity import continuity_audit
+
+    result = continuity_audit(
+        conversation_id=args.conversation_id,
+        limit=args.limit or 50,
+    )
+    return _print_json_or_text(result, as_json=bool(getattr(args, "json", False)))
+
+
+def _should_refresh_latest_version() -> bool:
+    """Decide whether to hit the npm registry to refresh `latest` version.
+
+    Prior behaviour gated this on `isatty()` so `nexo --help` never made
+    a network call outside an interactive terminal. That also meant NEXO
+    Desktop — which spawns `nexo` via subprocess with piped stdio — could
+    never populate the version cache, so the Desktop update banner for
+    Brain never saw a newer `Latest: vX` line in the help output and no
+    Brain update was ever offered automatically (v6.1.1 fix).
+
+    The 6-hour `max_age_seconds` at `_load_latest_version_cache()` is the
+    real rate-limit. This function now returns True unconditionally so
+    missing/stale cache entries are always refreshed, regardless of tty
+    context. Fail-closed: `_fetch_latest_version` still catches every
+    subprocess error and returns None, so the help line falls back to
+    installed-only when npm is unreachable.
+    """
+    return True
+
+
+def _version_sort_key(raw: str) -> tuple[tuple[int, ...], int, str]:
+    value = str(raw or "").strip()
+    base, _, suffix = value.partition("-")
+    parts: list[int] = []
+    for piece in base.split("."):
+        try:
+            parts.append(int(piece))
+        except Exception:
+            parts.append(-1)
+    while len(parts) < 3:
+        parts.append(0)
+    return (tuple(parts), 1 if not suffix else 0, suffix)
+
+
+def _version_status_payload(*, force_refresh: bool = False) -> dict:
+    installed = _get_version()
+    latest = _load_latest_version_cache()
+    latest_source = "cache" if latest else ""
+    should_refresh = False
+    if force_refresh and _should_refresh_latest_version():
+        # Desktop reads `nexo --version --json` to decide whether to show the
+        # Brain update CTA. If a user checked minutes before a release, the
+        # 6-hour cache can otherwise hide the new npm dist-tag until it expires.
+        should_refresh = (
+            latest is None
+            or (
+                bool(installed)
+                and _version_sort_key(latest) <= _version_sort_key(installed)
+            )
+        )
+    elif latest is None and _should_refresh_latest_version():
+        should_refresh = True
+    if should_refresh:
+        refreshed = _fetch_latest_version()
+        if refreshed:
+            latest = refreshed
+            latest_source = "npm"
+    if latest and installed and _version_sort_key(latest) < _version_sort_key(installed):
+        latest = installed
+        latest_source = "installed"
+        try:
+            _save_latest_version_cache(installed)
+        except Exception:
+            pass
+    has_update = bool(
+        latest
+        and installed
+        and _version_sort_key(latest) > _version_sort_key(installed)
+    )
+    return {
+        "ok": True,
+        "name": "nexo",
+        "package": LATEST_NPM_PACKAGE,
+        "installed": installed,
+        "latest": latest or "",
+        "hasUpdate": has_update,
+        "unknown": not bool(installed and latest),
+        "latestSource": latest_source,
+    }
+
+
+def _version_status_line(payload: dict | None = None) -> str:
+    payload = payload or _version_status_payload()
+    installed = str(payload.get("installed") or "?").strip()
+    latest = str(payload.get("latest") or "").strip()
+    if latest:
+        return f"NEXO Latest: v{latest} | Installed: v{installed}"
+    return f"NEXO Installed: v{installed}"
+
+# Ensure src/ is on path for imports
+if str(NEXO_CODE) not in sys.path:
+    sys.path.insert(0, str(NEXO_CODE))
+
+
+def _missing_runtime_module_message(module_name: str, exc: Exception) -> str:
+    missing = getattr(exc, "name", None) or module_name
+    return (
+        f"{module_name} is unavailable in the current runtime ({missing}). "
+        "Continuing with safe defaults so `nexo update` can repair the installation."
+    )
+
+
+def _load_runtime_power_support() -> dict:
+    try:
+        from runtime_power import (
+            ensure_power_policy_choice,
+            apply_power_policy,
+            format_power_policy_label,
+            ensure_full_disk_access_choice,
+            format_full_disk_access_label,
+        )
+        return {
+            "available": True,
+            "message": "",
+            "ensure_power_policy_choice": ensure_power_policy_choice,
+            "apply_power_policy": apply_power_policy,
+            "format_power_policy_label": format_power_policy_label,
+            "ensure_full_disk_access_choice": ensure_full_disk_access_choice,
+            "format_full_disk_access_label": format_full_disk_access_label,
+        }
+    except ImportError as exc:
+        message = _missing_runtime_module_message("runtime_power", exc)
+
+        def ensure_power_policy_choice(**kwargs):
+            return {"policy": "disabled", "prompted": False, "message": message}
+
+        def apply_power_policy(policy=None):
+            return {"ok": True, "action": "skipped", "details": [], "message": message}
+
+        def format_power_policy_label(policy):
+            return policy or "disabled"
+
+        def ensure_full_disk_access_choice(**kwargs):
+            return {"status": "unset", "prompted": False, "reasons": [], "message": message}
+
+        def format_full_disk_access_label(status):
+            return status or "unset"
+
+        return {
+            "available": False,
+            "message": message,
+            "ensure_power_policy_choice": ensure_power_policy_choice,
+            "apply_power_policy": apply_power_policy,
+            "format_power_policy_label": format_power_policy_label,
+            "ensure_full_disk_access_choice": ensure_full_disk_access_choice,
+            "format_full_disk_access_label": format_full_disk_access_label,
+        }
+
+
+def _load_public_contribution_support() -> dict:
+    try:
+        from public_contribution import (
+            ensure_public_contribution_choice,
+            format_public_contribution_label,
+            load_public_contribution_config,
+            refresh_public_contribution_state,
+            disable_public_contribution,
+        )
+        return {
+            "available": True,
+            "message": "",
+            "ensure_public_contribution_choice": ensure_public_contribution_choice,
+            "format_public_contribution_label": format_public_contribution_label,
+            "load_public_contribution_config": load_public_contribution_config,
+            "refresh_public_contribution_state": refresh_public_contribution_state,
+            "disable_public_contribution": disable_public_contribution,
+        }
+    except ImportError as exc:
+        message = _missing_runtime_module_message("public_contribution", exc)
+
+        def _default_config(config=None):
+            payload = {
+                "enabled": False,
+                "mode": "disabled",
+                "status": "unavailable",
+                "prompted": False,
+                "message": message,
+            }
+            if isinstance(config, dict):
+                payload.update(config)
+            return payload
+
+        def ensure_public_contribution_choice(**kwargs):
+            return _default_config()
+
+        def format_public_contribution_label(config=None):
+            cfg = _default_config(config)
+            if cfg.get("status") == "unavailable":
+                return "disabled (runtime repair needed)"
+            return cfg.get("mode") or "disabled"
+
+        def load_public_contribution_config():
+            return _default_config()
+
+        def refresh_public_contribution_state(config=None):
+            return _default_config(config)
+
+        def disable_public_contribution():
+            return _default_config()
+
+        return {
+            "available": False,
+            "message": message,
+            "ensure_public_contribution_choice": ensure_public_contribution_choice,
+            "format_public_contribution_label": format_public_contribution_label,
+            "load_public_contribution_config": load_public_contribution_config,
+            "refresh_public_contribution_state": refresh_public_contribution_state,
+            "disable_public_contribution": disable_public_contribution,
+        }
+
+
+def _scripts_list(args):
+    from db import init_db, list_personal_scripts
+    from script_registry import list_scripts, sync_personal_scripts
+
+    init_db()
+    sync_personal_scripts()
+    if args.all:
+        scripts = list_scripts(include_core=True)
+    else:
+        scripts = list_personal_scripts()
+
+    if args.json:
+        print(json.dumps(scripts, indent=2))
+    else:
+        if not scripts:
+            print("No personal scripts found in", paths.core_scripts_dir())
+            return 0
+        # Table output
+        name_w = max(len(s["name"]) for s in scripts)
+        rt_w = max(len(s["runtime"]) for s in scripts)
+        for s in scripts:
+            tag = " [core]" if s.get("core") else ""
+            schedule_tag = ""
+            if s.get("has_schedule"):
+                schedule_labels = [sch.get("schedule_label", "") for sch in s.get("schedules", []) if sch.get("schedule_label")]
+                if schedule_labels:
+                    schedule_tag = f" [{'; '.join(schedule_labels[:2])}]"
+            print(f"  {s['name']:<{name_w}}  {s['runtime']:<{rt_w}}  {s.get('description', '')}{schedule_tag}{tag}")
+    return 0
+
+
+def _scripts_sync(args):
+    from db import init_db
+    from script_registry import sync_personal_scripts
+
+    init_db()
+    result = sync_personal_scripts()
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(
+            f"Synced personal scripts: {result['scripts_upserted']} script(s), "
+            f"{result['schedules_upserted']} schedule(s), "
+            f"{result['scripts_pruned']} script(s) pruned, "
+            f"{result['schedules_pruned']} schedule(s) pruned."
+        )
+    return 0
+
+
+def _scripts_classify(args):
+    from script_registry import classify_scripts_dir
+
+    report = classify_scripts_dir()
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0
+
+    entries = report.get("entries", [])
+    if not entries:
+        print("No scripts directory found:", report.get("scripts_dir", paths.core_scripts_dir()))
+        return 0
+
+    path_w = max(len(Path(entry["path"]).name) for entry in entries)
+    for entry in entries:
+        reason = f" — {entry['reason']}" if entry.get("reason") else ""
+        print(f"  {Path(entry['path']).name:<{path_w}}  {entry['classification']}{reason}")
+    return 0
+
+
+def _scripts_reconcile(args):
+    from script_registry import reconcile_personal_scripts
+
+    result = reconcile_personal_scripts(dry_run=args.dry_run)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        sync = result.get("sync", {})
+        ensured = result.get("ensure_schedules", {})
+        print(
+            f"Reconciled personal scripts: {sync.get('registered_scripts', 0)} registered, "
+            f"{len(ensured.get('created', []))} schedule(s) created, "
+            f"{len(ensured.get('repaired', []))} repaired, "
+            f"{len(ensured.get('invalid', []))} invalid."
+        )
+        if args.dry_run:
+            print("  Dry run only — no schedules changed.")
+    return 0 if not result.get("ensure_schedules", {}).get("invalid") else 1
+
+
+def _scripts_ensure_schedules(args):
+    from script_registry import ensure_personal_schedules
+
+    result = ensure_personal_schedules(dry_run=args.dry_run)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(
+            f"Ensured schedules: {len(result.get('created', []))} created, "
+            f"{len(result.get('repaired', []))} repaired, "
+            f"{len(result.get('already_present', []))} already present, "
+            f"{len(result.get('invalid', []))} invalid."
+        )
+        if args.dry_run:
+            print("  Dry run only — no schedules changed.")
+    return 0 if not result.get("invalid") else 1
+
+
+def _scripts_create(args):
+    from script_registry import create_script
+
+    try:
+        result = create_script(
+            args.name,
+            description=args.description,
+            runtime=args.runtime,
+            force=args.force,
+        )
+    except (FileExistsError, ValueError) as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(f"Created personal script: {result['path']}")
+    return 0
+
+
+def _scripts_schedules(args):
+    from db import init_db, list_personal_script_schedules
+    from script_registry import sync_personal_scripts
+
+    init_db()
+    sync_personal_scripts()
+    schedules = list_personal_script_schedules()
+    if args.json:
+        print(json.dumps(schedules, indent=2, ensure_ascii=False))
+        return 0
+
+    if not schedules:
+        print("No personal script schedules registered.")
+        return 0
+
+    cron_w = max(len(s["cron_id"]) for s in schedules)
+    for schedule in schedules:
+        label = schedule.get("schedule_label") or schedule.get("schedule_value") or schedule.get("schedule_type")
+        print(f"  {schedule['cron_id']:<{cron_w}}  {label}")
+    return 0
+
+
+def _scripts_unschedule(args):
+    from script_registry import unschedule_personal_script
+
+    result = unschedule_personal_script(args.name)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        if not result.get("ok"):
+            print(result.get("error", "Failed to unschedule script"), file=sys.stderr)
+            return 1
+        print(f"Removed {len(result.get('removed_schedules', []))} schedule(s) from {result['script']}")
+    return 0 if result.get("ok") else 1
+
+
+def _scripts_set_enabled(args, enabled):
+    from script_registry import set_personal_script_enabled
+
+    result = set_personal_script_enabled(args.name, enabled)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if not result.get("ok"):
+        print(result.get("error", "Failed to toggle script"), file=sys.stderr)
+        return 1
+    verb = "enabled" if enabled else "disabled"
+    if result.get("changed"):
+        print(f"Script {result['name']} {verb}.")
+    else:
+        print(f"Script {result['name']} already {verb}.")
+    return 0
+
+
+def _scripts_set_instructions(args):
+    from script_registry import set_script_extra_instructions
+
+    if getattr(args, "clear", False):
+        text = ""
+    elif getattr(args, "stdin", False):
+        try:
+            text = sys.stdin.read()
+        except Exception as exc:
+            msg = f"Could not read instructions from stdin: {exc}"
+            if args.json:
+                print(json.dumps({"ok": False, "error": msg}, ensure_ascii=False))
+            else:
+                print(msg, file=sys.stderr)
+            return 1
+    else:
+        text = getattr(args, "text", None) or ""
+
+    result = set_script_extra_instructions(args.name, text)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if not result.get("ok"):
+        print(result.get("error", "Failed to update extra instructions"), file=sys.stderr)
+        return 1
+    if result.get("cleared"):
+        print(f"Extra instructions cleared for {result['name']}.")
+    else:
+        print(f"Extra instructions updated for {result['name']}.")
+    return 0
+
+
+def _scripts_set_schedule(args):
+    from script_registry import set_script_schedule_override
+
+    interval_seconds = None
+    daily_at = None
+    if getattr(args, "every_minutes", None) is not None:
+        interval_seconds = int(args.every_minutes) * 60
+    elif getattr(args, "every_seconds", None) is not None:
+        interval_seconds = int(args.every_seconds)
+    elif getattr(args, "daily_at", None):
+        daily_at = str(args.daily_at).strip()
+
+    result = set_script_schedule_override(
+        args.name,
+        interval_seconds=interval_seconds,
+        daily_at=daily_at,
+        clear=bool(getattr(args, "reset", False)),
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if not result.get("ok"):
+        print(result.get("error", "Failed to update schedule"), file=sys.stderr)
+        return 1
+
+    label = str(result.get("effective_schedule_label") or "").strip()
+    source = str(result.get("schedule_source") or "manifest").strip()
+    sync_result = result.get("runtime_sync") if isinstance(result.get("runtime_sync"), dict) else {}
+    if label:
+        print(f"Schedule updated for {result['name']}: {label} ({source})")
+    else:
+        print(f"Schedule updated for {result['name']}.")
+    if sync_result.get("ok") is False:
+        print(f"  Warning: saved, but runtime sync failed: {sync_result.get('error', 'unknown error')}")
+    return 0
+
+
+def _scripts_status(args):
+    from script_registry import get_personal_script_status
+
+    result = get_personal_script_status(args.name)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if not result.get("ok"):
+        print(result.get("error", "Failed to read status"), file=sys.stderr)
+        return 1
+    state = "enabled" if result.get("enabled") else "DISABLED"
+    print(f"{result.get('name')} [{result.get('classification')}] -> {state}")
+    last = result.get("last_run") or {}
+    if last:
+        exit_code = last.get("exit_code")
+        started = last.get("started_at") or "?"
+        print(f"  last run: {started} (exit={exit_code})")
+        summary = (last.get("summary") or "").strip()
+        if summary:
+            print(f"  summary: {summary[:120]}")
+    else:
+        print("  last run: (none)")
+    blocked_reason = (result.get("blocked_reason") or "").strip()
+    if blocked_reason:
+        print(f"  blocked: {blocked_reason}")
+    schedule_label = (result.get("effective_schedule_label") or "").strip()
+    if schedule_label:
+        schedule_source = (result.get("schedule_source") or "manifest").strip()
+        print(f"  schedule: {schedule_label} ({schedule_source})")
+    extra = (result.get("operator_extra_instructions") or "").strip()
+    if extra:
+        print(f"  extra instructions: {extra[:160]}")
+    return 0
+
+
+def _automations_list(args):
+    from script_registry import list_operator_automations
+
+    rows = list_operator_automations(include_all=bool(getattr(args, "all", False)))
+    if args.json:
+        print(json.dumps({"ok": True, "automations": rows}, indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("No automations registered.")
+        return 0
+    for row in rows:
+        state = "enabled" if row.get("enabled", True) else "disabled"
+        availability = "ready" if row.get("available", True) else "setup required"
+        schedule = str(row.get("effective_schedule_label") or row.get("first_schedule_label") or "—")
+        print(f"{row.get('name')} [{state}] · {availability} · {schedule}")
+    return 0
+
+
+def _automations_set_enabled(args, enabled):
+    from script_registry import set_automation_enabled
+
+    result = set_automation_enabled(args.name, enabled)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if not result.get("ok"):
+        print(result.get("error", "Failed to toggle automation"), file=sys.stderr)
+        return 1
+    verb = "enabled" if enabled else "disabled"
+    print(f"Automation {result['name']} {verb}.")
+    return 0
+
+
+def _automations_reactivate(args):
+    from script_registry import reactivate_automation
+
+    result = reactivate_automation(args.name, test_run=bool(getattr(args, "test_run", False)))
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if not result.get("ok"):
+        print(result.get("error", "Could not reactivate automation"), file=sys.stderr)
+        return 1
+    print(f"Automation {result['name']} enabled.")
+    if result.get("test_run"):
+        print("Test run completed.")
+    return 0
+
+
+def _automations_status(args):
+    from script_registry import get_automation_status
+
+    result = get_automation_status(args.name)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if not result.get("ok"):
+        print(result.get("error", "Failed to read automation status"), file=sys.stderr)
+        return 1
+    state = "enabled" if result.get("enabled") else "DISABLED"
+    print(f"{result.get('name')} [{result.get('classification')}] -> {state}")
+    blocked_reason = (result.get("blocked_reason") or "").strip()
+    if blocked_reason:
+        print(f"  blocked: {blocked_reason}")
+    schedule_label = (result.get("effective_schedule_label") or "").strip()
+    if schedule_label:
+        schedule_source = (result.get("schedule_source") or "manifest").strip()
+        print(f"  schedule: {schedule_label} ({schedule_source})")
+    extra = (result.get("operator_extra_instructions") or "").strip()
+    if extra:
+        print(f"  extra instructions: {extra[:160]}")
+    return 0
+
+
+def _automations_reconcile(args):
+    from automation_reconciler import apply_reconciliation_plan, build_reconciliation_plan
+
+    plan = build_reconciliation_plan()
+    if bool(getattr(args, "apply", False)):
+        result = apply_reconciliation_plan(plan)
+        payload = {"ok": result.get("ok", False), "plan": plan, "apply": result}
+    else:
+        payload = plan
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0 if payload.get("ok", True) else 1
+
+
+def _automations_set_instructions(args):
+    from script_registry import set_automation_instructions
+
+    if getattr(args, "clear", False):
+        text = ""
+    elif getattr(args, "stdin", False):
+        try:
+            text = sys.stdin.read()
+        except Exception as exc:
+            msg = f"Could not read instructions from stdin: {exc}"
+            if args.json:
+                print(json.dumps({"ok": False, "error": msg}, ensure_ascii=False))
+            else:
+                print(msg, file=sys.stderr)
+            return 1
+    else:
+        text = getattr(args, "text", None) or ""
+
+    result = set_automation_instructions(args.name, text)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if not result.get("ok"):
+        print(result.get("error", "Failed to update automation instructions"), file=sys.stderr)
+        return 1
+    if result.get("cleared"):
+        print(f"Extra instructions cleared for {result['name']}.")
+    else:
+        print(f"Extra instructions updated for {result['name']}.")
+    return 0
+
+
+def _automations_set_schedule(args):
+    from script_registry import set_automation_schedule
+
+    interval_seconds = None
+    daily_at = None
+    if getattr(args, "every_minutes", None) is not None:
+        interval_seconds = int(args.every_minutes) * 60
+    elif getattr(args, "every_seconds", None) is not None:
+        interval_seconds = int(args.every_seconds)
+    elif getattr(args, "daily_at", None):
+        daily_at = str(args.daily_at).strip()
+    if getattr(args, "weekdays", None) and not daily_at:
+        result = {"ok": False, "error": "--weekdays can only be used with --daily-at"}
+        if args.json:
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return 1
+        print(result["error"], file=sys.stderr)
+        return 1
+
+    result = set_automation_schedule(
+        args.name,
+        interval_seconds=interval_seconds,
+        daily_at=daily_at,
+        weekdays=getattr(args, "weekdays", None),
+        clear=bool(getattr(args, "reset", False)),
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if not result.get("ok"):
+        print(result.get("error", "Failed to update automation cadence"), file=sys.stderr)
+        return 1
+    label = str(result.get("effective_schedule_label") or "").strip()
+    source = str(result.get("schedule_source") or "manifest").strip()
+    if label:
+        print(f"Schedule updated for {result['name']}: {label} ({source})")
+    else:
+        print(f"Schedule updated for {result['name']}.")
+    return 0
+
+
+def _automations_preference_schema(args):
+    from automation_preferences import get_automation_preference_schema, search_automation_preference_schema
+
+    query = str(getattr(args, "query", "") or "").strip()
+    schema = get_automation_preference_schema(args.name)
+    payload = {
+        "ok": True,
+        "name": args.name,
+        "schema": schema,
+        "matches": search_automation_preference_schema(args.name, query) if query else [],
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+    print(schema.get("title") or args.name)
+    for group in list(schema.get("groups") or []):
+        print(f"\n{group.get('label') or group.get('id')}")
+        for item in list(group.get("items") or []):
+            marker = " (unavailable)" if item.get("disabled") else ""
+            print(f"  - {item.get('label') or item.get('id')}{marker}")
+    return 0
+
+
+def _automations_preferences(args):
+    from script_registry import get_automation_preference_contract, set_automation_preference_contract
+
+    has_payload = any([
+        str(getattr(args, "payload", "") or "").strip(),
+        str(getattr(args, "payload_file", "") or "").strip(),
+        bool(getattr(args, "payload_stdin", False)),
+    ])
+    if has_payload:
+        payload, error_code = _load_json_payload_arg(args, command_name="automations preferences")
+        if error_code is not None:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            return error_code
+        result = set_automation_preference_contract(args.name, payload)
+    else:
+        result = get_automation_preference_contract(args.name)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok", True) else 1
+    if not result.get("ok", True):
+        print(result.get("error", "Could not update automation preferences"), file=sys.stderr)
+        return 1
+    prefs = result.get("preferences") or {}
+    values = prefs.get("values") if isinstance(prefs, dict) else {}
+    print(f"Content preferences for {result.get('name') or args.name}:")
+    for key, value in sorted((values or {}).items()):
+        print(f"  {key}: {value}")
+    return 0
+
+
+def _morning_briefing(args):
+    from morning_briefing import latest_morning_briefing, mark_desktop_state
+
+    command = str(getattr(args, "morning_briefing_command", "") or "").strip()
+    if command == "latest":
+        result = latest_morning_briefing(include_non_sent=bool(getattr(args, "include_non_sent", False)))
+    elif command in {"mark-shown", "mark-opened", "mark-dismissed"}:
+        action = command.replace("mark-", "")
+        result = mark_desktop_state(action, briefing_id=getattr(args, "briefing_id", None))
+    else:
+        result = {"ok": False, "error": "Unknown morning briefing command."}
+
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok", True) else 1
+    if not result.get("ok", True):
+        print(result.get("error", "Could not read morning briefing"), file=sys.stderr)
+        return 1
+    briefing = result.get("briefing")
+    if not briefing:
+        print("No morning briefing is available yet.")
+        return 0
+    print(briefing.get("subject") or "Morning briefing")
+    body = str(briefing.get("body_text") or "").strip()
+    if body:
+        print()
+        print(body)
+    return 0
+
+
+def _agents_list(args):
+    from script_registry import list_agents
+
+    rows = list_agents(include_archived=bool(getattr(args, "all", False)))
+    if args.json:
+        print(json.dumps({"ok": True, "agents": rows}, indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("No agents registered.")
+        return 0
+    for row in rows:
+        state = "archived" if row.get("archived") else ("enabled" if row.get("enabled", True) else "disabled")
+        schedule = str(row.get("effective_schedule_label") or "manual")
+        print(f"{row.get('name')} [{state}] · {schedule} · {row.get('title') or row.get('description') or ''}")
+    return 0
+
+
+def _agents_create(args):
+    from script_registry import create_agent_script
+
+    try:
+        result = create_agent_script(
+            args.name,
+            description=args.description,
+            runtime=args.runtime,
+            force=args.force,
+        )
+    except (FileExistsError, ValueError) as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+        else:
+            print(str(e), file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(f"Created agent script: {result['path']}")
+    return 0
+
+
+def _agents_status(args):
+    from script_registry import get_agent_status
+
+    result = get_agent_status(args.name)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if not result.get("ok"):
+        print(result.get("error", "Failed to read agent status"), file=sys.stderr)
+        return 1
+    agent = result.get("agent") or {}
+    state = "archived" if agent.get("archived") else ("enabled" if agent.get("enabled") else "DISABLED")
+    print(f"{agent.get('name')} [{state}] -> {agent.get('title') or agent.get('description') or ''}")
+    schedule = str(agent.get("effective_schedule_label") or "").strip()
+    if schedule:
+        print(f"  schedule: {schedule} ({agent.get('schedule_source') or 'metadata'})")
+    if agent.get("last_run_at"):
+        print(f"  last run: {agent.get('last_run_at')} (exit={agent.get('last_exit_code')})")
+    return 0
+
+
+def _agents_set_enabled(args, enabled):
+    from script_registry import set_agent_enabled
+
+    result = set_agent_enabled(args.name, enabled)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if not result.get("ok"):
+        print(result.get("error", "Failed to toggle agent"), file=sys.stderr)
+        return 1
+    verb = "enabled" if enabled else "disabled"
+    print(f"Agent {result['name']} {verb}.")
+    return 0
+
+
+def _agents_archive(args):
+    from script_registry import archive_agent
+
+    result = archive_agent(args.name, archived=not bool(getattr(args, "restore", False)))
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if not result.get("ok"):
+        print(result.get("error", "Failed to archive agent"), file=sys.stderr)
+        return 1
+    print(f"Agent {result['name']} {'restored' if args.restore else 'archived'}.")
+    return 0
+
+
+def _agents_set_schedule(args):
+    from script_registry import set_agent_schedule
+
+    interval_seconds = None
+    daily_at = None
+    schedule_freq = None
+    schedule_at = None
+    schedule_day = None
+    if getattr(args, "every_minutes", None) is not None:
+        interval_seconds = int(args.every_minutes) * 60
+    elif getattr(args, "every_seconds", None) is not None:
+        interval_seconds = int(args.every_seconds)
+    elif getattr(args, "daily_at", None):
+        daily_at = str(args.daily_at).strip()
+    elif getattr(args, "schedule_freq", None):
+        schedule_freq = str(args.schedule_freq).strip()
+        schedule_at = str(getattr(args, "schedule_at", "") or "").strip()
+        schedule_day = getattr(args, "schedule_day", None)
+
+    result = set_agent_schedule(
+        args.name,
+        interval_seconds=interval_seconds,
+        daily_at=daily_at,
+        schedule_freq=schedule_freq,
+        schedule_at=schedule_at,
+        schedule_day=schedule_day,
+        clear=bool(getattr(args, "reset", False)),
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if not result.get("ok"):
+        print(result.get("error", "Failed to update agent cadence"), file=sys.stderr)
+        return 1
+    agent = result.get("agent") or {}
+    label = str(agent.get("effective_schedule_label") or "").strip()
+    print(f"Agent schedule updated for {result['name']}: {label or 'manual'}")
+    return 0
+
+
+def _agents_run(args):
+    from script_registry import get_agent_status
+
+    status = get_agent_status(args.name)
+    if not status.get("ok"):
+        print(status.get("error", "Agent not found"), file=sys.stderr)
+        return 1
+    agent = status.get("agent") or {}
+    if agent.get("archived"):
+        print(f"Agent is archived: {agent.get('name') or args.name}", file=sys.stderr)
+        return 1
+    if agent.get("enabled") is False:
+        print(f"Agent is disabled: {agent.get('name') or args.name}", file=sys.stderr)
+        return 1
+    args.name = agent.get("path") or args.name
+    args.script_args = list(getattr(args, "script_args", []) or [])
+    return _scripts_run(args)
+
+
+def _core_schedules_list(args):
+    from core_schedule_controls import list_core_schedules
+
+    rows = list_core_schedules()
+    if args.json:
+        print(json.dumps({"ok": True, "core_schedules": rows}, indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("No core schedules available.")
+        return 0
+    for row in rows:
+        schedule = str(row.get("effective_schedule_label") or "—")
+        note = str(row.get("note") or "").strip()
+        extra = f" · {note}" if note else ""
+        print(f"{row.get('name')} · {schedule}{extra}")
+    return 0
+
+
+def _core_schedules_status(args):
+    from core_schedule_controls import get_core_schedule_status
+
+    result = get_core_schedule_status(args.name)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if not result.get("ok"):
+        print(result.get("error", "Failed to read core schedule"), file=sys.stderr)
+        return 1
+    print(f"{result.get('name')} -> {result.get('effective_schedule_label') or '—'}")
+    default_label = (result.get("default_schedule_label") or "").strip()
+    if default_label:
+        print(f"  default: {default_label}")
+    note = (result.get("note") or "").strip()
+    if note:
+        print(f"  note: {note}")
+    return 0
+
+
+def _core_schedules_set(args):
+    from core_schedule_controls import set_core_schedule
+
+    interval_seconds = None
+    daily_at = None
+    if getattr(args, "every_minutes", None) is not None:
+        interval_seconds = int(args.every_minutes) * 60
+    elif getattr(args, "every_seconds", None) is not None:
+        interval_seconds = int(args.every_seconds)
+    elif getattr(args, "daily_at", None):
+        daily_at = str(args.daily_at).strip()
+
+    result = set_core_schedule(
+        args.name,
+        interval_seconds=interval_seconds,
+        daily_at=daily_at,
+        clear=bool(getattr(args, "reset", False)),
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if not result.get("ok"):
+        print(result.get("error", "Failed to update core schedule"), file=sys.stderr)
+        return 1
+    label = str(result.get("effective_schedule_label") or "").strip()
+    source = str(result.get("schedule_source") or "manifest").strip()
+    if label:
+        print(f"Core schedule updated for {result['name']}: {label} ({source})")
+    else:
+        print(f"Core schedule updated for {result['name']}.")
+    warning = str(result.get("warning") or "").strip()
+    if warning:
+        print(f"  Warning: {warning}")
+    sync_result = result.get("runtime_sync") if isinstance(result.get("runtime_sync"), dict) else {}
+    if sync_result.get("ok") is False:
+        print(f"  Warning: saved, but runtime sync failed: {sync_result.get('error', 'unknown error')}")
+    return 0
+
+
+def _scripts_remove(args):
+    from script_registry import remove_personal_script
+
+    result = remove_personal_script(args.name, keep_file=args.keep_file)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        if not result.get("ok"):
+            print(result.get("error", "Failed to remove script"), file=sys.stderr)
+            return 1
+        action = "unregistered" if args.keep_file else "removed"
+        print(f"Script {result['script']} {action}")
+    return 0 if result.get("ok") else 1
+
+
+def _scripts_run(args):
+    from db import init_db, record_personal_script_run
+    from script_registry import resolve_script_reference, sync_personal_scripts
+
+    init_db()
+    sync_personal_scripts()
+    info = resolve_script_reference(args.name)
+    if not info:
+        print(f"Script not found: {args.name}", file=sys.stderr)
+        return 1
+
+    path = Path(info["path"])
+    runtime = info["runtime"]
+    meta = info["metadata"]
+    is_core = info.get("core", False)
+
+    # Build environment
+    env = {
+        **os.environ,
+        "NEXO_HOME": str(NEXO_HOME),
+        "NEXO_CODE": str(NEXO_CODE),
+        "NEXO_SCRIPT_NAME": info["name"],
+        "NEXO_SCRIPT_PATH": str(path),
+        "NEXO_CLI": "nexo",
+    }
+
+    # Only inject DB paths for core scripts
+    if is_core:
+        env["NEXO_DB"] = str(paths.db_path())
+        env["NEXO_COGNITIVE_DB"] = str(resolve_cognitive_db(for_write=True))
+
+    # Timeout
+    timeout = None
+    timeout_str = meta.get("timeout", "")
+    if timeout_str:
+        try:
+            timeout = int(timeout_str)
+        except ValueError:
+            pass
+
+    # Build command
+    if runtime == "python":
+        cmd = [sys.executable, str(path)] + args.script_args
+    elif runtime == "shell":
+        cmd = ["bash", str(path)] + args.script_args
+    elif runtime == "node":
+        cmd = ["node", str(path)] + args.script_args
+    elif runtime == "php":
+        cmd = ["php", str(path)] + args.script_args
+    else:
+        # Try to execute directly
+        cmd = [str(path)] + args.script_args
+
+    try:
+        result = subprocess.run(cmd, env=env, timeout=timeout)
+        if not is_core:
+            record_personal_script_run(str(path), result.returncode)
+        return result.returncode
+    except subprocess.TimeoutExpired:
+        if not is_core:
+            record_personal_script_run(str(path), 124)
+        print(f"Script timed out after {timeout}s", file=sys.stderr)
+        return 124
+    except Exception as e:
+        if not is_core:
+            record_personal_script_run(str(path), 1)
+        print(f"Error running script: {e}", file=sys.stderr)
+        return 1
+
+
+def _scripts_doctor(args):
+    from db import init_db
+    from script_registry import doctor_script, doctor_all_scripts, sync_personal_scripts
+
+    init_db()
+    sync_personal_scripts()
+
+    if args.name:
+        results = [doctor_script(args.name)]
+    else:
+        results = doctor_all_scripts()
+
+    if args.json:
+        print(json.dumps(results, indent=2))
+    else:
+        if not results:
+            print("No personal scripts to check.")
+            return 0
+        any_fail = False
+        for r in results:
+            name = r.get("name", "?")
+            status = r.get("status", "?")
+            icon = {"pass": "✓", "warn": "⚠", "fail": "✗"}.get(status, "?")
+            print(f"\n{icon} {name} [{status}]")
+            for item in r.get("items", []):
+                lvl = item["level"]
+                prefix = {"pass": "  ✓", "warn": "  ⚠", "fail": "  ✗"}.get(lvl, "  ?")
+                print(f"{prefix} {item['msg']}")
+            if status == "fail":
+                any_fail = True
+        print()
+        return 1 if any_fail else 0
+
+    return 0
+
+
+def _export_bundle(args):
+    from user_data_portability import export_user_bundle
+
+    result = export_user_bundle(args.path or "")
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        if not result.get("ok"):
+            print(result.get("error", "Export failed"), file=sys.stderr)
+            return 1
+        sections = result.get("sections", {})
+        script_count = sections.get("personal_scripts", {}).get("files", 0)
+        print(f"User data export written to {result['path']}")
+        print(f"  Personal scripts: {script_count}")
+        print(f"  Sections: {', '.join(sorted(sections))}")
+    return 0 if result.get("ok") else 1
+
+
+def _import_bundle(args):
+    from user_data_portability import import_user_bundle
+
+    result = import_user_bundle(args.path)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        if not result.get("ok"):
+            print(result.get("error", "Import failed"), file=sys.stderr)
+            return 1
+        restored = result.get("restored", {})
+        script_count = restored.get("personal_scripts", {}).get("files", 0)
+        print(f"User data imported from {result['path']}")
+        print(f"  Safety backup: {result['safety_backup']}")
+        print(f"  Personal scripts restored: {script_count}")
+        print(f"  Sections: {', '.join(sorted(restored))}")
+    return 0 if result.get("ok") else 1
+
+
+def _inspect_bundle(args):
+    from user_data_portability import inspect_user_bundle
+
+    result = inspect_user_bundle(args.path)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        if not result.get("ok"):
+            print(result.get("error", "Inspect failed"), file=sys.stderr)
+            return 1
+        sections = result.get("section_names", [])
+        print(f"Bundle ready: {result['path']}")
+        print(f"  Bundle version: {result.get('bundle_version', '?')}")
+        print(f"  Current runtime: {result.get('current_version', '?')}")
+        print(f"  Sections: {', '.join(sections) if sections else '(none)'}")
+        warnings = result.get("warning_codes", [])
+        if warnings:
+            print(f"  Warnings: {', '.join(warnings)}")
+    return 0 if result.get("ok") else 1
+
+
+def _runtime_python_candidates() -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(value: str | None) -> None:
+        if not value:
+            return
+        text = str(value).strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        candidates.append(text)
+
+    _add(os.environ.get("NEXO_RUNTIME_PYTHON"))
+    _add(os.environ.get("NEXO_PYTHON"))
+    _add(sys.executable)
+
+    for root in {NEXO_HOME, NEXO_CODE, NEXO_CODE.parent}:
+        _add(str(root / ".venv" / "bin" / "python3"))
+        _add(str(root / ".venv" / "bin" / "python"))
+
+    if sys.platform == "darwin":
+        _add("/opt/homebrew/bin/python3")
+        _add("/usr/local/bin/python3")
+    else:
+        _add("/usr/local/bin/python3")
+        _add("/usr/bin/python3")
+
+    _add(shutil.which("python3"))
+    _add(shutil.which("python"))
+    return candidates
+
+
+def _python_supports_module(python_bin: str, module_name: str) -> bool:
+    path = Path(python_bin)
+    if "/" in python_bin and not path.exists():
+        return False
+    try:
+        result = subprocess.run(
+            [python_bin, "-c", f"import {module_name}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env={**os.environ, "NEXO_HOME": str(NEXO_HOME), "NEXO_CODE": str(NEXO_CODE)},
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _recover_scripts_call_runtime(tool_name: str, exc: ModuleNotFoundError) -> int | None:
+    missing = getattr(exc, "name", "") or ""
+    if missing != "fastmcp":
+        return None
+    if os.environ.get("NEXO_CLI_REEXECED") == "1":
+        return None
+
+    current = str(Path(sys.executable).resolve())
+    for candidate in _runtime_python_candidates():
+        try:
+            resolved = str(Path(candidate).resolve()) if "/" in candidate else candidate
+        except Exception:
+            resolved = candidate
+        if resolved == current:
+            continue
+        if not _python_supports_module(candidate, "fastmcp"):
+            continue
+        env = {
+            **os.environ,
+            "NEXO_HOME": str(NEXO_HOME),
+            "NEXO_CODE": str(NEXO_CODE),
+            "NEXO_CLI_REEXECED": "1",
+        }
+        result = subprocess.run(
+            [candidate, str(Path(__file__).resolve()), *sys.argv[1:]],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.stderr:
+            print(result.stderr, file=sys.stderr, end="")
+        return result.returncode
+    return None
+
+
+def _scripts_call(args):
+    """Call a NEXO MCP tool via in-process fastmcp client."""
+    tool_name = args.tool
+    try:
+        payload = json.loads(args.input) if args.input else {}
+    except json.JSONDecodeError as e:
+        print(f"Invalid JSON input: {e}", file=sys.stderr)
+        return 1
+
+    if not tool_name.startswith("nexo_"):
+        print(f"Tool not found: {tool_name}", file=sys.stderr)
+        return 1
+
+    # Legacy `scripts call nexo_doctor` callers predate the explicit doctor-plane
+    # contract. Keep the plugin strict, but default the CLI compatibility surface
+    # to the install/runtime plane that old callers implicitly meant.
+    if tool_name == "nexo_doctor" and isinstance(payload, dict) and not str(payload.get("plane") or "").strip():
+        payload["plane"] = "installation_live"
+
+    def _doctor_value_direct():
+        from plugins.doctor import handle_doctor
+
+        if not isinstance(payload, dict):
+            return handle_doctor()
+        return handle_doctor(
+            tier=str(payload.get("tier") or "boot"),
+            fix=bool(payload.get("fix") or False),
+            output=str(payload.get("output") or "text"),
+            plane=str(payload.get("plane") or ""),
+        )
+
+    def _bootstrap_mcp():
+        os.environ["NEXO_CLI_MODE"] = "1"
+        from db import init_db
+        from plugin_loader import load_all_plugins
+        from server import mcp
+
+        init_db()
+
+        # Plugin loading is required so scripts can call plugin tools such as
+        # nexo_doctor, but the loader is noisy on stderr and would pollute CLI output.
+        with contextlib.redirect_stderr(io.StringIO()):
+            load_all_plugins(mcp)
+
+        return mcp
+
+    def _extract_tool_value(result):
+        structured = getattr(result, "structured_content", None)
+        if structured not in (None, {}):
+            return structured
+
+        content = getattr(result, "content", None)
+        if isinstance(content, list):
+            texts = [item.text for item in content if hasattr(item, "text")]
+            if texts:
+                return "\n".join(texts)
+
+        dumped = getattr(result, "model_dump", None)
+        if callable(dumped):
+            data = dumped()
+            if isinstance(data, dict):
+                return data.get("structured_content") or data.get("content") or data
+
+        return str(result)
+
+    try:
+        if tool_name == "nexo_doctor":
+            value = _doctor_value_direct()
+        else:
+            mcp = _bootstrap_mcp()
+
+            async def _call():
+                tool = await mcp.get_tool(tool_name)
+                if tool is None:
+                    tools = await mcp.list_tools()
+                    available = sorted(t.name for t in tools)
+                    raise LookupError(
+                        f"Tool not found: {tool_name}\nAvailable tools: {', '.join(available)}"
+                    )
+                return await mcp.call_tool(tool_name, payload)
+
+            result = asyncio.run(_call())
+            value = _extract_tool_value(result)
+
+        if args.json_output:
+            if (
+                isinstance(value, dict)
+                and set(value.keys()) == {"result"}
+                and isinstance(value["result"], str)
+            ):
+                try:
+                    value = json.loads(value["result"])
+                except json.JSONDecodeError:
+                    pass
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    value = {"result": value}
+            elif not isinstance(value, (dict, list)):
+                value = {"result": value}
+            print(json.dumps(value, indent=2, ensure_ascii=False))
+            return 0
+
+        if isinstance(value, dict) and set(value.keys()) == {"result"} and isinstance(value["result"], str):
+            print(value["result"])
+        elif isinstance(value, (dict, list)):
+            print(json.dumps(value, indent=2, ensure_ascii=False))
+        else:
+            print(value)
+        return 0
+
+    except LookupError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    except Exception as e:
+        if isinstance(e, ModuleNotFoundError):
+            recovered = _recover_scripts_call_runtime(tool_name, e)
+            if recovered is not None:
+                return recovered
+        print(f"Error calling tool {tool_name}: {e}", file=sys.stderr)
+        return 1
+
+
+def _local_context_emit(payload: dict, args) -> int:
+    return _print_json_or_text(payload, as_json=bool(getattr(args, "json", False)))
+
+
+def _load_json_payload_arg(args, *, command_name: str) -> tuple[dict, int | None]:
+    payload_text = ""
+    payload_file = str(getattr(args, "payload_file", "") or "").strip()
+    if payload_file:
+        try:
+            payload_text = Path(payload_file).read_text(encoding="utf-8")
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": "payload_file_read_failed",
+                "detail": f"{type(exc).__name__}: {exc}",
+                "command": command_name,
+            }, 3
+    elif bool(getattr(args, "payload_stdin", False)):
+        payload_text = sys.stdin.read()
+    else:
+        payload_text = str(getattr(args, "payload", "") or "")
+
+    if not payload_text.strip():
+        return {}, None
+    try:
+        parsed = json.loads(payload_text)
+    except json.JSONDecodeError as exc:
+        return {
+            "ok": False,
+            "error": "invalid_payload_json",
+            "detail": str(exc),
+            "command": command_name,
+        }, 2
+    if not isinstance(parsed, dict):
+        return {
+            "ok": False,
+            "error": "payload_must_be_object",
+            "command": command_name,
+        }, 2
+    return parsed, None
+
+
+def _pre_answer_route(args) -> int:
+    payload, error_code = _load_json_payload_arg(args, command_name="pre-answer route")
+    if error_code is not None:
+        print(json.dumps(payload, ensure_ascii=False))
+        return error_code
+
+    for arg_key, payload_key in (
+        ("query", "query"),
+        ("sid", "sid"),
+        ("conversation_id", "conversation_id"),
+        ("intent", "intent"),
+        ("area", "area"),
+        ("files", "files"),
+        ("current_context", "current_context"),
+    ):
+        value = getattr(args, arg_key, None)
+        if value not in (None, ""):
+            payload[payload_key] = value
+    for arg_key, payload_key in (("budget_ms", "budget_ms"), ("token_budget", "token_budget")):
+        value = getattr(args, arg_key, None)
+        if value is not None:
+            payload[payload_key] = value
+
+    from pre_answer_runtime import run_pre_answer_route
+
+    result = run_pre_answer_route(payload)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result.get("ok") else 1
+
+
+def _memory_observations_process(args) -> int:
+    from memory_observation_processor import process_incremental
+
+    return _print_json_or_text(
+        process_incremental(
+            process_limit=int(getattr(args, "limit", 100) or 100),
+            backfill_limit=int(getattr(args, "backfill_limit", 100) or 100),
+            pending_sla_seconds=int(getattr(args, "pending_sla_seconds", 3600) or 3600),
+        ),
+        as_json=bool(getattr(args, "json", False)),
+    )
+
+
+def _memory_observations_intraday(args) -> int:
+    from memory_observation_processor import process_intraday_cycle
+
+    return _print_json_or_text(
+        process_intraday_cycle(
+            process_limit=int(getattr(args, "limit", 20) or 20),
+            backfill_limit=int(getattr(args, "backfill_limit", 20) or 20),
+            pending_sla_seconds=int(getattr(args, "pending_sla_seconds", 3600) or 3600),
+        ),
+        as_json=bool(getattr(args, "json", False)),
+    )
+
+
+def _cognitive_control_observatory(args) -> int:
+    from cognitive_control_observatory import build_cognitive_control_observatory
+
+    return _print_json_or_text(
+        build_cognitive_control_observatory(
+            window_seconds=int(getattr(args, "window_seconds", 86400) or 86400),
+        ),
+        as_json=bool(getattr(args, "json", False)),
+    )
+
+
+def _local_context_status(args) -> int:
+    import local_context
+    return _local_context_emit(local_context.status(), args)
+
+
+def _local_context_run_once(args) -> int:
+    import local_context
+    return _local_context_emit(
+        local_context.run_once(
+            root=getattr(args, "root", "") or None,
+            limit=getattr(args, "limit", None),
+            process_limit=int(getattr(args, "process_limit", 100) or 100),
+        ),
+        args,
+    )
+
+
+def _local_context_reconcile(args) -> int:
+    import local_context
+    return _local_context_emit(
+        local_context.reconcile_live_changes(
+            asset_limit=int(getattr(args, "asset_limit", 2000) or 0),
+            dir_limit=int(getattr(args, "dir_limit", 300) or 0),
+            file_limit=int(getattr(args, "file_limit", 1000) or 0),
+        ),
+        args,
+    )
+
+
+def _local_context_control(args) -> int:
+    import local_context
+    command = str(getattr(args, "local_context_command", "") or "")
+    if command == "pause":
+        return _local_context_emit(local_context.pause(), args)
+    if command == "resume":
+        return _local_context_emit(local_context.resume(), args)
+    if command == "clear-index":
+        return _local_context_emit(local_context.clear_index(), args)
+    return _local_context_emit({"ok": False, "error": f"unsupported control command: {command}"}, args)
+
+
+def _local_context_roots(args) -> int:
+    import local_context
+    command = str(getattr(args, "local_context_roots_command", "") or "")
+    if command == "list":
+        return _local_context_emit({"ok": True, "roots": local_context.list_roots()}, args)
+    if command == "add":
+        return _local_context_emit(
+            local_context.add_root(
+                getattr(args, "path", ""),
+                mode=getattr(args, "mode", "normal") or "normal",
+                depth=getattr(args, "depth", None),
+            ),
+            args,
+        )
+    if command == "remove":
+        return _local_context_emit(local_context.remove_root(getattr(args, "path", "")), args)
+    return _local_context_emit({"ok": False, "error": f"unsupported roots command: {command}"}, args)
+
+
+def _local_context_exclusions(args) -> int:
+    import local_context
+    command = str(getattr(args, "local_context_exclusions_command", "") or "")
+    if command == "list":
+        return _local_context_emit({"ok": True, "exclusions": local_context.list_exclusions()}, args)
+    if command == "add":
+        return _local_context_emit(
+            local_context.add_exclusion(
+                getattr(args, "path", ""),
+                reason=getattr(args, "reason", "user") or "user",
+            ),
+            args,
+        )
+    if command == "remove":
+        return _local_context_emit(local_context.remove_exclusion(getattr(args, "path", "")), args)
+    return _local_context_emit({"ok": False, "error": f"unsupported exclusions command: {command}"}, args)
+
+
+def _local_context_filetypes(args) -> int:
+    import local_context
+    command = str(getattr(args, "local_context_filetypes_command", "") or "")
+    if command == "list":
+        return _local_context_emit(local_context.list_file_type_rules(readonly=False), args)
+    if command == "include":
+        return _local_context_emit(
+            local_context.set_file_type_rule(
+                getattr(args, "extension", ""),
+                action=getattr(args, "action", "extract") or "extract",
+                reason=getattr(args, "reason", "user") or "user",
+            ),
+            args,
+        )
+    if command == "exclude":
+        return _local_context_emit(
+            local_context.set_file_type_rule(
+                getattr(args, "extension", ""),
+                action="ignore",
+                reason=getattr(args, "reason", "user") or "user",
+            ),
+            args,
+        )
+    if command == "remove":
+        return _local_context_emit(local_context.remove_file_type_rule(getattr(args, "extension", "")), args)
+    if command == "reset":
+        return _local_context_emit(local_context.reset_file_type_rules(), args)
+    return _local_context_emit({"ok": False, "error": f"unsupported filetypes command: {command}"}, args)
+
+
+def _local_context_migrate_roots_v2(args) -> int:
+    import local_context
+    dry_run = not bool(getattr(args, "apply", False))
+    return _local_context_emit(local_context.migrate_roots_seed_v2(dry_run=dry_run), args)
+
+
+def _local_context_query(args) -> int:
+    import local_context
+    return _local_context_emit(
+        local_context.context_query(
+            getattr(args, "query", "") or "",
+            intent=getattr(args, "intent", "answer") or "answer",
+            limit=int(getattr(args, "limit", 12) or 12),
+            evidence_required=not bool(getattr(args, "no_evidence_required", False)),
+            current_context=getattr(args, "current_context", "") or "",
+            mode=getattr(args, "mode", "compact") or "compact",
+            max_chars=int(getattr(args, "max_chars", 20000) or 0),
+            include_entities=bool(getattr(args, "include_entities", False)),
+            include_relations=bool(getattr(args, "include_relations", False)),
+            record_query=not bool(getattr(args, "no_record", False)),
+        ),
+        args,
+    )
+
+
+def _local_context_diagnostics(args) -> int:
+    import local_context
+    return _local_context_emit(
+        local_context.diagnostics_tail(limit=int(getattr(args, "limit", 100) or 100)),
+        args,
+    )
+
+
+def _local_context_models(args) -> int:
+    import local_context
+    command = str(getattr(args, "local_context_models_command", "") or "status")
+    if command == "warmup":
+        return _local_context_emit(
+            local_context.warmup_models(local_files_only=not bool(getattr(args, "allow_download", False))),
+            args,
+        )
+    return _local_context_emit(local_context.model_status(), args)
+
+
+def _local_context_performance(args) -> int:
+    import local_context
+    command = str(getattr(args, "local_context_performance_command", "") or "status")
+    if command == "set":
+        return _local_context_emit(
+            local_context.set_performance_profile(getattr(args, "profile", "") or "medium"),
+            args,
+        )
+    return _local_context_emit({"ok": True, "performance": local_context.performance_config()}, args)
+
+
+def _local_context_service_config(args) -> int:
+    from local_context import api as local_context_api
+    return _local_context_emit(
+        local_context_api.render_service_config(getattr(args, "platform", "") or None),
+        args,
+    )
+
+
+def _local_context_asset(args) -> int:
+    import local_context
+    command = str(getattr(args, "local_context_asset_command", "") or "")
+    if command == "get":
+        return _local_context_emit(local_context.get_asset(getattr(args, "asset_id", "")), args)
+    if command == "neighbors":
+        return _local_context_emit(
+            local_context.get_neighbors(
+                getattr(args, "asset_id", ""),
+                limit=int(getattr(args, "limit", 30) or 30),
+            ),
+            args,
+        )
+    if command == "purge":
+        return _local_context_emit(local_context.purge_asset(getattr(args, "asset_id", "")), args)
+    return _local_context_emit({"ok": False, "error": f"unsupported asset command: {command}"}, args)
+
+
+def _recover(args):
+    """Delegate to plugins.recover.cli_main so the logic lives in one place."""
+    from plugins.recover import cli_main as _recover_cli_main
+    argv: list[str] = []
+    if getattr(args, "source", None):
+        argv.extend(["--from", args.source])
+    if getattr(args, "list", False):
+        argv.append("--list")
+    if getattr(args, "dry_run", False):
+        argv.append("--dry-run")
+    if getattr(args, "force", False):
+        argv.append("--force")
+    if getattr(args, "yes", False):
+        argv.append("--yes")
+    if getattr(args, "json", False):
+        argv.append("--json")
+    return _recover_cli_main(argv)
+
+
+def _rollback_f06(args):
+    """Revert the F0.6 layout migration using ``~/.nexo-pre-f06-snapshot``.
+
+    Safe two-stage swap: the current ``~/.nexo`` tree is renamed to a dated
+    backup (``~/.nexo-rollback-backup-YYYYMMDDHHMMSS``) BEFORE the snapshot is
+    restored in its place, so the operation never destroys state if it is
+    interrupted mid-way. LaunchAgents are booted out before the swap and
+    reloaded after (skip via ``--keep-agents-running``).
+    """
+    import json as _json
+    import shutil as _shutil
+    import subprocess as _subprocess
+    from datetime import datetime as _datetime
+    from pathlib import Path as _Path
+
+    nexo_home = _Path(os.environ.get("NEXO_HOME", str(_Path.home() / ".nexo")))
+    snapshot = _Path(str(nexo_home) + "-pre-f06-snapshot")
+    now_stamp = _datetime.now().strftime("%Y%m%d%H%M%S")
+    dry_run = bool(getattr(args, "dry_run", False))
+    emit_json = bool(getattr(args, "json", False))
+    assume_yes = bool(getattr(args, "yes", False))
+    keep_agents = bool(getattr(args, "keep_agents_running", False))
+
+    report: dict[str, object] = {
+        "nexo_home": str(nexo_home),
+        "snapshot": str(snapshot),
+        "snapshot_exists": snapshot.exists(),
+        "snapshot_is_dir": snapshot.is_dir() if snapshot.exists() else False,
+        "dry_run": dry_run,
+        "steps": [],
+        "status": "planned",
+    }
+
+    if not snapshot.exists() or not snapshot.is_dir():
+        report["status"] = "error_no_snapshot"
+        report["error"] = f"Pre-F0.6 snapshot not found at {snapshot}"
+        if emit_json:
+            print(_json.dumps(report, indent=2))
+        else:
+            print(f"ERROR: no pre-F0.6 snapshot at {snapshot}", file=sys.stderr)
+            print("       Rollback is only available immediately after a migration.", file=sys.stderr)
+        return 1
+
+    if nexo_home.exists():
+        backup_target = _Path(str(nexo_home) + f"-rollback-backup-{now_stamp}")
+        # Avoid collision if the operator retries in the same second.
+        collision_suffix = 0
+        while backup_target.exists():
+            collision_suffix += 1
+            backup_target = _Path(str(nexo_home) + f"-rollback-backup-{now_stamp}-{collision_suffix}")
+    else:
+        backup_target = None
+
+    agents_to_restart: list[_Path] = []
+    if not keep_agents:
+        agents_dir = _Path.home() / "Library" / "LaunchAgents"
+        if agents_dir.is_dir():
+            agents_to_restart = sorted(agents_dir.glob("com.nexo.*.plist"))
+
+    plan_steps: list[dict] = []
+    if agents_to_restart:
+        plan_steps.append({
+            "step": "bootout_launchagents",
+            "count": len(agents_to_restart),
+            "samples": [p.name for p in agents_to_restart[:5]],
+        })
+    if backup_target is not None:
+        plan_steps.append({
+            "step": "move_current_nexo_home_to_backup",
+            "from": str(nexo_home),
+            "to": str(backup_target),
+        })
+    plan_steps.append({
+        "step": "move_snapshot_to_nexo_home",
+        "from": str(snapshot),
+        "to": str(nexo_home),
+    })
+    if agents_to_restart:
+        plan_steps.append({
+            "step": "reload_launchagents",
+            "count": len(agents_to_restart),
+        })
+    report["steps"] = plan_steps
+
+    if dry_run:
+        report["status"] = "dry_run"
+        if emit_json:
+            print(_json.dumps(report, indent=2))
+        else:
+            print(f"nexo rollback f06 (DRY-RUN)")
+            print(f"  NEXO_HOME: {nexo_home}")
+            print(f"  snapshot:  {snapshot}")
+            if backup_target is not None:
+                print(f"  backup → {backup_target}")
+            if agents_to_restart:
+                print(f"  LaunchAgents to restart: {len(agents_to_restart)}")
+            print("  (no filesystem or launchctl changes were made)")
+        return 0
+
+    if not assume_yes:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            print("ERROR: interactive confirmation required. Pass --yes to proceed non-interactively.", file=sys.stderr)
+            return 1
+        print("This will replace the current NEXO_HOME with the pre-F0.6 snapshot.")
+        print(f"  Current ~/.nexo → {backup_target if backup_target else '(nothing to back up, current missing)'}")
+        print(f"  Restored from snapshot → {nexo_home}")
+        if agents_to_restart:
+            print(f"  LaunchAgents affected: {len(agents_to_restart)}")
+        answer = input("Type 'ROLLBACK' to proceed: ").strip()
+        if answer != "ROLLBACK":
+            print("Aborted — exact token not typed.")
+            return 1
+
+    def _run_launchctl(cmd: list[str]) -> tuple[int, str]:
+        try:
+            proc = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            return proc.returncode, (proc.stderr or "").strip()
+        except _subprocess.TimeoutExpired as exc:
+            return 124, f"timeout: {exc}"
+        except FileNotFoundError:
+            return 127, "launchctl not found"
+        except Exception as exc:  # noqa: BLE001  — launchctl errors are varied
+            return 1, str(exc)
+
+    executed: list[dict] = []
+
+    if agents_to_restart and not keep_agents:
+        for plist in agents_to_restart:
+            rc, err = _run_launchctl(["launchctl", "unload", str(plist)])
+            executed.append({"op": "unload", "plist": str(plist), "rc": rc, "err": err})
+
+    if backup_target is not None:
+        try:
+            nexo_home.rename(backup_target)
+            executed.append({"op": "rename_home", "to": str(backup_target), "rc": 0})
+        except OSError as exc:
+            executed.append({"op": "rename_home", "to": str(backup_target), "rc": 1, "err": str(exc)})
+            report["status"] = "error_rename_home"
+            report["executed"] = executed
+            if emit_json:
+                print(_json.dumps(report, indent=2))
+            else:
+                print(f"ERROR: failed to move {nexo_home} → {backup_target}: {exc}", file=sys.stderr)
+                print("       No changes to snapshot. Current NEXO_HOME is intact.", file=sys.stderr)
+            return 1
+
+    try:
+        snapshot.rename(nexo_home)
+        executed.append({"op": "rename_snapshot", "to": str(nexo_home), "rc": 0})
+    except OSError as exc:
+        executed.append({"op": "rename_snapshot", "to": str(nexo_home), "rc": 1, "err": str(exc)})
+        # Best-effort rollback of the backup rename so the user isn't left without NEXO_HOME.
+        if backup_target is not None and backup_target.exists() and not nexo_home.exists():
+            try:
+                backup_target.rename(nexo_home)
+                executed.append({"op": "rollback_rename_home", "rc": 0})
+            except OSError as rexc:
+                executed.append({"op": "rollback_rename_home", "rc": 1, "err": str(rexc)})
+        report["status"] = "error_rename_snapshot"
+        report["executed"] = executed
+        if emit_json:
+            print(_json.dumps(report, indent=2))
+        else:
+            print(f"ERROR: failed to move snapshot → NEXO_HOME: {exc}", file=sys.stderr)
+        return 1
+
+    if agents_to_restart and not keep_agents:
+        for plist in agents_to_restart:
+            if not plist.exists():
+                # The snapshot may not have the same plist set; skip silently.
+                executed.append({"op": "load_skip_missing", "plist": str(plist), "rc": 0})
+                continue
+            rc, err = _run_launchctl(["launchctl", "load", str(plist)])
+            executed.append({"op": "load", "plist": str(plist), "rc": rc, "err": err})
+
+    report["status"] = "done"
+    report["executed"] = executed
+    if backup_target is not None:
+        report["backup_target"] = str(backup_target)
+
+    if emit_json:
+        print(_json.dumps(report, indent=2))
+    else:
+        print("nexo rollback f06: done")
+        print(f"  restored:  {nexo_home}")
+        if backup_target is not None:
+            print(f"  prior home saved at: {backup_target}")
+            print(f"    review and rm -rf {backup_target}  when you are sure.")
+        if agents_to_restart:
+            print(f"  LaunchAgents reloaded: {len(agents_to_restart)}")
+    return 0
+
+
+def _update(args):
+    """Update the installed runtime.
+
+    Modes:
+    - Dev-linked runtime: sync from the source repo recorded in version.json
+    - Explicit dev env: sync from NEXO_CODE/src
+    - Packaged/runtime-only install: delegate to plugins.update handle_update()
+    """
+    from auto_update import manual_sync_update, _resolve_sync_source
+
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    progress_messages: list[str] = []
+
+    def progress(message: str) -> None:
+        progress_messages.append(message)
+        if not args.json:
+            print(f"[NEXO] {message}", flush=True)
+
+    dest = NEXO_HOME
+    src_dir, repo_dir = _resolve_sync_source()
+    include_clis = not getattr(args, "no_clis", False)
+
+    if src_dir is None or repo_dir is None:
+        try:
+            from plugins.update import handle_update
+        except Exception as e:
+            print(
+                "No source repo recorded for this runtime and packaged updater is unavailable: "
+                f"{e}",
+                file=sys.stderr,
+            )
+            return 1
+
+        result = handle_update(progress_fn=progress, include_clis=include_clis)
+        runtime_power = _load_runtime_power_support()
+        public_contribution = _load_public_contribution_support()
+        choice = runtime_power["ensure_power_policy_choice"](interactive=interactive, reason="update")
+        power_result = runtime_power["apply_power_policy"](choice.get("policy"))
+        fda_choice = runtime_power["ensure_full_disk_access_choice"](interactive=interactive, reason="update")
+        contrib_choice = public_contribution["ensure_public_contribution_choice"](interactive=interactive, reason="update")
+        if args.json:
+            print(json.dumps({
+                "mode": "packaged",
+                "message": result,
+                "progress": progress_messages,
+                "power_policy": choice.get("policy"),
+                "power_action": power_result.get("action"),
+                "power_details": power_result.get("details"),
+                "full_disk_access_status": fda_choice.get("status"),
+                "full_disk_access_reasons": fda_choice.get("reasons"),
+                "full_disk_access_message": fda_choice.get("message"),
+                "public_contribution_mode": contrib_choice.get("mode"),
+                "public_contribution_status": contrib_choice.get("status"),
+                "public_contribution_message": contrib_choice.get("message"),
+            }, indent=2, ensure_ascii=False))
+        else:
+            print(result)
+            if choice.get("prompted"):
+                print(f"Power policy: {runtime_power['format_power_policy_label'](choice.get('policy'))}")
+            if power_result.get("message"):
+                print(f"Power helper: {power_result.get('message')}")
+            if fda_choice.get("prompted"):
+                print(f"Full Disk Access: {runtime_power['format_full_disk_access_label'](fda_choice.get('status'))}")
+            if fda_choice.get("message"):
+                print(f"Full Disk Access: {fda_choice.get('message')}")
+            if contrib_choice.get("prompted"):
+                print(f"Contributor mode: {public_contribution['format_public_contribution_label'](contrib_choice)}")
+            if contrib_choice.get("message"):
+                print(f"Contributor mode: {contrib_choice.get('message')}")
+        return 0 if "UPDATE SUCCESSFUL" in result or "Already up to date" in result else 1
+
+    result = manual_sync_update(
+        interactive=interactive,
+        allow_source_pull=True,
+        progress_fn=progress,
+        include_clis=include_clis,
+    )
+    runtime_power = _load_runtime_power_support()
+    public_contribution = _load_public_contribution_support()
+    choice = runtime_power["ensure_power_policy_choice"](interactive=interactive, reason="update")
+    power_result = runtime_power["apply_power_policy"](choice.get("policy"))
+    fda_choice = runtime_power["ensure_full_disk_access_choice"](interactive=interactive, reason="update")
+    contrib_choice = public_contribution["ensure_public_contribution_choice"](interactive=interactive, reason="update")
+    result["power_policy"] = choice.get("policy")
+    result["power_action"] = power_result.get("action")
+    result["power_details"] = power_result.get("details")
+    result["full_disk_access_status"] = fda_choice.get("status")
+    result["full_disk_access_reasons"] = fda_choice.get("reasons")
+    result["public_contribution_mode"] = contrib_choice.get("mode")
+    result["public_contribution_status"] = contrib_choice.get("status")
+    result["progress"] = progress_messages
+    if power_result.get("message"):
+        result["power_message"] = power_result.get("message")
+    if fda_choice.get("message"):
+        result["full_disk_access_message"] = fda_choice.get("message")
+    if contrib_choice.get("message"):
+        result["public_contribution_message"] = contrib_choice.get("message")
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        if result.get("ok"):
+            print(f"Updated NEXO_HOME ({dest})")
+            print(
+                f"  {result.get('packages', 0)} packages, {result.get('files', 0)} files synced from "
+                f"{result.get('source', src_dir)}"
+            )
+            healed = 0
+            invalid = 0
+            for action in result.get("actions", []):
+                if action.startswith("personal-schedules-healed:"):
+                    try:
+                        healed += int(action.split(":", 1)[1])
+                    except ValueError:
+                        pass
+                elif action.startswith("personal-schedules-invalid:"):
+                    try:
+                        invalid += int(action.split(":", 1)[1])
+                    except ValueError:
+                        pass
+            if healed:
+                print(f"  Personal schedules: self-healed {healed}")
+            if invalid:
+                print(f"  Personal schedules: {invalid} declarations need review")
+            if result.get("pulled_source"):
+                print("  Source repo: pulled latest fast-forward before sync")
+            for dep in result.get("runtime_dependencies") or []:
+                dep_name = dep.get("name", "")
+                dep_status = dep.get("status", "")
+                if dep_status == "updated":
+                    print(f"  Dependencies: {dep_name} {dep.get('old_version')} -> {dep.get('new_version')}")
+                elif dep_status == "installed":
+                    print(f"  Dependencies: {dep_name} installed ({dep.get('new_version')})")
+                elif dep_status == "already_latest":
+                    print(f"  Dependencies: {dep_name} {dep.get('old_version')} (latest)")
+                elif dep_status == "failed":
+                    print(f"  WARNING: {dep_name} update failed: {dep.get('error', 'unknown')}")
+            if choice.get("prompted"):
+                print(f"  Power policy: {runtime_power['format_power_policy_label'](choice.get('policy'))}")
+            if power_result.get("message"):
+                print(f"  Power helper: {power_result.get('message')}")
+            if fda_choice.get("prompted"):
+                print(f"  Full Disk Access: {runtime_power['format_full_disk_access_label'](fda_choice.get('status'))}")
+            if fda_choice.get("message"):
+                print(f"  Full Disk Access: {fda_choice.get('message')}")
+            if contrib_choice.get("prompted"):
+                print(f"  Contributor mode: {public_contribution['format_public_contribution_label'](contrib_choice)}")
+            if contrib_choice.get("message"):
+                print(f"  Contributor mode: {contrib_choice.get('message')}")
+            # One-time model-recommendation upgrade prompt (interactive only).
+            try:
+                _prompt_model_recommendations(interactive=interactive)
+            except Exception as exc:
+                print(f"  Model recommendation check skipped: {exc}", file=sys.stderr)
+        else:
+            print(f"UPDATE FAILED: {result.get('error', 'sync failed')}", file=sys.stderr)
+
+    # Auto-migrate calibration.json flat → nested once per user. Silent on
+    # no-op; logs a line if an actual migration happened.
+    try:
+        from calibration_migration import detect as _cal_detect, apply_migration as _cal_apply
+        if _cal_detect()["shape"] == "flat":
+            mig = _cal_apply()
+            if mig.get("status") == "migrated" and not args.json:
+                print(f"[NEXO] calibration.json migrated flat → nested (backup: {mig.get('backup')})",
+                      flush=True)
+    except Exception:
+        pass
+
+    # v5.4.1 one-time hygiene: purge pre-fix "tool":"unknown" entries from
+    # the sensory-register buffer. Keeps a .pre-v5.4.1.bak backup the first
+    # time it runs on a given host.
+    try:
+        buf = paths.brain_dir() / "session_buffer.jsonl"
+        marker = buf.with_suffix(".jsonl.pre-v5.4.1.bak")
+        if buf.is_file() and not marker.is_file():
+            raw = buf.read_text(errors="ignore").splitlines()
+            unknown = sum(1 for ln in raw if '"tool":"unknown"' in ln)
+            if unknown > 0:
+                buf.rename(marker)
+                cleaned = "\n".join(ln for ln in raw if '"tool":"unknown"' not in ln)
+                if cleaned:
+                    cleaned += "\n"
+                buf.write_text(cleaned)
+                if not args.json:
+                    print(f"[NEXO] session_buffer.jsonl: purged {unknown} legacy "
+                          f"\"tool\":\"unknown\" entries (backup: {marker.name})", flush=True)
+    except Exception:
+        pass
+
+    return 0 if result.get("ok") else 1
+
+
+def _prompt_model_recommendations(*, interactive: bool) -> None:
+    """If model_defaults.json has bumped recommendation_version beyond what
+    the user has acknowledged, offer a one-time upgrade prompt. In
+    non-interactive (cron/headless) contexts, only log a hint. Honours
+    customized models by skipping silently (see was_nexo_default)."""
+    from client_preferences import (
+        load_client_preferences,
+        save_client_preferences,
+        normalize_client_key,
+    )
+    from model_defaults import detect_outdated_recommendations, client_default
+
+    preferences = load_client_preferences()
+    result = detect_outdated_recommendations(preferences)
+    pending = result.get("pending") or []
+    auto_ack = result.get("auto_ack") or {}
+
+    # Apply silent acknowledgements first (user already on current model, or
+    # has customized their model — either way no prompt needed). This avoids
+    # repeated stderr hints in cron/headless updates.
+    if auto_ack:
+        try:
+            existing_ack = dict(preferences.get("acknowledged_model_recommendations") or {})
+            existing_ack.update({k: int(v) for k, v in auto_ack.items()})
+            save_client_preferences(acknowledged_model_recommendations=existing_ack)
+        except Exception:
+            pass
+
+    if not pending:
+        return
+
+    is_tty = bool(interactive and sys.stdin.isatty() and sys.stdout.isatty())
+    if not is_tty:
+        for entry in pending:
+            print(
+                f"  ⭐ Model recommendation available for "
+                f"{entry['client']}: {entry['display_name']}. "
+                f"Run `nexo update` interactively to review and apply.",
+                file=sys.stderr,
+            )
+        return
+
+    updated_profiles = dict(preferences.get("client_runtime_profiles") or {})
+    updated_ack = dict(preferences.get("acknowledged_model_recommendations") or {})
+    updated_ack.update({k: int(v) for k, v in auto_ack.items()})
+    changed = bool(auto_ack)
+    for entry in pending:
+        client = entry["client"]
+        effort_str = f" / {entry['current_effort']}" if entry["current_effort"] else ""
+        prev_effort = f" / {entry['user_effort']}" if entry["user_effort"] else ""
+        print()
+        print(f"[NEXO] ⭐ New model recommendation for {client}:")
+        print(
+            f"       {entry['current_model']}{effort_str}  "
+            f"(previous: {entry['user_model']}{prev_effort})"
+        )
+        print(f"       {entry['display_name']} — recommended by NEXO.")
+        answer = input("       Migrate your configuration? [y/N/later]: ").strip().lower()
+        client_key = normalize_client_key(client) or client
+        if answer in {"y", "yes", "s", "si", "sí"}:
+            updated_profiles[client_key] = {
+                "model": entry["current_model"],
+                "reasoning_effort": entry["current_effort"],
+            }
+            updated_ack[client_key] = entry["current_version"]
+            print(f"       ✅ Migrated to {entry['current_model']}.")
+            changed = True
+        elif answer in {"later", "l", "luego"}:
+            # Do NOT acknowledge — will prompt again next interactive update.
+            print("       ↻ I will ask again during the next update.")
+        else:
+            # "N" / empty / anything else → record ack so we don't re-ask.
+            updated_ack[client_key] = entry["current_version"]
+            print(f"       Kept {entry['user_model']}. I will not ask again for this version.")
+            changed = True
+
+    if changed:
+        save_client_preferences(
+            client_runtime_profiles=updated_profiles,
+            acknowledged_model_recommendations=updated_ack,
+        )
+        # Re-sync clients so config.toml / settings.json reflect the new model.
+        try:
+            from client_sync import sync_all_clients
+            sync_all_clients(
+                nexo_home=NEXO_HOME,
+                runtime_root=NEXO_CODE,
+                preferences=load_client_preferences(),
+            )
+        except Exception:
+            pass
+
+
+def _clients_sync(args):
+    from client_preferences import load_client_preferences
+    from client_sync import format_sync_summary, sync_all_clients
+
+    result = sync_all_clients(
+        nexo_home=NEXO_HOME,
+        runtime_root=NEXO_CODE,
+        enabled_clients=("claude_code", "claude_desktop", "codex"),
+        preferences=load_client_preferences(),
+        auto_install_missing_claude=bool(getattr(args, "auto_install_missing_claude", False)),
+        auto_install_missing_codex=bool(getattr(args, "auto_install_missing_codex", False)),
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(format_sync_summary(result))
+    return 0 if result.get("ok") else 1
+
+
+def _write_calibration_default_resonance(tier: str) -> None:
+    """Persist ``preferences.default_resonance`` in ``brain/calibration.json``.
+
+    NEXO Desktop's preferences UI reads from calibration.json (matches the
+    rest of the user-facing knobs — autonomy, communication, assistant_name,
+    …). This helper keeps the CLI path writing to both calibration.json
+    AND schedule.json so the two surfaces never disagree.
+    """
+    cal_path = paths.brain_dir() / "calibration.json"
+    try:
+        cal_path.parent.mkdir(parents=True, exist_ok=True)
+        if cal_path.exists():
+            data = json.loads(cal_path.read_text())
+            if not isinstance(data, dict):
+                data = {}
+        else:
+            data = {}
+        prefs = data.get("preferences")
+        if not isinstance(prefs, dict):
+            prefs = {}
+        prefs["default_resonance"] = tier
+        data["preferences"] = prefs
+        cal_path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    except Exception as exc:  # best-effort; schedule.json still has the value
+        print(f"[NEXO] Warning: could not update calibration.json: {exc}",
+              file=sys.stderr)
+
+
+def _preferences(args):
+    """Read or change user preferences stored in schedule.json.
+
+    User-facing knobs that multiple surfaces depend on should land here
+    instead of being spread across ad-hoc files or one-off flags.
+    """
+    from client_preferences import (
+        BACKEND_NONE,
+        AUTOMATION_BACKEND_KEYS,
+        PROVIDER_KEYS,
+        PROVIDER_NONE,
+        load_client_preferences,
+        normalize_provider_key,
+        normalize_default_terminal_client,
+        save_client_preferences,
+    )
+    from resonance_map import (
+        DEFAULT_RESONANCE,
+        TIERS,
+        _load_user_default_resonance,
+    )
+
+    action = str(getattr(args, "preferences_action", "") or "").strip().lower()
+    if action in {"catalog", "get", "set", "explain"}:
+        from preference_catalog import build_preference_catalog, explain_preference, set_preference
+
+        if action == "catalog":
+            payload = build_preference_catalog(
+                include_values=bool(getattr(args, "include_values", False)),
+                query=str(getattr(args, "query", "") or "").strip() or None,
+            )
+        elif action in {"get", "explain"}:
+            pref_id = str(getattr(args, "preferences_id", "") or "").strip()
+            payload = explain_preference(pref_id)
+        else:
+            pref_id = str(getattr(args, "preferences_id", "") or "").strip()
+            value = getattr(args, "preferences_value", None)
+            payload = set_preference(pref_id, value, dry_run=bool(getattr(args, "dry_run", False)))
+        if getattr(args, "json", False):
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            print(json.dumps(payload, ensure_ascii=False))
+        return 0 if payload.get("ok", True) else 1
+
+    prefs = load_client_preferences()
+    if not isinstance(prefs, dict):
+        prefs = {}
+
+    automation_enabled = None
+    if getattr(args, "automation_enabled", False):
+        automation_enabled = True
+    elif getattr(args, "automation_disabled", False):
+        automation_enabled = False
+
+    automation_backend = getattr(args, "automation_backend", None)
+    chat_provider = getattr(args, "chat_provider", None)
+    automation_provider = getattr(args, "automation_provider", None)
+    automation_changed = (
+        automation_enabled is not None
+        or automation_backend is not None
+        or automation_provider is not None
+    )
+    provider_changed = chat_provider is not None or automation_provider is not None
+
+    if automation_backend and automation_provider:
+        print(
+            "[NEXO] Use either --automation-provider or --automation-backend, not both.",
+            file=sys.stderr,
+        )
+        return 2
+    normalized_chat_provider = normalize_provider_key(chat_provider)
+    normalized_automation_provider = normalize_provider_key(automation_provider)
+    if (
+        normalized_chat_provider in PROVIDER_KEYS
+        and normalized_automation_provider in PROVIDER_KEYS
+        and normalized_chat_provider != normalized_automation_provider
+    ):
+        print(
+            "[NEXO] Chat and background automation must use the same provider.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.resonance:
+        tier = args.resonance.lower()
+        if tier not in TIERS:
+            print(
+                f"[NEXO] Unknown resonance tier '{args.resonance}'. "
+                f"Valid values: {', '.join(TIERS)}.",
+                file=sys.stderr,
+            )
+            return 2
+    else:
+        tier = None
+
+    if automation_enabled is True and not automation_backend:
+        current_backend = str(prefs.get("automation_backend") or "").strip().lower()
+        if current_backend in AUTOMATION_BACKEND_KEYS and current_backend != BACKEND_NONE:
+            automation_backend = current_backend
+        else:
+            automation_backend = normalize_default_terminal_client(
+                prefs.get("default_terminal_client"),
+                interactive_clients=prefs.get("interactive_clients"),
+            ) or "claude_code"
+
+    if tier or automation_changed or provider_changed:
+        save_client_preferences(
+            default_resonance=tier,
+            automation_enabled=automation_enabled,
+            automation_backend=automation_backend,
+            selected_chat_provider=chat_provider,
+            automation_provider=automation_provider,
+            automation_user_override=True if automation_changed else None,
+        )
+        if tier:
+            # Write to calibration.json as well so Desktop and CLI agree.
+            _write_calibration_default_resonance(tier)
+        prefs = load_client_preferences()
+
+    calibration_value = _load_user_default_resonance()
+    schedule_value = str(
+        (prefs.get("default_resonance") if isinstance(prefs, dict) else "")
+        or ""
+    ).strip().lower()
+    current_resonance = calibration_value or schedule_value or DEFAULT_RESONANCE
+
+    if args.show or tier or automation_changed or provider_changed:
+        is_explicit = bool(calibration_value or schedule_value)
+        provider_runtime = prefs.get("provider_runtime") if isinstance(prefs.get("provider_runtime"), dict) else {}
+        payload = {
+            "default_resonance": current_resonance,
+            "default_resonance_is_explicit": is_explicit,
+            "default_resonance_source": (
+                "calibration.json" if calibration_value
+                else ("schedule.json" if schedule_value else "default")
+            ),
+            "available_tiers": list(TIERS),
+            "automation_enabled": bool(prefs.get("automation_enabled", True)),
+            "automation_backend": str(prefs.get("automation_backend") or BACKEND_NONE),
+            "automation_user_override": bool(prefs.get("automation_user_override", False)),
+            "available_automation_backends": list(AUTOMATION_BACKEND_KEYS),
+            "default_terminal_client": str(prefs.get("default_terminal_client") or "claude_code"),
+            "selected_chat_provider": str(provider_runtime.get("selected_chat_provider") or "anthropic"),
+            "automation_provider": str(provider_runtime.get("automation_provider") or PROVIDER_NONE),
+            "available_providers": list(PROVIDER_KEYS),
+            "provider_runtime": provider_runtime,
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            print(f"default_resonance = {current_resonance}")
+            print(f"  source: {payload['default_resonance_source']}")
+            print(
+                "automation = "
+                + ("enabled" if payload["automation_enabled"] else "disabled")
+                + f" · backend={payload['automation_backend']}"
+            )
+            print(
+                "provider = "
+                + f"chat:{payload['selected_chat_provider']} · automation:{payload['automation_provider']}"
+            )
+            if not is_explicit:
+                print(f"  (inherited from DEFAULT_RESONANCE; run "
+                      f"`nexo preferences --resonance alto` to set explicitly)")
+        return 0
+
+    # No flag: print usage
+    print(
+        "Usage: nexo preferences [--resonance TIER] "
+        "[--automation-enabled|--automation-disabled] "
+        "[--automation-backend BACKEND|--automation-provider PROVIDER] "
+        "[--chat-provider PROVIDER] [--show] [--json]"
+    )
+    print(f"  resonance tiers: {', '.join(TIERS)}")
+    print(f"  current default: {current_resonance}")
+    return 0
+
+
+def _provider(args):
+    """Provider runtime status/selection for Desktop and terminal parity."""
+    from client_preferences import (
+        PROVIDER_KEYS,
+        detect_installed_clients,
+        load_client_preferences,
+        provider_to_client,
+        save_client_preferences,
+    )
+
+    command = getattr(args, "provider_command", "status") or "status"
+    prefs = load_client_preferences()
+    provider_runtime = prefs.get("provider_runtime") if isinstance(prefs.get("provider_runtime"), dict) else {}
+    if command == "select":
+        target = str(args.provider or "").strip().lower()
+        if target not in PROVIDER_KEYS:
+            print(f"[NEXO] Unknown provider '{target}'. Valid values: {', '.join(PROVIDER_KEYS)}.", file=sys.stderr)
+            return 2
+        if getattr(args, "automation_only", False) or getattr(args, "chat_only", False):
+            print(
+                "[NEXO] Provider selection is unified: chat and background automation use the same provider.",
+                file=sys.stderr,
+            )
+            return 2
+        save_client_preferences(
+            selected_chat_provider=target,
+            automation_provider=target,
+            automation_user_override=True,
+        )
+        prefs = load_client_preferences()
+        provider_runtime = prefs.get("provider_runtime") if isinstance(prefs.get("provider_runtime"), dict) else {}
+
+    detected = detect_installed_clients()
+    payload = {
+        "selected_chat_provider": str(provider_runtime.get("selected_chat_provider") or "anthropic"),
+        "automation_provider": str(provider_runtime.get("automation_provider") or "none"),
+        "automation_backend": str(prefs.get("automation_backend") or "none"),
+        "default_terminal_client": str(prefs.get("default_terminal_client") or "claude_code"),
+        "providers": provider_runtime.get("providers") or {},
+        "installed_clients": detected,
+    }
+    for provider in PROVIDER_KEYS:
+        client = provider_to_client(provider)
+        payload["providers"].setdefault(provider, {})
+        payload["providers"][provider]["client"] = client
+        payload["providers"][provider]["detected"] = detected.get(client, {})
+
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(f"chat_provider = {payload['selected_chat_provider']}")
+        print(f"automation_provider = {payload['automation_provider']} · backend={payload['automation_backend']}")
+        for provider in PROVIDER_KEYS:
+            detected_provider = payload["providers"].get(provider, {}).get("detected", {})
+            state = "installed" if detected_provider.get("installed") else "missing"
+            print(f"  {provider}: {state}")
+    return 0
+
+
+def _contributor_status(args):
+    public_contribution = _load_public_contribution_support()
+    config = public_contribution["refresh_public_contribution_state"](
+        public_contribution["load_public_contribution_config"]()
+    )
+    payload = {
+        "enabled": bool(config.get("enabled")),
+        "mode": config.get("mode"),
+        "status": config.get("status"),
+        "label": public_contribution["format_public_contribution_label"](config),
+        "github_user": config.get("github_user"),
+        "fork_repo": config.get("fork_repo"),
+        "active_pr_url": config.get("active_pr_url"),
+        "active_branch": config.get("active_branch"),
+        "cooldown_until": config.get("cooldown_until"),
+        "last_result": config.get("last_result"),
+        "message": config.get("message") or public_contribution.get("message"),
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(f"Contributor mode: {payload['label']}")
+        if payload["message"]:
+            print(f"  {payload['message']}")
+        if payload["github_user"]:
+            print(f"  GitHub user: {payload['github_user']}")
+        if payload["fork_repo"]:
+            print(f"  Fork: {payload['fork_repo']}")
+        if payload["active_pr_url"]:
+            print(f"  Legacy PR URL: {payload['active_pr_url']}")
+        if payload["cooldown_until"]:
+            print(f"  Cooldown until: {payload['cooldown_until']}")
+        if payload["last_result"]:
+            print(f"  Last result: {payload['last_result']}")
+    return 0
+
+
+def _contributor_on(args):
+    public_contribution = _load_public_contribution_support()
+
+    if not public_contribution["available"]:
+        print(public_contribution["message"], file=sys.stderr)
+        return 1
+    config = public_contribution["ensure_public_contribution_choice"](
+        interactive=True,
+        reason="contributor",
+        force_prompt=True,
+    )
+    if args.json:
+        print(json.dumps(config, indent=2, ensure_ascii=False))
+    else:
+        print(f"Contributor mode: {public_contribution['format_public_contribution_label'](config)}")
+        if config.get("message"):
+            print(config.get("message"))
+    return 1
+
+
+def _contributor_off(args):
+    public_contribution = _load_public_contribution_support()
+
+    if not public_contribution["available"]:
+        print(public_contribution["message"], file=sys.stderr)
+        return 1
+    config = public_contribution["disable_public_contribution"]()
+    if args.json:
+        print(json.dumps(config, indent=2, ensure_ascii=False))
+    else:
+        print(f"Contributor mode: {public_contribution['format_public_contribution_label'](config)}")
+    return 0
+
+
+def _service_control(service_name: str, action: str) -> int:
+    """Control a LaunchAgent/systemd service: on, off, status."""
+    import platform as plat
+
+    label = f"com.nexo.{service_name}"
+
+    # v7.12.12 — Linux/WSL path uses systemd user units (`<service>.service`
+    # in ~/.config/systemd/user/). Until 7.12.11 this stub printed
+    # "supported only on macOS" and returned 1, leaving Linux operators
+    # with no CLI to start/stop the brain — they had to learn systemctl
+    # syntax themselves. Symmetric semantics: on=start, off=stop,
+    # status=is-active. Names match the macOS labels with "nexo-" prefix.
+    if plat.system() == "Linux":
+        unit = f"nexo-{service_name}.service"
+        if action == "status":
+            result = subprocess.run(
+                ["systemctl", "--user", "is-active", unit],
+                capture_output=True,
+                text=True,
+            )
+            state = (result.stdout or "").strip() or "unknown"
+            print(f"{service_name}: {'running' if state == 'active' else state}")
+            return 0
+        if action in ("on", "off"):
+            verb = "start" if action == "on" else "stop"
+            result = subprocess.run(
+                ["systemctl", "--user", verb, unit],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                print(f"{service_name}: {'started' if action == 'on' else 'stopped'}")
+                return 0
+            err = (result.stderr or result.stdout or "").strip()
+            print(f"Failed to {verb} {service_name}: {err}", file=sys.stderr)
+            print(f"Hint: install the unit at ~/.config/systemd/user/{unit}", file=sys.stderr)
+            return 1
+        print(f"Unknown action: {action}. Use on, off, or status.", file=sys.stderr)
+        return 1
+
+    if plat.system() != "Darwin":
+        print(f"Service control not supported on this platform: {plat.system()}", file=sys.stderr)
+        return 1
+
+    plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+    uid = os.getuid()
+
+    if action == "status":
+        result = subprocess.run(
+            ["launchctl", "list"],
+            capture_output=True, text=True,
+        )
+        running = label in (result.stdout or "")
+        if running:
+            print(f"{service_name}: running")
+        else:
+            print(f"{service_name}: stopped")
+        return 0
+
+    if action == "on":
+        if not plist_path.is_file():
+            print(f"LaunchAgent not found: {plist_path}", file=sys.stderr)
+            print(f"Run 'nexo-brain' to install it, or enable it during setup.", file=sys.stderr)
+            return 1
+        subprocess.run(
+            ["launchctl", "bootout", f"gui/{uid}", str(plist_path)],
+            capture_output=True,
+        )
+        result = subprocess.run(
+            ["launchctl", "bootstrap", f"gui/{uid}", str(plist_path)],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            print(f"{service_name}: started")
+        else:
+            print(f"Failed to start {service_name}: {result.stderr.strip()}", file=sys.stderr)
+            return 1
+        return 0
+
+    if action == "off":
+        result = subprocess.run(
+            ["launchctl", "bootout", f"gui/{uid}", str(plist_path)],
+            capture_output=True, text=True,
+        )
+        print(f"{service_name}: stopped")
+        return 0
+
+    print(f"Unknown action: {action}. Use on, off, or status.", file=sys.stderr)
+    return 1
+
+
+def _dashboard(args):
+    return _service_control("dashboard", args.action)
+
+
+def _terminal_client_label(client: str) -> str:
+    return TERMINAL_CLIENT_LABELS.get(client, client.replace("_", " ").title())
+
+
+def _ordered_available_terminal_clients(preferences: dict, detected: dict) -> list[str]:
+    """Return the terminal clients we should offer the operator, in priority order.
+
+    Policy:
+      1. Clients that are BOTH detected installed AND enabled in preferences
+         keep their priority (``last_used`` → ``default`` → TERMINAL_CLIENT_ORDER).
+      2. If that primary list ends up with ≤1 choice, we also surface every
+         other DETECTED-INSTALLED client even when it is not yet marked
+         ``enabled`` in preferences. Rationale (bug Francisco 2026-04-22):
+         operators with both Claude Code and Codex installed were being
+         dropped straight into whichever one was last used (or the only one
+         ever enabled) with no chance to pick. ``nexo chat`` must offer the
+         picker whenever more than one interactive client is available on
+         the machine; the preferences flag stays as a *priority* signal, not
+         as a hard filter that hides a legitimately installed CLI.
+    """
+    enabled = preferences.get("interactive_clients", {})
+    last_used = str(preferences.get("last_terminal_client", "")).strip()
+    preferred = str(preferences.get("default_terminal_client", "")).strip()
+    ordered: list[str] = []
+
+    for client in (last_used, preferred, *TERMINAL_CLIENT_ORDER):
+        if client in TERMINAL_CLIENT_ORDER and client not in ordered:
+            ordered.append(client)
+
+    primary = [
+        client
+        for client in ordered
+        if enabled.get(client, False) and detected.get(client, {}).get("installed", False)
+    ]
+    if len(primary) <= 1:
+        # Surface additional installed clients so the operator gets to pick
+        # whenever there is a genuine competing install on disk. We preserve
+        # the priority order built above so the picker still highlights the
+        # last-used/default client first.
+        for client in ordered:
+            if client in primary:
+                continue
+            if detected.get(client, {}).get("installed", False):
+                primary.append(client)
+    return primary
+
+
+def _preferred_terminal_client_label(preferences: dict, clients: list[str]) -> str:
+    last_used = str(preferences.get("last_terminal_client", "")).strip()
+    if clients and clients[0] == last_used:
+        return "last choice"
+    return "default"
+
+
+def _prompt_for_terminal_client(
+    clients: list[str],
+    normalize_client_key,
+    *,
+    preferred_label: str = "default",
+) -> str | None:
+    if not clients:
+        return None
+    if len(clients) == 1:
+        return clients[0]
+
+    while True:
+        print("Select terminal client for this chat:")
+        for index, client in enumerate(clients, start=1):
+            suffix = f" [{preferred_label}]" if index == 1 else ""
+            print(f"  {index}. {_terminal_client_label(client)}{suffix}")
+
+        try:
+            response = input(f"Choose 1-{len(clients)} [1]: ").strip()
+        except EOFError:
+            return clients[0]
+
+        if not response:
+            return clients[0]
+        if response.isdigit():
+            choice = int(response)
+            if 1 <= choice <= len(clients):
+                return clients[choice - 1]
+
+        client_key = normalize_client_key(response)
+        if client_key in clients:
+            return client_key
+
+        print("Invalid choice. Try again.", file=sys.stderr)
+
+
+def _ensure_chat_full_disk_access_notice(*, interactive: bool | None = None) -> dict:
+    runtime_power = _load_runtime_power_support()
+    if interactive is None:
+        interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
+    try:
+        choice = runtime_power["ensure_full_disk_access_choice"](
+            interactive=interactive,
+            reason="chat",
+            output_fn=lambda message: print(message, file=sys.stderr),
+        )
+    except EOFError:
+        return {
+            "status": "later",
+            "prompted": False,
+            "reasons": [],
+            "message": "Full Disk Access setup skipped because stdin closed.",
+        }
+    message = str(choice.get("message") or "").strip()
+    if message and (choice.get("prompted") or choice.get("relevant")):
+        print(f"[NEXO] Full Disk Access: {message}", file=sys.stderr)
+    return choice
+
+
+def _chat(args):
+    target = args.path or "."
+    selected_client = getattr(args, "client", None)
+    print(f"[NEXO] {_version_status_line()}", file=sys.stderr)
+
+    try:
+        from auto_update import startup_preflight
+
+        preflight = startup_preflight(entrypoint="chat", interactive=False)
+        if preflight.get("updated"):
+            print("[NEXO] Startup update applied before chat.", file=sys.stderr)
+        elif preflight.get("deferred_reason"):
+            print(f"[NEXO] Update deferred: {preflight['deferred_reason']}", file=sys.stderr)
+        elif preflight.get("git_update"):
+            print(f"[NEXO] {preflight['git_update']}", file=sys.stderr)
+        elif preflight.get("npm_notice"):
+            print(f"[NEXO] {preflight['npm_notice']}", file=sys.stderr)
+        for message in preflight.get("client_bootstrap_updates", []):
+            print(f"[NEXO] {message}", file=sys.stderr)
+        if preflight.get("error"):
+            print(f"[NEXO] Startup preflight warning: {preflight['error']}", file=sys.stderr)
+    except Exception:
+        pass
+
+    try:
+        _ensure_chat_full_disk_access_notice()
+    except Exception as exc:
+        print(f"[NEXO] Full Disk Access check warning: {exc}", file=sys.stderr)
+
+    try:
+        from client_preferences import (
+            detect_installed_clients,
+            load_client_preferences,
+            normalize_client_key,
+            save_client_preferences,
+        )
+        from agent_runner import TerminalClientUnavailableError, launch_interactive_client
+    except ImportError:
+        print("Agent runner module not found. Ensure NEXO is properly installed.", file=sys.stderr)
+        return 1
+
+    if not selected_client:
+        try:
+            preferences = load_client_preferences()
+            detected = detect_installed_clients()
+            clients = _ordered_available_terminal_clients(preferences, detected)
+            selected_client = _prompt_for_terminal_client(
+                clients,
+                normalize_client_key,
+                preferred_label=_preferred_terminal_client_label(preferences, clients),
+            )
+        except Exception:
+            selected_client = None
+
+    try:
+        result = launch_interactive_client(
+            target=target,
+            client=selected_client,
+            env=os.environ.copy(),
+        )
+    except TerminalClientUnavailableError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if result.returncode == 0 and selected_client:
+        try:
+            save_client_preferences(last_terminal_client=normalize_client_key(selected_client))
+        except Exception:
+            pass
+    return int(result.returncode)
+
+
+def _notify(args):
+    """Emit an event to the runtime events bus (events.ndjson)."""
+    from events_bus import emit
+    try:
+        event = emit(
+            args.type,
+            text=getattr(args, "text", "") or "",
+            reason=getattr(args, "reason", "") or "",
+            priority=getattr(args, "priority", "normal"),
+            source=getattr(args, "source", "nexo-brain"),
+        )
+    except ValueError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}), file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps({"ok": True, "event": event}, ensure_ascii=False, indent=2))
+    else:
+        print(f"notify: id={event['id']} type={event['type']} priority={event['priority']}")
+    return 0
+
+
+def _health(args):
+    """Collect a health snapshot and print it."""
+    from health_check import collect
+    report = collect()
+    if getattr(args, "json", True) is False:
+        # minimal text mode
+        print(f"status: {report.get('status', 'unknown')}")
+        for name, sub in report.get("subsystems", {}).items():
+            print(f"  {name:10s} {sub.get('status', '?')}")
+        return 0 if report.get("status") == "ok" else 1
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report.get("status") == "ok" else 1
+
+
+def _logs(args):
+    """Tail recent logs: events bus + operations/*.log."""
+    import glob as _glob
+    lines_want = max(1, int(getattr(args, "lines", 100)))
+    source = (getattr(args, "source", "all") or "all").lower()
+
+    results: dict = {"source": source, "lines": lines_want, "entries": []}
+    home = Path(os.environ.get("NEXO_HOME", str(Path.home() / ".nexo")))
+
+    def _collect_events(n: int) -> list[dict]:
+        try:
+            from events_bus import tail as _tail
+            return _tail(lines=n)
+        except Exception as exc:
+            return [{"error": f"events tail failed: {exc}"}]
+
+    def _collect_ops(n: int) -> list[dict]:
+        ops_dir = home / "operations"
+        if not ops_dir.is_dir():
+            return []
+        files = sorted(
+            ops_dir.glob("*.log"),
+            key=lambda p: p.stat().st_mtime if p.exists() else 0,
+            reverse=True,
+        )[:5]
+        out: list[dict] = []
+        for log in files:
+            try:
+                text = log.read_text(errors="ignore").splitlines()[-n:]
+            except Exception as exc:
+                out.append({"file": str(log), "error": str(exc)})
+                continue
+            for line in text:
+                out.append({"file": log.name, "line": line})
+        return out[-n:]
+
+    if source in ("all", "events"):
+        results["entries"].extend({"kind": "event", **e} for e in _collect_events(lines_want))
+    if source in ("all", "operations"):
+        results["entries"].extend({"kind": "log", **e} for e in _collect_ops(lines_want))
+    if source not in ("all", "events", "operations"):
+        # Treat as filename match inside operations/
+        specific = home / "operations" / source
+        if specific.is_file():
+            try:
+                text = specific.read_text(errors="ignore").splitlines()[-lines_want:]
+                results["entries"] = [{"kind": "log", "file": specific.name, "line": ln} for ln in text]
+            except Exception as exc:
+                results["error"] = str(exc)
+        else:
+            results["error"] = f"unknown log source: {source}"
+
+    if args.json:
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+    else:
+        for entry in results["entries"][-lines_want:]:
+            if entry.get("kind") == "event":
+                print(f"[event] id={entry.get('id')} {entry.get('type')} "
+                      f"{entry.get('priority')} {entry.get('text','')}")
+            else:
+                print(f"[{entry.get('file','?')}] {entry.get('line','')}")
+    return 0
+
+
+def _doctor(args):
+    """Run unified doctor diagnostics."""
+    try:
+        from db import init_db
+        from doctor.orchestrator import run_doctor
+        from doctor.formatters import format_report
+    except ImportError:
+        print("Doctor module not found. Ensure NEXO is properly installed.", file=sys.stderr)
+        return 1
+
+    init_db()
+
+    # Calibration migration hook — runs before the orchestrator so the rest
+    # of doctor sees the canonical nested shape.
+    want_migrate = getattr(args, "migrate_calibration", False) or args.fix
+    dry = getattr(args, "calibration_dry_run", False)
+    if want_migrate or dry:
+        from calibration_migration import detect, apply_migration
+        shape = detect()
+        if shape["shape"] == "flat":
+            mig = apply_migration(dry_run=dry)
+            if args.json:
+                print(json.dumps({"calibration_migration": mig}, ensure_ascii=False, indent=2))
+            else:
+                print(f"[NEXO] calibration migration: {mig.get('status')} — {mig.get('reason','')}",
+                      file=sys.stderr, flush=True)
+
+    tier_label = getattr(args, "tier", "boot") or "boot"
+    print(f"[NEXO] Inspecting {tier_label} diagnostics... please wait.", file=sys.stderr, flush=True)
+    report = run_doctor(tier=args.tier, fix=args.fix, plane=getattr(args, "plane", ""))
+    output = format_report(report, fmt="json" if args.json else "text")
+    print(output)
+
+    if report.overall_status == "critical":
+        return 2
+    elif report.overall_status == "degraded":
+        return 1
+    return 0
+
+
+def _support_snapshot(args):
+    """Collect a generic runtime snapshot for support and diagnostics."""
+    from support_snapshot import collect_snapshot
+
+    payload = collect_snapshot(
+        log_lines=getattr(args, "log_lines", 80),
+        include_doctor=bool(getattr(args, "include_doctor", False)),
+    )
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _skills_list(args):
+    from db import init_db, list_skills, sync_skill_directories
+
+    init_db()
+    sync_skill_directories()
+    skills = list_skills(level=args.level, tag=args.tag, source_kind=args.source_kind)
+    if args.json:
+        print(json.dumps(skills, indent=2, ensure_ascii=False))
+        return 0
+
+    if not skills:
+        print("No skills found.")
+        return 0
+
+    for skill in skills:
+        print(
+            f"[{skill['id']}] {skill['name']} "
+            f"({skill['level']}, {skill.get('mode', 'guide')}, {skill.get('source_kind', 'personal')}, "
+            f"trust={skill['trust_score']}, used={skill['use_count']}x)"
+        )
+    return 0
+
+
+def _skills_get(args):
+    from db import get_skill, init_db, sync_skill_directories
+
+    init_db()
+    sync_skill_directories()
+    skill = get_skill(args.id)
+    if not skill:
+        print(f"Skill not found: {args.id}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(skill, indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps(skill, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _skills_apply(args):
+    from skills_runtime import apply_skill
+
+    try:
+        params = json.loads(args.params) if args.params else {}
+    except json.JSONDecodeError as e:
+        print(f"Invalid params JSON: {e}", file=sys.stderr)
+        return 1
+
+    result = apply_skill(args.id, params=params, mode=args.mode, dry_run=args.dry_run, context=args.context)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0 if result.get("ok") else 1
+
+
+def _skills_test(args):
+    from skills_runtime import test_skill
+
+    try:
+        params = json.loads(args.params) if args.params else {}
+    except json.JSONDecodeError as e:
+        print(f"Invalid params JSON: {e}", file=sys.stderr)
+        return 1
+
+    result = test_skill(args.id, params=params, mode=args.mode, context=args.context)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0 if result.get("ok") else 1
+
+
+def _skills_sync(args):
+    from skills_runtime import sync_skills
+
+    result = sync_skills()
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0 if not result.get("issues") else 1
+
+
+def _skills_approve(args):
+    from skills_runtime import approve_skill_execution
+
+    result = approve_skill_execution(args.id, execution_level=args.execution_level, approved_by=args.approved_by)
+    if "error" in result:
+        print(result["error"], file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _skills_featured(args):
+    from skills_runtime import get_featured_skill_summaries
+
+    result = get_featured_skill_summaries(limit=args.limit)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _skills_evolution(args):
+    from skills_runtime import list_evolution_candidates
+
+    result = list_evolution_candidates()
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _skills_outcome_review(args):
+    from skills_runtime import review_skill_outcomes
+
+    result = review_skill_outcomes(args.id, auto_apply=args.auto_apply)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0 if result.get("ok") else 1
+
+
+def _skills_promote(args):
+    from skills_runtime import promote_skill
+
+    result = promote_skill(args.id, target_level=args.target_level, reason=args.reason)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0 if result.get("ok") else 1
+
+
+def _skills_retire(args):
+    from skills_runtime import retire_skill
+
+    result = retire_skill(args.id, replacement_id=args.replacement_id, reason=args.reason)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0 if result.get("ok") else 1
+
+
+def _skills_compose(args):
+    from skills_runtime import compose_skills
+
+    try:
+        component_ids = json.loads(args.component_ids) if args.component_ids.strip().startswith("[") else [
+            item.strip() for item in args.component_ids.split(",") if item.strip()
+        ]
+        tags = json.loads(args.tags) if args.tags.strip().startswith("[") else [
+            item.strip() for item in args.tags.split(",") if item.strip()
+        ]
+        trigger_patterns = json.loads(args.trigger_patterns) if args.trigger_patterns.strip().startswith("[") else [
+            item.strip() for item in args.trigger_patterns.split(",") if item.strip()
+        ]
+    except json.JSONDecodeError as e:
+        print(f"Invalid JSON: {e}", file=sys.stderr)
+        return 1
+
+    result = compose_skills(
+        new_skill_id=args.new_id,
+        name=args.name,
+        component_ids=component_ids,
+        description=args.description,
+        level=args.level,
+        mode=args.mode,
+        tags=tags,
+        trigger_patterns=trigger_patterns,
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0 if result.get("ok") else 1
+
+
+def _uninstall(args):
+    """Stop all crons, remove MCP config and hooks, preserve user data."""
+    from pathlib import Path
+    from windows_runtime import cleanup_windows_host_artifacts, running_inside_wsl, running_from_windows_host
+
+    nexo_home = Path(os.environ.get("NEXO_HOME", Path.home() / ".nexo"))
+    dry_run = args.dry_run
+    delete_data = args.delete_data
+    use_json = args.json
+    platform = sys.platform
+
+    actions: list[dict] = []
+    errors: list[str] = []
+
+    def log_action(category: str, detail: str, path: str = ""):
+        actions.append({"category": category, "detail": detail, "path": path})
+        if not use_json:
+            tag = "[DRY-RUN] " if dry_run else ""
+            print(f"  {tag}{category}: {detail}")
+
+    # ── 1. Stop and remove LaunchAgents (macOS) ──
+    if platform == "darwin":
+        la_dir = Path.home() / "Library" / "LaunchAgents"
+        if la_dir.exists():
+            uid = os.getuid()
+            for plist in sorted(la_dir.glob("com.nexo.*.plist")):
+                label = plist.stem
+                # Stop the agent
+                if not dry_run:
+                    subprocess.run(
+                        ["launchctl", "bootout", f"gui/{uid}", str(plist)],
+                        capture_output=True,
+                    )
+                log_action("stop-cron", f"launchctl bootout {label}", str(plist))
+                # Remove plist file
+                if not dry_run:
+                    plist.unlink(missing_ok=True)
+                log_action("remove-plist", label, str(plist))
+    # ── systemd (Linux) ──
+    elif platform == "linux":
+        systemd_dir = Path.home() / ".config" / "systemd" / "user"
+        if systemd_dir.exists():
+            for unit in sorted(list(systemd_dir.glob("nexo-*.timer")) + list(systemd_dir.glob("nexo-*.service"))):
+                if not dry_run:
+                    if unit.suffix == ".timer":
+                        subprocess.run(["systemctl", "--user", "stop", unit.name], capture_output=True)
+                        subprocess.run(["systemctl", "--user", "disable", unit.name], capture_output=True)
+                    unit.unlink(missing_ok=True)
+                log_action("remove-systemd", unit.name, str(unit))
+            if not dry_run:
+                subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+
+        if running_inside_wsl() or running_from_windows_host():
+            host_cleanup = cleanup_windows_host_artifacts(
+                delete_data=delete_data,
+                dry_run=dry_run,
+            )
+            for action in host_cleanup.get("actions", []):
+                log_action(
+                    action.get("category", "remove-win-host-artifact"),
+                    action.get("detail", ""),
+                    action.get("path", ""),
+                )
+            for error in host_cleanup.get("errors", []):
+                errors.append(f"Windows host cleanup: {error}")
+
+    # ── 2. Remove MCP server and hooks from Claude Code settings ──
+    claude_settings = Path.home() / ".claude" / "settings.json"
+    if claude_settings.exists():
+        try:
+            settings = json.loads(claude_settings.read_text())
+            changed = False
+
+            # Remove nexo MCP server
+            mcp = settings.get("mcpServers", {})
+            if "nexo" in mcp:
+                if not dry_run:
+                    del mcp["nexo"]
+                    changed = True
+                log_action("remove-mcp", "nexo server from settings.json", str(claude_settings))
+
+            # Remove NEXO hooks (hooks referencing NEXO_HOME)
+            hooks = settings.get("hooks", {})
+            nexo_home_str = str(nexo_home)
+            for event_name in list(hooks.keys()):
+                hook_list = hooks[event_name]
+                if isinstance(hook_list, list):
+                    original_len = len(hook_list)
+                    filtered = [
+                        h for h in hook_list
+                        if not (
+                            isinstance(h, dict)
+                            and nexo_home_str in (h.get("command", "") + " ".join(h.get("args", [])))
+                        )
+                    ]
+                    if len(filtered) < original_len:
+                        if not dry_run:
+                            hooks[event_name] = filtered
+                            changed = True
+                        removed_count = original_len - len(filtered)
+                        log_action("remove-hooks", f"{removed_count} hook(s) from {event_name}", str(claude_settings))
+                # Clean up empty hook lists
+                if isinstance(hooks.get(event_name), list) and len(hooks.get(event_name, [])) == 0:
+                    if not dry_run:
+                        del hooks[event_name]
+                        changed = True
+
+            if changed and not dry_run:
+                claude_settings.write_text(json.dumps(settings, indent=2, ensure_ascii=False))
+        except Exception as exc:
+            errors.append(f"Failed to clean settings.json: {exc}")
+
+    # ── 3. Remove Codex AGENTS.md bootstrap ──
+    codex_agents = Path.home() / "AGENTS.md"
+    if codex_agents.exists():
+        try:
+            content = codex_agents.read_text()
+            if "NEXO" in content or "nexo" in content:
+                log_action("preserve-note", "AGENTS.md contains NEXO references — remove manually if desired", str(codex_agents))
+        except Exception:
+            pass
+
+    # ── 4. Remove runtime files, PRESERVE user data ──
+    # User data directories that are NEVER deleted (unless --delete-data)
+    user_data_dirs = {"data", "brain", "operations", "coordination", "config", "logs", "backups"}
+    user_data_files = {"version.json"}  # keeps reinstall detection working
+
+    # Runtime directories that get removed
+    runtime_dirs = {"plugins", "hooks", "dashboard", "cognitive", "db", "rules", "crons", "doctor", "skills"}
+    # Runtime flat files: any .py/.txt at NEXO_HOME root is core runtime.
+    # User data always lives in subdirectories (data/, brain/, scripts/, etc.)
+    # so this is safe and doesn't need updating when new core files are added.
+    runtime_file_extensions = {".py", ".txt"}
+
+    if nexo_home.exists():
+        # Remove runtime directories
+        for d in sorted(runtime_dirs):
+            dir_path = nexo_home / d
+            if dir_path.is_dir():
+                if not dry_run:
+                    shutil.rmtree(dir_path, ignore_errors=True)
+                log_action("remove-runtime-dir", d, str(dir_path))
+
+        # Remove runtime flat files (any .py/.txt at root level)
+        for file_path in sorted(nexo_home.iterdir()):
+            if file_path.is_file() and file_path.suffix in runtime_file_extensions:
+                if not dry_run:
+                    file_path.unlink(missing_ok=True)
+                log_action("remove-runtime-file", file_path.name, str(file_path))
+
+        # Remove core scripts (nexo-*.py/sh in scripts/)
+        scripts_dir = nexo_home / "scripts"
+        if scripts_dir.is_dir():
+            for script in sorted(scripts_dir.glob("nexo-*")):
+                if script.is_file():
+                    if not dry_run:
+                        script.unlink(missing_ok=True)
+                    log_action("remove-core-script", script.name, str(script))
+            # Remove deep-sleep directory (core)
+            ds_dir = scripts_dir / "deep-sleep"
+            if ds_dir.is_dir():
+                if not dry_run:
+                    shutil.rmtree(ds_dir, ignore_errors=True)
+                log_action("remove-runtime-dir", "scripts/deep-sleep", str(ds_dir))
+
+        # List preserved user data
+        for d in sorted(user_data_dirs):
+            dir_path = nexo_home / d
+            if dir_path.is_dir():
+                if delete_data:
+                    if not dry_run:
+                        shutil.rmtree(dir_path, ignore_errors=True)
+                    log_action("DELETE-user-data", d, str(dir_path))
+                else:
+                    log_action("preserve-data", d, str(dir_path))
+
+        # Preserve personal scripts (non nexo-* files in scripts/)
+        if scripts_dir.is_dir():
+            personal = [f.name for f in scripts_dir.iterdir() if f.is_file() and not f.name.startswith("nexo-")]
+            if personal:
+                log_action("preserve-scripts", f"{len(personal)} personal script(s)", str(scripts_dir))
+
+        # Preserve templates/
+        templates_dir = nexo_home / "templates"
+        if templates_dir.is_dir():
+            log_action("preserve-data", "templates", str(templates_dir))
+
+    # ── 5. Write uninstall marker for reinstall detection ──
+    if not dry_run and nexo_home.exists():
+        marker = nexo_home / ".uninstalled"
+        marker.write_text(json.dumps({
+            "uninstalled_at": __import__("datetime").datetime.now().isoformat(),
+            "nexo_home": str(nexo_home),
+            "data_preserved": not delete_data,
+        }, indent=2))
+        log_action("write-marker", ".uninstalled marker for reinstall detection", str(marker))
+
+    # ── Summary ──
+    result = {
+        "ok": len(errors) == 0,
+        "dry_run": dry_run,
+        "nexo_home": str(nexo_home),
+        "actions": actions,
+        "errors": errors,
+        "data_preserved": not delete_data,
+    }
+
+    if use_json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print()
+        if dry_run:
+            print(f"  DRY RUN complete. {len(actions)} action(s) would be taken.")
+            print("  Run without --dry-run to execute.")
+        else:
+            print(f"  Uninstall complete. {len(actions)} action(s) taken.")
+            if not delete_data:
+                print(f"\n  Your data is preserved in: {nexo_home}")
+                print("  To reinstall: npm install -g nexo-brain && nexo-brain")
+            if errors:
+                print(f"\n  {len(errors)} error(s):")
+                for e in errors:
+                    print(f"    - {e}")
+
+    return 1 if errors else 0
+
+
+def _print_help():
+    v = _get_version()
+    print(f"""NEXO Runtime CLI v{v}
+{_version_status_line()}
+
+Commands:
+  nexo chat [path] [--client claude_code|codex]      Launch a NEXO terminal client
+  nexo export [path]                                 Export a portable user-data bundle
+  nexo import-inspect PATH                           Inspect a portable user-data bundle
+  nexo import PATH                                   Import a portable user-data bundle
+  nexo doctor [--tier boot|runtime|deep|all] [--fix]   System diagnostics
+  nexo support-snapshot [--include-doctor] [--log-lines N]
+  nexo scripts list|create|classify|sync|reconcile|ensure-schedules|schedules|schedule|run|doctor|call|unschedule|remove
+                                                      Personal scripts
+  nexo skills list|apply|sync|approve                  Executable skills
+  nexo clients sync                                    Sync Claude/Codex shared-brain configs and bootstrap files
+  nexo update                                          Update installed runtime
+  nexo uninstall [--dry-run] [--delete-data]            Stop crons, remove runtime (keeps data)
+  nexo contributor status|on|off                       Retired public contribution mode
+  nexo dashboard on|off|status                         Web dashboard control
+
+Run 'nexo <command> --help' for details.
+Homepage: https://nexo-brain.com
+GitHub:   https://github.com/wazionapps/nexo""")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="nexo", description="NEXO Runtime CLI", add_help=False)
+    parser.add_argument("-h", "--help", action="store_true", help="Show help")
+    parser.add_argument("-v", "--version", action="store_true", help="Show version")
+    parser.add_argument("--json", action="store_true", help="JSON output for --version")
+    sub = parser.add_subparsers(dest="command")
+
+    # -- email (Plan F1 — interactive wizard for email accounts) --
+    try:
+        from cli_email import register_email_parser
+        register_email_parser(sub)
+    except Exception as _exc_email:  # pragma: no cover
+        pass
+
+    # -- chat --
+    chat_parser = sub.add_parser("chat", help="Launch a NEXO terminal client")
+    chat_parser.add_argument("path", nargs="?", default=".", help="Working directory (default: current directory)")
+    chat_parser.add_argument(
+        "--client",
+        choices=["claude_code", "codex"],
+        help="Override the chat picker and launch a specific terminal client",
+    )
+
+    # -- export --
+    export_parser = sub.add_parser("export", help="Export a portable user-data bundle")
+    export_parser.add_argument("path", nargs="?", default="", help="Output bundle path (default: NEXO_HOME/exports/...)")
+    export_parser.add_argument("--json", action="store_true", help="JSON output")
+
+    # -- import inspect --
+    inspect_parser = sub.add_parser("import-inspect", help="Inspect a portable user-data bundle")
+    inspect_parser.add_argument("path", help="Bundle path created by `nexo export`")
+    inspect_parser.add_argument("--json", action="store_true", help="JSON output")
+
+    # -- import --
+    import_parser = sub.add_parser("import", help="Import a portable user-data bundle")
+    import_parser.add_argument("path", help="Bundle path created by `nexo export`")
+    import_parser.add_argument("--json", action="store_true", help="JSON output")
+
+    # -- scripts --
+    scripts_parser = sub.add_parser("scripts", help="Manage personal scripts")
+    scripts_sub = scripts_parser.add_subparsers(dest="scripts_command")
+
+    # scripts list
+    list_p = scripts_sub.add_parser("list", help="List scripts")
+    list_p.add_argument("--all", action="store_true", help="Include core/internal scripts")
+    list_p.add_argument("--json", action="store_true", help="JSON output")
+
+    # scripts create
+    create_p = scripts_sub.add_parser("create", help="Create a personal script scaffold")
+    create_p.add_argument("name", help="Human/script name")
+    create_p.add_argument("--description", default="", help="One-line description")
+    create_p.add_argument("--runtime", default="python", choices=["python", "shell"], help="Script runtime")
+    create_p.add_argument("--force", action="store_true", help="Overwrite if the target file exists")
+    create_p.add_argument("--json", action="store_true", help="JSON output")
+
+    # scripts classify
+    classify_p = scripts_sub.add_parser("classify", help="Classify all files in NEXO_HOME/personal/scripts")
+    classify_p.add_argument("--json", action="store_true", help="JSON output")
+
+    # scripts sync
+    sync_p = scripts_sub.add_parser("sync", help="Sync script registry from filesystem and personal LaunchAgents")
+    sync_p.add_argument("--json", action="store_true", help="JSON output")
+
+    # scripts reconcile
+    reconcile_p = scripts_sub.add_parser("reconcile", help="Classify, sync, and ensure declared schedules")
+    reconcile_p.add_argument("--dry-run", action="store_true", help="Show what would change without editing schedules")
+    reconcile_p.add_argument("--json", action="store_true", help="JSON output")
+
+    # scripts ensure-schedules
+    ensure_p = scripts_sub.add_parser("ensure-schedules", help="Create or repair declared personal schedules")
+    ensure_p.add_argument("--dry-run", action="store_true", help="Show what would change without editing schedules")
+    ensure_p.add_argument("--json", action="store_true", help="JSON output")
+
+    # scripts schedules
+    schedules_p = scripts_sub.add_parser("schedules", help="List registered personal script schedules")
+    schedules_p.add_argument("--json", action="store_true", help="JSON output")
+
+    # scripts unschedule
+    unschedule_p = scripts_sub.add_parser("unschedule", help="Remove all personal schedules from a script")
+    unschedule_p.add_argument("name", help="Script name or path")
+    unschedule_p.add_argument("--json", action="store_true", help="JSON output")
+
+    # scripts enable / disable / status (Plan F0.2.2)
+    enable_p = scripts_sub.add_parser("enable", help="Enable a script or supported core automation")
+    enable_p.add_argument("name", help="Script name or path")
+    enable_p.add_argument("--json", action="store_true", help="JSON output")
+
+    disable_p = scripts_sub.add_parser("disable", help="Disable a script or supported core automation")
+    disable_p.add_argument("name", help="Script name or path")
+    disable_p.add_argument("--json", action="store_true", help="JSON output")
+
+    status_p = scripts_sub.add_parser("status", help="Show enabled flag + last cron_runs row for a script")
+    status_p.add_argument("name", help="Script name or path")
+    status_p.add_argument("--json", action="store_true", help="JSON output")
+
+    instructions_p = scripts_sub.add_parser(
+        "instructions",
+        help="Set or clear operator extra instructions for a supported automation",
+    )
+    instructions_p.add_argument("name", help="Script name or path")
+    instructions_group = instructions_p.add_mutually_exclusive_group(required=True)
+    instructions_group.add_argument("--text", help="Instruction text to persist")
+    instructions_group.add_argument("--stdin", action="store_true", help="Read instruction text from stdin")
+    instructions_group.add_argument("--clear", action="store_true", help="Clear any persisted extra instructions")
+    instructions_p.add_argument("--json", action="store_true", help="JSON output")
+
+    schedule_p = scripts_sub.add_parser(
+        "schedule",
+        help="Change the cadence of a supported core automation",
+    )
+    schedule_p.add_argument("name", help="Script name or path")
+    schedule_group = schedule_p.add_mutually_exclusive_group(required=True)
+    schedule_group.add_argument("--every-minutes", type=int, help="Run the automation every N minutes")
+    schedule_group.add_argument("--every-seconds", type=int, help="Run the automation every N seconds")
+    schedule_group.add_argument("--daily-at", type=str, help="Run the automation every day at HH:MM (24h)")
+    schedule_group.add_argument("--reset", action="store_true", help="Restore the shipped default cadence")
+    schedule_p.add_argument("--json", action="store_true", help="JSON output")
+
+    # scripts remove
+    remove_p = scripts_sub.add_parser("remove", help="Remove a personal script and any attached schedules")
+    remove_p.add_argument("name", help="Script name or path")
+    remove_p.add_argument("--keep-file", action="store_true", help="Keep the script file and only unregister/unschedule it")
+    remove_p.add_argument("--json", action="store_true", help="JSON output")
+
+    # scripts run
+    run_p = scripts_sub.add_parser("run", help="Run a script by name")
+    run_p.add_argument("name", help="Script name")
+    run_p.add_argument("script_args", nargs="*", help="Arguments to pass to the script")
+
+    # scripts doctor
+    doc_p = scripts_sub.add_parser("doctor", help="Validate scripts")
+    doc_p.add_argument("name", nargs="?", help="Specific script to check")
+    doc_p.add_argument("--json", action="store_true", help="JSON output")
+
+    # scripts call
+    call_p = scripts_sub.add_parser("call", help="Call a NEXO MCP tool")
+    call_p.add_argument("tool", help="MCP tool name")
+    call_p.add_argument("--input", default="{}", help="JSON input payload")
+    call_p.add_argument("--json-output", action="store_true", help="Force JSON output")
+
+    pre_answer_parser = sub.add_parser("pre-answer", help="Route pre-answer context")
+    pre_answer_sub = pre_answer_parser.add_subparsers(dest="pre_answer_command")
+    pre_answer_route_p = pre_answer_sub.add_parser("route", help="Run the pre-answer router")
+    pre_answer_payload_group = pre_answer_route_p.add_mutually_exclusive_group()
+    pre_answer_payload_group.add_argument("--payload", default="", help="JSON payload")
+    pre_answer_payload_group.add_argument("--payload-file", default="", help="Path to a JSON payload file")
+    pre_answer_payload_group.add_argument("--payload-stdin", action="store_true", help="Read JSON payload from stdin")
+    pre_answer_route_p.add_argument("--query", default="", help="User query/text to route")
+    pre_answer_route_p.add_argument("--sid", default="", help="NEXO session id")
+    pre_answer_route_p.add_argument("--conversation-id", default="", help="Client conversation id")
+    pre_answer_route_p.add_argument("--intent", default="", help="Optional intent override or auto")
+    pre_answer_route_p.add_argument("--area", default="", help="Optional area/project hint")
+    pre_answer_route_p.add_argument("--files", default="", help="Optional comma-separated file hints")
+    pre_answer_route_p.add_argument("--budget-ms", type=int, default=None, help="Deadline budget in milliseconds")
+    pre_answer_route_p.add_argument("--token-budget", type=int, default=None, help="Approximate token budget")
+    pre_answer_route_p.add_argument("--current-context", default="", help="Current conversation/task context")
+    pre_answer_route_p.add_argument("--json", action="store_true", help="JSON output")
+
+    cognitive_control_parser = sub.add_parser("cognitive-control", help="Cognitive control observability")
+    cognitive_control_sub = cognitive_control_parser.add_subparsers(dest="cognitive_control_command")
+    cognitive_observatory_p = cognitive_control_sub.add_parser("observatory", help="Read-only cognitive quality metrics")
+    cognitive_observatory_p.add_argument("--window-seconds", type=int, default=86400, help="Observation window")
+    cognitive_observatory_p.add_argument("--json", action="store_true", help="JSON output")
+
+    memory_observations_parser = sub.add_parser("memory-observations", help="Process Memory Observations v2 queue")
+    memory_observations_sub = memory_observations_parser.add_subparsers(dest="memory_observations_command")
+    memory_observations_process_p = memory_observations_sub.add_parser("process", help="Run one bounded observation processor cycle")
+    memory_observations_process_p.add_argument("--limit", type=int, default=100, help="Maximum pending rows to process")
+    memory_observations_process_p.add_argument("--backfill-limit", type=int, default=100, help="Maximum legacy events to enqueue or repair")
+    memory_observations_process_p.add_argument("--pending-sla-seconds", type=int, default=3600, help="Pending queue SLA threshold")
+    memory_observations_process_p.add_argument("--json", action="store_true", help="JSON output")
+    memory_observations_intraday_p = memory_observations_sub.add_parser("intraday", help="Run low-limit daytime observation cycle")
+    memory_observations_intraday_p.add_argument("--limit", type=int, default=20, help="Maximum pending rows to process")
+    memory_observations_intraday_p.add_argument("--backfill-limit", type=int, default=20, help="Maximum legacy events to enqueue or repair")
+    memory_observations_intraday_p.add_argument("--pending-sla-seconds", type=int, default=3600, help="Pending queue SLA threshold")
+    memory_observations_intraday_p.add_argument("--json", action="store_true", help="JSON output")
+
+    local_context_parser = sub.add_parser("local-context", help="Manage the local memory index")
+    local_context_sub = local_context_parser.add_subparsers(dest="local_context_command")
+
+    local_context_status_p = local_context_sub.add_parser("status", help="Show local memory index status")
+    local_context_status_p.add_argument("--json", action="store_true", help="JSON output")
+
+    local_context_run_p = local_context_sub.add_parser("run-once", help="Run one incremental scan/extract cycle")
+    local_context_run_p.add_argument("--root", default="", help="Optional folder to add before running")
+    local_context_run_p.add_argument("--limit", type=int, default=None, help="Maximum files to scan in this cycle")
+    local_context_run_p.add_argument("--process-limit", type=int, default=100, help="Maximum extraction/graph jobs to process")
+    local_context_run_p.add_argument("--json", action="store_true", help="JSON output")
+
+    local_context_reconcile_p = local_context_sub.add_parser("reconcile", help="Reconcile changed, deleted and new local files")
+    local_context_reconcile_p.add_argument("--asset-limit", type=int, default=2000, help="Maximum known files to verify")
+    local_context_reconcile_p.add_argument("--dir-limit", type=int, default=300, help="Maximum known folders to verify")
+    local_context_reconcile_p.add_argument("--file-limit", type=int, default=1000, help="Maximum files to scan inside changed folders")
+    local_context_reconcile_p.add_argument("--json", action="store_true", help="JSON output")
+
+    local_context_pause_p = local_context_sub.add_parser("pause", help="Pause local memory indexing")
+    local_context_pause_p.add_argument("--json", action="store_true", help="JSON output")
+
+    local_context_resume_p = local_context_sub.add_parser("resume", help="Resume local memory indexing")
+    local_context_resume_p.add_argument("--json", action="store_true", help="JSON output")
+
+    local_context_clear_p = local_context_sub.add_parser("clear-index", help="Clear the local memory index")
+    local_context_clear_p.add_argument("--json", action="store_true", help="JSON output")
+
+    local_context_roots_p = local_context_sub.add_parser("roots", help="Manage included folders")
+    local_context_roots_sub = local_context_roots_p.add_subparsers(dest="local_context_roots_command")
+    local_context_roots_list_p = local_context_roots_sub.add_parser("list", help="List included folders")
+    local_context_roots_list_p.add_argument("--json", action="store_true", help="JSON output")
+    local_context_roots_add_p = local_context_roots_sub.add_parser("add", help="Add an included folder")
+    local_context_roots_add_p.add_argument("path", help="Folder path")
+    local_context_roots_add_p.add_argument("--mode", choices=["normal", "developer", "complete"], default="normal", help="Indexing mode")
+    local_context_roots_add_p.add_argument("--depth", type=int, default=None, help="Privacy depth override")
+    local_context_roots_add_p.add_argument("--json", action="store_true", help="JSON output")
+    local_context_roots_remove_p = local_context_roots_sub.add_parser("remove", help="Remove an included folder")
+    local_context_roots_remove_p.add_argument("path", help="Folder path")
+    local_context_roots_remove_p.add_argument("--json", action="store_true", help="JSON output")
+
+    local_context_exclusions_p = local_context_sub.add_parser("exclusions", help="Manage excluded folders")
+    local_context_exclusions_sub = local_context_exclusions_p.add_subparsers(dest="local_context_exclusions_command")
+    local_context_exclusions_list_p = local_context_exclusions_sub.add_parser("list", help="List excluded folders")
+    local_context_exclusions_list_p.add_argument("--json", action="store_true", help="JSON output")
+    local_context_exclusions_add_p = local_context_exclusions_sub.add_parser("add", help="Add an excluded folder")
+    local_context_exclusions_add_p.add_argument("path", help="Folder path")
+    local_context_exclusions_add_p.add_argument("--reason", default="user", help="Reason label")
+    local_context_exclusions_add_p.add_argument("--json", action="store_true", help="JSON output")
+    local_context_exclusions_remove_p = local_context_exclusions_sub.add_parser("remove", help="Remove an excluded folder")
+    local_context_exclusions_remove_p.add_argument("path", help="Folder path")
+    local_context_exclusions_remove_p.add_argument("--json", action="store_true", help="JSON output")
+
+    local_context_filetypes_p = local_context_sub.add_parser("filetypes", help="Manage included and excluded file extensions")
+    local_context_filetypes_sub = local_context_filetypes_p.add_subparsers(dest="local_context_filetypes_command")
+    local_context_filetypes_list_p = local_context_filetypes_sub.add_parser("list", help="List file type rules")
+    local_context_filetypes_list_p.add_argument("--json", action="store_true", help="JSON output")
+    local_context_filetypes_include_p = local_context_filetypes_sub.add_parser("include", help="Include a file extension")
+    local_context_filetypes_include_p.add_argument("extension", help="Extension, for example .pdf or asd")
+    local_context_filetypes_include_p.add_argument("--action", choices=["extract", "metadata"], default="extract", help="How to index this extension")
+    local_context_filetypes_include_p.add_argument("--reason", default="user", help="Reason label")
+    local_context_filetypes_include_p.add_argument("--json", action="store_true", help="JSON output")
+    local_context_filetypes_exclude_p = local_context_filetypes_sub.add_parser("exclude", help="Exclude a file extension")
+    local_context_filetypes_exclude_p.add_argument("extension", help="Extension, for example .jpg or tmp")
+    local_context_filetypes_exclude_p.add_argument("--reason", default="user", help="Reason label")
+    local_context_filetypes_exclude_p.add_argument("--json", action="store_true", help="JSON output")
+    local_context_filetypes_remove_p = local_context_filetypes_sub.add_parser("remove", help="Remove a user extension override")
+    local_context_filetypes_remove_p.add_argument("extension", help="Extension to reset")
+    local_context_filetypes_remove_p.add_argument("--json", action="store_true", help="JSON output")
+    local_context_filetypes_reset_p = local_context_filetypes_sub.add_parser("reset", help="Remove all user extension overrides")
+    local_context_filetypes_reset_p.add_argument("--json", action="store_true", help="JSON output")
+
+    local_context_migrate_roots_v2_p = local_context_sub.add_parser("migrate-roots-v2", help="Plan or apply Local Memory roots v2 cleanup")
+    local_context_migrate_roots_v2_p.add_argument("--apply", action="store_true", help="Apply cleanup. Omit for dry-run.")
+    local_context_migrate_roots_v2_p.add_argument("--json", action="store_true", help="JSON output")
+
+    local_context_query_p = local_context_sub.add_parser("query", help="Query local memory evidence")
+    local_context_query_p.add_argument("query", help="Question or search phrase")
+    local_context_query_p.add_argument("--intent", default="answer", help="Intent label included with the query result")
+    local_context_query_p.add_argument("--limit", type=int, default=12, help="Maximum evidence rows")
+    local_context_query_p.add_argument("--current-context", default="", help="Optional current conversation/task context")
+    local_context_query_p.add_argument("--mode", choices=["compact", "full"], default="compact", help="Payload shape. Compact is safe for chat clients; full is for debugging.")
+    local_context_query_p.add_argument("--max-chars", type=int, default=20000, help="Maximum JSON payload size before truncation. Use 0 to disable.")
+    local_context_query_p.add_argument("--include-entities", action="store_true", help="Include matched entities in the JSON payload.")
+    local_context_query_p.add_argument("--include-relations", action="store_true", help="Include graph relations in the JSON payload.")
+    local_context_query_p.add_argument("--no-evidence-required", action="store_true", help="Allow empty evidence results")
+    local_context_query_p.add_argument("--no-record", action="store_true", help="Do not write query telemetry to local-context-usage.db")
+    local_context_query_p.add_argument("--json", action="store_true", help="JSON output")
+
+    local_context_diagnostics_p = local_context_sub.add_parser("diagnostics", help="Tail local memory diagnostic events")
+    local_context_diagnostics_p.add_argument("--limit", type=int, default=100, help="Maximum log rows")
+    local_context_diagnostics_p.add_argument("--json", action="store_true", help="JSON output")
+
+    local_context_service_p = local_context_sub.add_parser("service-config", help="Render macOS/Windows service config metadata")
+    local_context_service_p.add_argument("--platform", choices=["", "macos", "windows", "linux"], default="", help="Override platform")
+    local_context_service_p.add_argument("--json", action="store_true", help="JSON output")
+
+    local_context_models_p = local_context_sub.add_parser("models", help="Show or warm local model profiles")
+    local_context_models_sub = local_context_models_p.add_subparsers(dest="local_context_models_command")
+    local_context_models_status_p = local_context_models_sub.add_parser("status", help="Show local model status")
+    local_context_models_status_p.add_argument("--json", action="store_true", help="JSON output")
+    local_context_models_warmup_p = local_context_models_sub.add_parser("warmup", help="Warm local model profiles without network by default")
+    local_context_models_warmup_p.add_argument("--allow-download", action="store_true", help="Allow model downloads")
+    local_context_models_warmup_p.add_argument("--json", action="store_true", help="JSON output")
+
+    local_context_performance_p = local_context_sub.add_parser("performance", help="Show or change local memory indexing speed")
+    local_context_performance_sub = local_context_performance_p.add_subparsers(dest="local_context_performance_command")
+    local_context_performance_status_p = local_context_performance_sub.add_parser("status", help="Show active indexing speed")
+    local_context_performance_status_p.add_argument("--json", action="store_true", help="JSON output")
+    local_context_performance_set_p = local_context_performance_sub.add_parser("set", help="Set indexing speed")
+    local_context_performance_set_p.add_argument("profile", choices=["low", "medium", "high", "extreme"], help="Indexing speed profile")
+    local_context_performance_set_p.add_argument("--json", action="store_true", help="JSON output")
+
+    local_context_asset_p = local_context_sub.add_parser("asset", help="Inspect or purge one indexed asset")
+    local_context_asset_sub = local_context_asset_p.add_subparsers(dest="local_context_asset_command")
+    local_context_asset_get_p = local_context_asset_sub.add_parser("get", help="Get indexed asset details")
+    local_context_asset_get_p.add_argument("asset_id", help="Asset id")
+    local_context_asset_get_p.add_argument("--json", action="store_true", help="JSON output")
+    local_context_asset_neighbors_p = local_context_asset_sub.add_parser("neighbors", help="Get graph neighbors")
+    local_context_asset_neighbors_p.add_argument("asset_id", help="Asset id")
+    local_context_asset_neighbors_p.add_argument("--limit", type=int, default=30, help="Maximum relation rows")
+    local_context_asset_neighbors_p.add_argument("--json", action="store_true", help="JSON output")
+    local_context_asset_purge_p = local_context_asset_sub.add_parser("purge", help="Purge one indexed asset")
+    local_context_asset_purge_p.add_argument("asset_id", help="Asset id")
+    local_context_asset_purge_p.add_argument("--json", action="store_true", help="JSON output")
+
+    agents_parser = sub.add_parser("agents", help="Manage Home-facing personal agents")
+    agents_sub = agents_parser.add_subparsers(dest="agents_command")
+
+    agents_list_p = agents_sub.add_parser("list", help="List personal-script-backed agents")
+    agents_list_p.add_argument("--all", action="store_true", help="Include archived agents")
+    agents_list_p.add_argument("--json", action="store_true", help="JSON output")
+
+    agents_create_p = agents_sub.add_parser("create", help="Create a personal script marked as an agent")
+    agents_create_p.add_argument("name", help="Human/agent name")
+    agents_create_p.add_argument("--description", default="", help="One-line description")
+    agents_create_p.add_argument("--runtime", default="python", choices=["python", "shell"], help="Script runtime")
+    agents_create_p.add_argument("--force", action="store_true", help="Overwrite if the target file exists")
+    agents_create_p.add_argument("--json", action="store_true", help="JSON output")
+
+    agents_status_p = agents_sub.add_parser("status", help="Read agent status")
+    agents_status_p.add_argument("name", help="Agent name or path")
+    agents_status_p.add_argument("--json", action="store_true", help="JSON output")
+
+    agents_enable_p = agents_sub.add_parser("enable", help="Enable an agent")
+    agents_enable_p.add_argument("name", help="Agent name or path")
+    agents_enable_p.add_argument("--json", action="store_true", help="JSON output")
+
+    agents_disable_p = agents_sub.add_parser("disable", help="Disable an agent")
+    agents_disable_p.add_argument("name", help="Agent name or path")
+    agents_disable_p.add_argument("--json", action="store_true", help="JSON output")
+
+    agents_archive_p = agents_sub.add_parser("archive", help="Archive an agent without deleting its script")
+    agents_archive_p.add_argument("name", help="Agent name or path")
+    agents_archive_p.add_argument("--restore", action="store_true", help="Restore instead of archive")
+    agents_archive_p.add_argument("--json", action="store_true", help="JSON output")
+
+    agents_schedule_p = agents_sub.add_parser("schedule", help="Change an agent cadence")
+    agents_schedule_p.add_argument("name", help="Agent name or path")
+    agents_schedule_group = agents_schedule_p.add_mutually_exclusive_group(required=True)
+    agents_schedule_group.add_argument("--every-minutes", type=int, help="Run the agent every N minutes")
+    agents_schedule_group.add_argument("--every-seconds", type=int, help="Run the agent every N seconds")
+    agents_schedule_group.add_argument("--daily-at", type=str, help="Run the agent every day at HH:MM or HH:MM:weekday")
+    agents_schedule_group.add_argument("--schedule-freq", choices=["daily", "weekly", "monthly", "every_n_days"], help="Run the agent on an anchored cadence")
+    agents_schedule_group.add_argument("--reset", action="store_true", help="Clear the agent schedule")
+    agents_schedule_p.add_argument("--schedule-at", type=str, help="Anchored schedule time HH:MM")
+    agents_schedule_p.add_argument("--schedule-day", type=int, help="Weekday 0-6, month day 1-28, or every N days")
+    agents_schedule_p.add_argument("--json", action="store_true", help="JSON output")
+
+    agents_run_p = agents_sub.add_parser("run", help="Run an agent now")
+    agents_run_p.add_argument("name", help="Agent name or path")
+    agents_run_p.add_argument("script_args", nargs=argparse.REMAINDER, help="Arguments passed to the script")
+
+    automations_parser = sub.add_parser("automations", help="Manage Desktop-facing automations")
+    automations_sub = automations_parser.add_subparsers(dest="automations_command")
+
+    automations_list_p = automations_sub.add_parser("list", help="List operator-facing automations")
+    automations_list_p.add_argument("--all", action="store_true", help="Include support/debug automation rows as well")
+    automations_list_p.add_argument("--json", action="store_true", help="JSON output")
+
+    automations_enable_p = automations_sub.add_parser("enable", help="Enable an automation")
+    automations_enable_p.add_argument("name", help="Automation name or path")
+    automations_enable_p.add_argument("--json", action="store_true", help="JSON output")
+
+    automations_disable_p = automations_sub.add_parser("disable", help="Disable an automation")
+    automations_disable_p.add_argument("name", help="Automation name or path")
+    automations_disable_p.add_argument("--json", action="store_true", help="JSON output")
+
+    automations_reactivate_p = automations_sub.add_parser(
+        "reactivate",
+        help="Enable an automation and optionally run a check",
+    )
+    automations_reactivate_p.add_argument("name", help="Automation name or path")
+    automations_reactivate_p.add_argument("--test-run", action="store_true", help="Run the automation's check without sending")
+    automations_reactivate_p.add_argument("--json", action="store_true", help="JSON output")
+
+    automations_status_p = automations_sub.add_parser("status", help="Read automation status")
+    automations_status_p.add_argument("name", help="Automation name or path")
+    automations_status_p.add_argument("--json", action="store_true", help="JSON output")
+
+    automations_reconcile_p = automations_sub.add_parser(
+        "reconcile",
+        help="Build or apply the safe automation reconciliation plan",
+    )
+    automations_reconcile_p.add_argument("--apply", action="store_true", help="Apply only safe deterministic actions")
+    automations_reconcile_p.add_argument("--json", action="store_true", help="JSON output")
+
+    automations_instructions_p = automations_sub.add_parser(
+        "instructions",
+        help="Set or clear operator extra instructions for an automation",
+    )
+    automations_instructions_p.add_argument("name", help="Automation name or path")
+    automations_instructions_group = automations_instructions_p.add_mutually_exclusive_group(required=True)
+    automations_instructions_group.add_argument("--text", help="Instruction text to persist")
+    automations_instructions_group.add_argument("--stdin", action="store_true", help="Read instruction text from stdin")
+    automations_instructions_group.add_argument("--clear", action="store_true", help="Clear any persisted extra instructions")
+    automations_instructions_p.add_argument("--json", action="store_true", help="JSON output")
+
+    automations_schedule_p = automations_sub.add_parser(
+        "schedule",
+        help="Change the cadence of an operator-facing automation",
+    )
+    automations_schedule_p.add_argument("name", help="Automation name or path")
+    automations_schedule_group = automations_schedule_p.add_mutually_exclusive_group(required=True)
+    automations_schedule_group.add_argument("--every-minutes", type=int, help="Run the automation every N minutes")
+    automations_schedule_group.add_argument("--every-seconds", type=int, help="Run the automation every N seconds")
+    automations_schedule_group.add_argument("--daily-at", type=str, help="Run the automation every day at HH:MM (24h)")
+    automations_schedule_group.add_argument("--reset", action="store_true", help="Restore the shipped default cadence")
+    automations_schedule_p.add_argument("--weekdays", default=None, help="Optional calendar days, e.g. Mon-Fri or Tue,Sat")
+    automations_schedule_p.add_argument("--json", action="store_true", help="JSON output")
+
+    automations_schema_p = automations_sub.add_parser(
+        "preference-schema",
+        help="Read structured content options for an automation",
+    )
+    automations_schema_p.add_argument("name", help="Automation name or path")
+    automations_schema_p.add_argument("--query", default="", help="Local search inside the preference options")
+    automations_schema_p.add_argument("--json", action="store_true", help="JSON output")
+
+    automations_preferences_p = automations_sub.add_parser(
+        "preferences",
+        help="Read or update structured content preferences for an automation",
+    )
+    automations_preferences_p.add_argument("name", help="Automation name or path")
+    automations_preferences_p.add_argument("--payload", default="", help="JSON object to persist")
+    automations_preferences_p.add_argument("--payload-file", default="", help="Path to a JSON object to persist")
+    automations_preferences_p.add_argument("--payload-stdin", action="store_true", help="Read JSON object from stdin")
+    automations_preferences_p.add_argument("--json", action="store_true", help="JSON output")
+
+    morning_briefing_parser = sub.add_parser("morning-briefing", help="Read the latest operator morning briefing")
+    morning_briefing_sub = morning_briefing_parser.add_subparsers(dest="morning_briefing_command")
+    morning_latest_p = morning_briefing_sub.add_parser("latest", help="Show the latest sent morning briefing")
+    morning_latest_p.add_argument("--include-non-sent", action="store_true", help="Include failed/in-progress rows for diagnostics")
+    morning_latest_p.add_argument("--json", action="store_true", help="JSON output")
+    for mark_command in ("mark-shown", "mark-opened", "mark-dismissed"):
+        mark_p = morning_briefing_sub.add_parser(mark_command, help=f"{mark_command.replace('-', ' ')} for Desktop")
+        mark_p.add_argument("--id", dest="briefing_id", type=int, default=None, help="Specific briefing id")
+        mark_p.add_argument("--json", action="store_true", help="JSON output")
+
+    core_schedules_parser = sub.add_parser("core-schedules", help="Manage structural core cron cadences")
+    core_schedules_sub = core_schedules_parser.add_subparsers(dest="core_schedules_command")
+
+    core_schedules_list_p = core_schedules_sub.add_parser("list", help="List structural core schedules")
+    core_schedules_list_p.add_argument("--json", action="store_true", help="JSON output")
+
+    core_schedules_status_p = core_schedules_sub.add_parser("status", help="Read one structural core schedule")
+    core_schedules_status_p.add_argument("name", help="Core cron name")
+    core_schedules_status_p.add_argument("--json", action="store_true", help="JSON output")
+
+    core_schedules_schedule_p = core_schedules_sub.add_parser(
+        "schedule",
+        help="Change the cadence of a structural core cron",
+    )
+    core_schedules_schedule_p.add_argument("name", help="Core cron name")
+    core_schedules_schedule_group = core_schedules_schedule_p.add_mutually_exclusive_group(required=True)
+    core_schedules_schedule_group.add_argument("--every-minutes", type=int, help="Run the cron every N minutes")
+    core_schedules_schedule_group.add_argument("--every-seconds", type=int, help="Run the cron every N seconds")
+    core_schedules_schedule_group.add_argument("--daily-at", type=str, help="Run the cron at HH:MM and preserve any weekday")
+    core_schedules_schedule_group.add_argument("--reset", action="store_true", help="Restore the shipped default cadence")
+    core_schedules_schedule_p.add_argument("--json", action="store_true", help="JSON output")
+
+    # -- update --
+    update_parser = sub.add_parser("update", help="Update installed runtime")
+    update_parser.add_argument("--json", action="store_true", help="JSON output")
+    update_parser.add_argument(
+        "--no-clis",
+        dest="no_clis",
+        action="store_true",
+        help="Skip auto-updating external terminal CLIs (Claude Code, Codex)",
+    )
+
+    # -- recover --
+    recover_parser = sub.add_parser(
+        "recover",
+        help="Restore ~/.nexo/data/nexo.db from a hourly backup (data-loss recovery)",
+    )
+    recover_parser.add_argument("--from", dest="source", default=None,
+                                help="Explicit backup path (file or snapshot directory)")
+    recover_parser.add_argument("--list", action="store_true",
+                                help="List available backups and exit")
+    recover_parser.add_argument("--dry-run", action="store_true",
+                                help="Report the plan but do not touch the DB")
+    recover_parser.add_argument("--force", action="store_true",
+                                help="Overwrite the current DB even if it does not look wiped")
+    recover_parser.add_argument("--yes", action="store_true",
+                                help="Skip the interactive confirmation prompt")
+    recover_parser.add_argument("--json", action="store_true", help="JSON output")
+
+    # -- rollback --
+    rollback_parser = sub.add_parser(
+        "rollback",
+        help="Reverse a structural migration using a pre-change snapshot",
+    )
+    rollback_sub = rollback_parser.add_subparsers(dest="rollback_command")
+    rollback_f06_p = rollback_sub.add_parser(
+        "f06",
+        help="Revert the F0.6 layout migration using ~/.nexo-pre-f06-snapshot",
+    )
+    rollback_f06_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would happen, do not mutate filesystem or LaunchAgents.",
+    )
+    rollback_f06_p.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the interactive confirmation prompt.",
+    )
+    rollback_f06_p.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON instead of text output.",
+    )
+    rollback_f06_p.add_argument(
+        "--keep-agents-running",
+        action="store_true",
+        help="Do not bootout / reload LaunchAgents. Advanced use; leaves stale services.",
+    )
+
+    # -- clients --
+    clients_parser = sub.add_parser("clients", help="Shared client config management")
+    clients_sub = clients_parser.add_subparsers(dest="clients_command")
+    clients_sync_p = clients_sub.add_parser("sync", help="Sync Claude Code, Claude Desktop, and Codex to the same NEXO brain")
+    clients_sync_p.add_argument("--json", action="store_true", help="JSON output")
+    clients_sync_p.add_argument(
+        "--auto-install-missing-claude",
+        action="store_true",
+        help="Install Claude Code automatically when the selected runtime needs it and it is missing.",
+    )
+    clients_sync_p.add_argument(
+        "--auto-install-missing-codex",
+        action="store_true",
+        help="Install Codex automatically when the selected runtime needs it and it is missing.",
+    )
+
+    # -- closure --
+    closure_parser = sub.add_parser("closure", help="Operational closure queue")
+    closure_sub = closure_parser.add_subparsers(dest="closure_command")
+    closure_status_p = closure_sub.add_parser("status", help="Show closure queue status")
+    closure_status_p.add_argument("--limit", type=int, default=10, help="Top items to include")
+    closure_status_p.add_argument("--no-refresh", action="store_true", help="Do not refresh adapters before reading")
+    closure_status_p.add_argument("--json", action="store_true", help="JSON output")
+    closure_next_p = closure_sub.add_parser("next", help="Show ranked closure items")
+    closure_next_p.add_argument("--limit", type=int, default=10, help="Maximum items")
+    closure_next_p.add_argument("--include-waiting", action="store_true", help="Include waiting_user/blocked items")
+    closure_next_p.add_argument("--refresh", action="store_true", help="Refresh adapters before reading")
+    closure_next_p.add_argument("--source", default="", help="Filter by source")
+    closure_next_p.add_argument("--kind", default="", help="Filter by kind")
+    closure_next_p.add_argument("--state", default="", help="Filter by state, e.g. ready or waiting_user")
+    closure_next_p.add_argument("--area", default="", help="Filter by owner/source/kind/payload area")
+    closure_next_p.add_argument("--max-risk", type=float, default=0.0, help="Filter by maximum risk_score")
+    closure_next_p.add_argument("--json", action="store_true", help="JSON output")
+    closure_snapshot_p = closure_sub.add_parser("snapshot", help="Write and show the daily closure snapshot")
+    closure_snapshot_p.add_argument("--date", default="", help="Snapshot date YYYY-MM-DD")
+    closure_snapshot_p.add_argument("--limit", type=int, default=10, help="Top items to include")
+    closure_snapshot_p.add_argument("--no-refresh", action="store_true", help="Do not refresh adapters before snapshot")
+    closure_snapshot_p.add_argument("--json", action="store_true", help="JSON output")
+
+    # -- preferences --
+    preferences_parser = sub.add_parser(
+        "preferences",
+        help="Read or change NEXO user preferences (resonance, default client, ...)",
+    )
+    preferences_parser.add_argument("preferences_action", nargs="?", choices=["catalog", "get", "set", "explain"], help="Catalog operation")
+    preferences_parser.add_argument("preferences_id", nargs="?", help="Preference id or alias")
+    preferences_parser.add_argument("preferences_value", nargs="?", help="Value for `preferences set`")
+    preferences_parser.add_argument("--query", default="", help="Filter catalog entries")
+    preferences_parser.add_argument("--include-values", action="store_true", help="Include current values in catalog output")
+    preferences_parser.add_argument("--dry-run", action="store_true", help="Preview a preference change")
+    preferences_parser.add_argument(
+        "--resonance",
+        choices=["maximo", "alto", "medio", "bajo"],
+        help="Set the default resonance tier for interactive sessions "
+             "(nexo chat, Desktop new conversation, interactive nexo update). "
+             "System-owned callers (deep-sleep, catchup, etc.) ignore this value "
+             "and use the tier hard-coded in resonance_map.py. Default: alto.",
+    )
+    preferences_parser.add_argument(
+        "--show",
+        action="store_true",
+        help="Print the current preferences as JSON and exit.",
+    )
+    automation_enabled_group = preferences_parser.add_mutually_exclusive_group()
+    automation_enabled_group.add_argument(
+        "--automation-enabled",
+        action="store_true",
+        help="Allow background automations to run.",
+    )
+    automation_enabled_group.add_argument(
+        "--automation-disabled",
+        action="store_true",
+        help="Pause background automations without deleting their schedules.",
+    )
+    preferences_parser.add_argument(
+        "--automation-backend",
+        choices=["claude_code", "codex", "none"],
+        help="Backend used by background automations when they are enabled.",
+    )
+    preferences_parser.add_argument(
+        "--chat-provider",
+        choices=["anthropic", "openai"],
+        help="Provider used for new chat sessions: Anthropic runs Claude Code, OpenAI runs Codex.",
+    )
+    preferences_parser.add_argument(
+        "--automation-provider",
+        choices=["anthropic", "openai", "none"],
+        help="Provider used by background automations. 'none' pauses the runtime instead of falling back.",
+    )
+    preferences_parser.add_argument("--json", action="store_true", help="JSON output")
+
+    # -- provider --
+    provider_parser = sub.add_parser("provider", help="Provider runtime status and selection")
+    provider_sub = provider_parser.add_subparsers(dest="provider_command")
+    provider_status_p = provider_sub.add_parser("status", help="Show selected Anthropic/OpenAI runtime")
+    provider_status_p.add_argument("--json", action="store_true", help="JSON output")
+    provider_select_p = provider_sub.add_parser("select", help="Select Anthropic or OpenAI runtime")
+    provider_select_p.add_argument("provider", choices=["anthropic", "openai"], help="Provider to select")
+    provider_scope = provider_select_p.add_mutually_exclusive_group()
+    provider_scope.add_argument("--chat-only", action="store_true", help="Only switch new chat sessions")
+    provider_scope.add_argument("--automation-only", action="store_true", help="Only switch background automation")
+    provider_select_p.add_argument("--json", action="store_true", help="JSON output")
+
+    # -- doctor --
+    doctor_parser = sub.add_parser("doctor", help="Unified diagnostics")
+    doctor_parser.add_argument("--tier", default="boot", choices=["boot", "runtime", "deep", "all"],
+                               help="Diagnostic tier (default: boot)")
+    doctor_parser.add_argument(
+        "--plane",
+        default="",
+        choices=["", "runtime_personal", "installation_live", "database_real", "product_public", "cooperator"],
+        help="Diagnostic plane. Doctor only runs on runtime_personal, installation_live, or database_real.",
+    )
+    doctor_parser.add_argument("--json", action="store_true", help="JSON output")
+    doctor_parser.add_argument("--fix", action="store_true", help="Apply deterministic fixes")
+    doctor_parser.add_argument("--migrate-calibration", action="store_true",
+                               help="Force calibration.json flat → nested migration")
+    doctor_parser.add_argument("--calibration-dry-run", action="store_true",
+                               help="Preview the calibration migration without writing")
+
+    support_snapshot_parser = sub.add_parser("support-snapshot", help="Generic runtime snapshot for support and diagnostics")
+    support_snapshot_parser.add_argument("--json", action="store_true", help="JSON output (default)")
+    support_snapshot_parser.add_argument("--include-doctor", action="store_true", help="Include runtime doctor report")
+    support_snapshot_parser.add_argument("--log-lines", type=int, default=80, help="How many recent log lines to include")
+
+    # -- contributor --
+    contributor_parser = sub.add_parser("contributor", help="Retired public contribution mode")
+    contributor_parser.add_argument("action", choices=["status", "on", "off"], help="Manage contributor mode")
+    contributor_parser.add_argument("--json", action="store_true", help="JSON output")
+
+    # -- skills --
+    skills_parser = sub.add_parser("skills", help="Skills v2 runtime")
+    skills_sub = skills_parser.add_subparsers(dest="skills_command")
+
+    skills_list_p = skills_sub.add_parser("list", help="List skills")
+    skills_list_p.add_argument("--level", default="", help="Filter by level")
+    skills_list_p.add_argument("--tag", default="", help="Filter by tag")
+    skills_list_p.add_argument("--source-kind", default="", help="Filter by source kind")
+    skills_list_p.add_argument("--json", action="store_true", help="JSON output")
+
+    skills_get_p = skills_sub.add_parser("get", help="Get skill")
+    skills_get_p.add_argument("id", help="Skill ID")
+    skills_get_p.add_argument("--json", action="store_true", help="JSON output")
+
+    skills_apply_p = skills_sub.add_parser("apply", help="Apply a skill")
+    skills_apply_p.add_argument("id", help="Skill ID")
+    skills_apply_p.add_argument("--params", default="{}", help="JSON parameters")
+    skills_apply_p.add_argument("--mode", default="auto", choices=["auto", "guide", "execute", "hybrid"])
+    skills_apply_p.add_argument("--dry-run", action="store_true", help="Render without executing")
+    skills_apply_p.add_argument("--context", default="", help="Usage context for feedback loop")
+    skills_apply_p.add_argument("--json", action="store_true", help="JSON output")
+
+    skills_test_p = skills_sub.add_parser("test", help="Dry-run test a skill")
+    skills_test_p.add_argument("id", help="Skill ID")
+    skills_test_p.add_argument("--params", default="{}", help="JSON parameters")
+    skills_test_p.add_argument("--mode", default="auto", choices=["auto", "guide", "execute", "hybrid"])
+    skills_test_p.add_argument("--context", default="", help="Testing context")
+    skills_test_p.add_argument("--json", action="store_true", help="JSON output")
+
+    skills_sync_p = skills_sub.add_parser("sync", help="Sync filesystem skills")
+    skills_sync_p.add_argument("--json", action="store_true", help="JSON output")
+
+    skills_approve_p = skills_sub.add_parser("approve", help="Approve an executable skill")
+    skills_approve_p.add_argument("id", help="Skill ID")
+    skills_approve_p.add_argument("--execution-level", default="", choices=["", "read-only", "local", "remote"])
+    skills_approve_p.add_argument("--approved-by", default="", help="Approver name")
+    skills_approve_p.add_argument("--json", action="store_true", help="JSON output")
+
+    skills_featured_p = skills_sub.add_parser("featured", help="Featured startup skills")
+    skills_featured_p.add_argument("--limit", type=int, default=5)
+    skills_featured_p.add_argument("--json", action="store_true", help="JSON output")
+
+    skills_evolution_p = skills_sub.add_parser("evolution", help="Evolution candidates")
+    skills_evolution_p.add_argument("--json", action="store_true", help="JSON output")
+
+    skills_outcome_review_p = skills_sub.add_parser("outcome-review", help="Review skill lifecycle against sustained outcomes")
+    skills_outcome_review_p.add_argument("id", help="Skill ID")
+    skills_outcome_review_p.add_argument("--auto-apply", action="store_true", help="Apply the recommended promotion/retirement when it is strong enough")
+    skills_outcome_review_p.add_argument("--json", action="store_true", help="JSON output")
+
+    skills_promote_p = skills_sub.add_parser("promote", help="Promote a skill lifecycle level")
+    skills_promote_p.add_argument("id", help="Skill ID")
+    skills_promote_p.add_argument("--target-level", default="published", choices=["draft", "published", "stable"])
+    skills_promote_p.add_argument("--reason", default="", help="Why promote this skill")
+    skills_promote_p.add_argument("--json", action="store_true", help="JSON output")
+
+    skills_retire_p = skills_sub.add_parser("retire", help="Archive a skill")
+    skills_retire_p.add_argument("id", help="Skill ID")
+    skills_retire_p.add_argument("--replacement-id", default="", help="Optional replacement skill ID")
+    skills_retire_p.add_argument("--reason", default="", help="Why retire this skill")
+    skills_retire_p.add_argument("--json", action="store_true", help="JSON output")
+
+    skills_compose_p = skills_sub.add_parser("compose", help="Compose multiple skills into one")
+    skills_compose_p.add_argument("new_id", help="New skill ID")
+    skills_compose_p.add_argument("name", help="New skill name")
+    skills_compose_p.add_argument("--component-ids", required=True, help="JSON array or comma-separated skill IDs")
+    skills_compose_p.add_argument("--description", default="", help="Composite skill description")
+    skills_compose_p.add_argument("--level", default="draft", choices=["trace", "draft", "published", "stable"])
+    skills_compose_p.add_argument("--mode", default="guide", choices=["guide", "hybrid"])
+    skills_compose_p.add_argument("--tags", default="[]", help="JSON array or comma-separated tags")
+    skills_compose_p.add_argument("--trigger-patterns", default="[]", help="JSON array or comma-separated trigger patterns")
+    skills_compose_p.add_argument("--json", action="store_true", help="JSON output")
+
+    # -- uninstall --
+    uninstall_parser = sub.add_parser("uninstall", help="Stop all crons, remove runtime, keep user data")
+    uninstall_parser.add_argument("--dry-run", action="store_true", help="Show what would be done without doing it")
+    uninstall_parser.add_argument("--delete-data", action="store_true", help="Also delete databases and user data (DESTRUCTIVE)")
+    uninstall_parser.add_argument("--json", action="store_true", help="JSON output")
+
+    # -- dashboard --
+    dashboard_parser = sub.add_parser("dashboard", help="Web dashboard control")
+    dashboard_parser.add_argument("action", choices=["on", "off", "status"], help="Start, stop, or check dashboard")
+
+    mcp_parser = sub.add_parser("mcp", help="MCP runtime status and restart state")
+    mcp_sub = mcp_parser.add_subparsers(dest="mcp_command")
+    mcp_status_p = mcp_sub.add_parser("status", help="Read the current runtime/MCP alignment state")
+    mcp_status_p.add_argument("--client", default="", help="Optional client label such as claude_desktop or codex")
+    mcp_status_p.add_argument("--json", action="store_true", help="JSON output")
+    mcp_probe_p = mcp_sub.add_parser("probe", help="Launch the MCP server and verify initialize + tools/list")
+    mcp_probe_p.add_argument("--client", default="", help="Optional client label such as claude_desktop or codex")
+    mcp_probe_p.add_argument("--timeout-ms", type=int, default=8000)
+    mcp_probe_p.add_argument("--plugin-mode", default="none", choices=["essential", "none", "full"])
+    mcp_probe_p.add_argument("--json", action="store_true", help="JSON output")
+    mcp_clear_p = mcp_sub.add_parser("clear-restart", help="Acknowledge that a client/session reloaded the new runtime")
+    mcp_clear_p.add_argument("--client", default="", help="Client label such as claude_desktop or codex")
+    mcp_clear_p.add_argument("--installed-version", default="")
+    mcp_clear_p.add_argument("--process-version", default="")
+    mcp_clear_p.add_argument("--installed-fingerprint", default="")
+    mcp_clear_p.add_argument("--process-fingerprint", default="")
+    mcp_clear_p.add_argument("--json", action="store_true", help="JSON output")
+
+    continuity_parser = sub.add_parser("continuity", help="Continuity snapshots and resume bundles")
+    continuity_sub = continuity_parser.add_subparsers(dest="continuity_command")
+    cwrite_p = continuity_sub.add_parser("snapshot-write", help="Write a continuity snapshot")
+    cwrite_p.add_argument("--conversation-id", required=True)
+    cwrite_p.add_argument("--session-id", default="")
+    cwrite_p.add_argument("--external-session-id", default="")
+    cwrite_p.add_argument("--client", default="")
+    cwrite_p.add_argument("--event-type", default="turn_end")
+    cwrite_p.add_argument("--payload", default="")
+    cwrite_p.add_argument("--trace-id", default="")
+    cwrite_p.add_argument("--idempotency-key", default="")
+    cwrite_p.add_argument("--json", action="store_true", help="JSON output")
+
+    cread_p = continuity_sub.add_parser("snapshot-read", help="Read continuity snapshots")
+    cread_p.add_argument("--conversation-id", default="")
+    cread_p.add_argument("--session-id", default="")
+    cread_p.add_argument("--limit", type=int, default=20)
+    cread_p.add_argument("--json", action="store_true", help="JSON output")
+
+    cbundle_p = continuity_sub.add_parser("resume-bundle", help="Build a continuity resume bundle")
+    cbundle_p.add_argument("--conversation-id", default="")
+    cbundle_p.add_argument("--session-id", default="")
+    cbundle_p.add_argument("--external-session-id", default="")
+    cbundle_p.add_argument("--client", default="")
+    cbundle_p.add_argument("--token-budget", type=int, default=2000)
+    cbundle_p.add_argument("--json", action="store_true", help="JSON output")
+
+    caudit_p = continuity_sub.add_parser("audit", help="Read the continuity audit timeline")
+    caudit_p.add_argument("--conversation-id", required=True)
+    caudit_p.add_argument("--limit", type=int, default=50)
+    caudit_p.add_argument("--json", action="store_true", help="JSON output")
+
+    # -- desktop bridge (read-only, for NEXO Desktop and any external UI) --
+    # v7.4.0 — lifecycle event bridge (guardian-claude-desktop-plan).
+    lifecycle_parser = sub.add_parser("lifecycle", help="Conversation lifecycle event handler (v7.4 Desktop bridge)")
+    lifecycle_sub = lifecycle_parser.add_subparsers(dest="lifecycle_command")
+
+    lrec_p = lifecycle_sub.add_parser("record", help="Record a lifecycle event")
+    lrec_p.add_argument("--event-id", required=True, help="UUID minted by the client (idempotency key)")
+    lrec_p.add_argument("--action", required=True, help="close|delete|archive|switch|app-exit|window-close")
+    lrec_p.add_argument("--conversation-id", required=True)
+    lrec_p.add_argument("--session-id", default="")
+    lrec_p.add_argument("--reason", default="user_action")
+    lrec_p.add_argument("--payload", default="", help="JSON-encoded payload_snapshot")
+    lrec_p.add_argument("--payload-file", default="", help="Path to a JSON payload_snapshot file for large Desktop events")
+    lrec_p.add_argument("--source", default="desktop")
+
+    lstat_p = lifecycle_sub.add_parser("status", help="Read the current delivery_status of an event")
+    lstat_p.add_argument("--event-id", required=True)
+
+    lcomp_p = lifecycle_sub.add_parser(
+        "complete-canonical",
+        help="v7.5: confirm Desktop finished executing the canonical_actions a prior record returned",
+    )
+    lcomp_p.add_argument("--event-id", required=True)
+    lcomp_p.add_argument("--plan-id", required=True, help="canonical_plan_id returned by the original record call")
+    lcomp_p.add_argument(
+        "--results",
+        default="",
+        help="JSON array of per-action outcomes, e.g. '[{\"action_id\":\"a1\",\"status\":\"ok\"}]'",
+    )
+
+    lwait_p = lifecycle_sub.add_parser(
+        "wait-for-diary",
+        help="v7.9: wait for concrete session_diary evidence before canonical stop_session",
+    )
+    lwait_p.add_argument("--event-id", required=True)
+    lwait_p.add_argument("--timeout-ms", type=int, default=45_000)
+    lwait_p.add_argument("--poll-ms", type=int, default=500)
+
+    lfallback_diary_p = lifecycle_sub.add_parser(
+        "write-fallback-diary",
+        help="v7.9.22: write emergency diary evidence for a lifecycle event",
+    )
+    lfallback_diary_p.add_argument("--event-id", required=True)
+    lfallback_diary_p.add_argument("--reason", default="")
+    lfallback_diary_p.add_argument("--source", default="desktop-lifecycle-fallback")
+
+    lwait_stop_p = lifecycle_sub.add_parser(
+        "wait-for-stop",
+        help="v7.9.10: wait until the linked NEXO session is no longer active",
+    )
+    lwait_stop_p.add_argument("--event-id", required=True)
+    lwait_stop_p.add_argument("--timeout-ms", type=int, default=10_000)
+    lwait_stop_p.add_argument("--poll-ms", type=int, default=500)
+
+    lstop_sid_p = lifecycle_sub.add_parser(
+        "stop-nexo-session",
+        help="v7.9.10: explicit best-effort stop of a NEXO SID for Desktop lifecycle cleanup",
+    )
+    lstop_sid_p.add_argument("--sid", required=True)
+
+    # Fase E.5 — quarantine ops surfaced via Desktop Guardian Proposals panel.
+    quarantine_parser = sub.add_parser("quarantine", help="Quarantine proposals (Fase E.5 Desktop UI)")
+    quarantine_sub = quarantine_parser.add_subparsers(dest="quarantine_command")
+
+    qlist_p = quarantine_sub.add_parser("list", help="List quarantine items")
+    qlist_p.add_argument("--status", default="pending",
+                         choices=["pending", "promoted", "rejected", "expired", "all"])
+    qlist_p.add_argument("--limit", type=int, default=20)
+    qlist_p.add_argument("--json", action="store_true", help="JSON output (default)")
+
+    qpromote_p = quarantine_sub.add_parser("promote", help="Promote a quarantine item to STM")
+    qpromote_p.add_argument("id", help="Quarantine item id")
+    qpromote_p.add_argument("--json", action="store_true", help="JSON output (default)")
+
+    qreject_p = quarantine_sub.add_parser("reject", help="Reject a quarantine item")
+    qreject_p.add_argument("id", help="Quarantine item id")
+    qreject_p.add_argument("--reason", default="", help="Optional rejection reason")
+    qreject_p.add_argument("--json", action="store_true", help="JSON output (default)")
+
+    schema_parser = sub.add_parser("schema", help="Editable-field schema for Preferences UI")
+    schema_parser.add_argument("--json", action="store_true", help="JSON output (default)")
+
+    identity_parser = sub.add_parser("identity", help="Canonical assistant identity")
+    identity_parser.add_argument("--json", action="store_true", help="JSON output (default)")
+
+    onboard_parser = sub.add_parser("onboard", help="Onboarding wizard steps")
+    onboard_parser.add_argument("--json", action="store_true", help="JSON output (default)")
+
+    scan_profile_parser = sub.add_parser("scan-profile", help="Build profile.json from CLAUDE.md + calibration")
+    scan_profile_parser.add_argument("--json", action="store_true", help="JSON output")
+    scan_profile_parser.add_argument("--apply", action="store_true", help="Write profile.json (default is preview)")
+    scan_profile_parser.add_argument("--force", action="store_true", help="Overwrite existing profile.json on --apply")
+
+    # -- runtime events bus + operational observability --
+    notify_parser = sub.add_parser("notify", help="Emit an event to the runtime event bus")
+    notify_parser.add_argument("type", choices=[
+        "attention_required", "proactive_message", "followup_alert",
+        "health_alert", "info",
+    ], help="Event type")
+    notify_parser.add_argument("--text", default="", help="Short user-facing message")
+    notify_parser.add_argument("--reason", default="", help="Internal reason / trigger")
+    notify_parser.add_argument("--priority", choices=["low", "normal", "high", "urgent"], default="normal")
+    notify_parser.add_argument("--source", default="nexo-brain", help="Who emitted this event")
+    notify_parser.add_argument("--json", action="store_true", help="JSON output")
+
+    health_parser = sub.add_parser("health", help="Snapshot of NEXO Brain subsystem health")
+    health_parser.add_argument("--json", action="store_true", help="JSON output (default)")
+
+    logs_parser = sub.add_parser("logs", help="Tail recent operational logs")
+    logs_parser.add_argument("--tail", action="store_true", help="Tail mode (default)")
+    logs_parser.add_argument("--lines", type=int, default=100, help="How many lines to return")
+    logs_parser.add_argument("--source", default="all",
+                             help="Log source: all | events | operations | <logname>")
+    logs_parser.add_argument("--json", action="store_true", help="JSON output")
+
+    args = parser.parse_args()
+
+    if args.help or (not args.command and not args.version):
+        _print_help()
+        return 0
+    if args.version:
+        payload = _version_status_payload(force_refresh=bool(args.json))
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False))
+        else:
+            print(f"nexo v{payload.get('installed') or _get_version()}")
+            print(_version_status_line(payload))
+        return 0
+
+    if args.command == "email":
+        # Plan F1 — setup / list / test / remove email accounts.
+        fn = getattr(args, "func", None)
+        if fn is None:
+            print("usage: nexo email {setup,list,test,remove}")
+            return 1
+        return int(fn(args) or 0)
+
+    if args.command == "scripts":
+        if args.scripts_command == "list":
+            return _scripts_list(args)
+        elif args.scripts_command == "create":
+            return _scripts_create(args)
+        elif args.scripts_command == "classify":
+            return _scripts_classify(args)
+        elif args.scripts_command == "sync":
+            return _scripts_sync(args)
+        elif args.scripts_command == "reconcile":
+            return _scripts_reconcile(args)
+        elif args.scripts_command == "ensure-schedules":
+            return _scripts_ensure_schedules(args)
+        elif args.scripts_command == "schedules":
+            return _scripts_schedules(args)
+        elif args.scripts_command == "unschedule":
+            return _scripts_unschedule(args)
+        elif args.scripts_command == "remove":
+            return _scripts_remove(args)
+        elif args.scripts_command == "run":
+            return _scripts_run(args)
+        elif args.scripts_command == "doctor":
+            return _scripts_doctor(args)
+        elif args.scripts_command == "call":
+            return _scripts_call(args)
+        elif args.scripts_command == "enable":
+            return _scripts_set_enabled(args, True)
+        elif args.scripts_command == "disable":
+            return _scripts_set_enabled(args, False)
+        elif args.scripts_command == "status":
+            return _scripts_status(args)
+        elif args.scripts_command == "instructions":
+            return _scripts_set_instructions(args)
+        elif args.scripts_command == "schedule":
+            return _scripts_set_schedule(args)
+        else:
+            scripts_parser.print_help()
+            return 0
+    elif args.command == "pre-answer":
+        if args.pre_answer_command == "route":
+            return _pre_answer_route(args)
+        pre_answer_parser.print_help()
+        return 0
+    elif args.command == "cognitive-control":
+        if args.cognitive_control_command == "observatory":
+            return _cognitive_control_observatory(args)
+        cognitive_control_parser.print_help()
+        return 0
+    elif args.command == "memory-observations":
+        if args.memory_observations_command == "process":
+            return _memory_observations_process(args)
+        if args.memory_observations_command == "intraday":
+            return _memory_observations_intraday(args)
+        memory_observations_parser.print_help()
+        return 0
+    elif args.command == "local-context":
+        if args.local_context_command == "status":
+            return _local_context_status(args)
+        if args.local_context_command == "run-once":
+            return _local_context_run_once(args)
+        if args.local_context_command == "reconcile":
+            return _local_context_reconcile(args)
+        if args.local_context_command in {"pause", "resume", "clear-index"}:
+            return _local_context_control(args)
+        if args.local_context_command == "roots":
+            if not args.local_context_roots_command:
+                local_context_roots_p.print_help()
+                return 0
+            return _local_context_roots(args)
+        if args.local_context_command == "exclusions":
+            if not args.local_context_exclusions_command:
+                local_context_exclusions_p.print_help()
+                return 0
+            return _local_context_exclusions(args)
+        if args.local_context_command == "filetypes":
+            if not args.local_context_filetypes_command:
+                local_context_filetypes_p.print_help()
+                return 0
+            return _local_context_filetypes(args)
+        if args.local_context_command == "migrate-roots-v2":
+            return _local_context_migrate_roots_v2(args)
+        if args.local_context_command == "query":
+            return _local_context_query(args)
+        if args.local_context_command == "diagnostics":
+            return _local_context_diagnostics(args)
+        if args.local_context_command == "service-config":
+            return _local_context_service_config(args)
+        if args.local_context_command == "models":
+            if not args.local_context_models_command:
+                args.local_context_models_command = "status"
+            return _local_context_models(args)
+        if args.local_context_command == "performance":
+            if not args.local_context_performance_command:
+                args.local_context_performance_command = "status"
+            return _local_context_performance(args)
+        if args.local_context_command == "asset":
+            if not args.local_context_asset_command:
+                local_context_asset_p.print_help()
+                return 0
+            return _local_context_asset(args)
+        local_context_parser.print_help()
+        return 0
+    elif args.command == "agents":
+        if args.agents_command == "list":
+            return _agents_list(args)
+        elif args.agents_command == "create":
+            return _agents_create(args)
+        elif args.agents_command == "status":
+            return _agents_status(args)
+        elif args.agents_command == "enable":
+            return _agents_set_enabled(args, True)
+        elif args.agents_command == "disable":
+            return _agents_set_enabled(args, False)
+        elif args.agents_command == "archive":
+            return _agents_archive(args)
+        elif args.agents_command == "schedule":
+            return _agents_set_schedule(args)
+        elif args.agents_command == "run":
+            return _agents_run(args)
+        agents_parser.print_help()
+        return 0
+    elif args.command == "automations":
+        if args.automations_command == "list":
+            return _automations_list(args)
+        elif args.automations_command == "enable":
+            return _automations_set_enabled(args, True)
+        elif args.automations_command == "disable":
+            return _automations_set_enabled(args, False)
+        elif args.automations_command == "reactivate":
+            return _automations_reactivate(args)
+        elif args.automations_command == "status":
+            return _automations_status(args)
+        elif args.automations_command == "reconcile":
+            return _automations_reconcile(args)
+        elif args.automations_command == "instructions":
+            return _automations_set_instructions(args)
+        elif args.automations_command == "schedule":
+            return _automations_set_schedule(args)
+        elif args.automations_command == "preference-schema":
+            return _automations_preference_schema(args)
+        elif args.automations_command == "preferences":
+            return _automations_preferences(args)
+        automations_parser.print_help()
+        return 0
+    elif args.command == "morning-briefing":
+        if args.morning_briefing_command in {"latest", "mark-shown", "mark-opened", "mark-dismissed"}:
+            return _morning_briefing(args)
+        morning_briefing_parser.print_help()
+        return 0
+    elif args.command == "core-schedules":
+        if args.core_schedules_command == "list":
+            return _core_schedules_list(args)
+        elif args.core_schedules_command == "status":
+            return _core_schedules_status(args)
+        elif args.core_schedules_command == "schedule":
+            return _core_schedules_set(args)
+        core_schedules_parser.print_help()
+        return 0
+    elif args.command == "chat":
+        return _chat(args)
+    elif args.command == "export":
+        return _export_bundle(args)
+    elif args.command == "import-inspect":
+        return _inspect_bundle(args)
+    elif args.command == "import":
+        return _import_bundle(args)
+    elif args.command == "update":
+        return _update(args)
+    elif args.command == "recover":
+        return _recover(args)
+    elif args.command == "rollback":
+        if args.rollback_command == "f06":
+            return _rollback_f06(args)
+        rollback_parser.print_help()
+        return 0
+    elif args.command == "clients":
+        if args.clients_command == "sync":
+            return _clients_sync(args)
+        clients_parser.print_help()
+        return 0
+    elif args.command == "closure":
+        if not args.closure_command:
+            args.closure_command = "status"
+        return _closure(args)
+    elif args.command == "mcp":
+        if args.mcp_command == "status":
+            return _mcp_status(args)
+        if args.mcp_command == "probe":
+            return _mcp_probe(args)
+        if args.mcp_command == "clear-restart":
+            return _mcp_clear_restart(args)
+        mcp_parser.print_help()
+        return 0
+    elif args.command == "continuity":
+        if args.continuity_command == "snapshot-write":
+            return _continuity_snapshot_write(args)
+        elif args.continuity_command == "snapshot-read":
+            return _continuity_snapshot_read(args)
+        elif args.continuity_command == "resume-bundle":
+            return _continuity_resume_bundle(args)
+        elif args.continuity_command == "audit":
+            return _continuity_audit(args)
+        continuity_parser.print_help()
+        return 0
+    elif args.command == "preferences":
+        return _preferences(args)
+    elif args.command == "provider":
+        return _provider(args)
+    elif args.command == "doctor":
+        return _doctor(args)
+    elif args.command == "support-snapshot":
+        return _support_snapshot(args)
+    elif args.command == "contributor":
+        if args.action == "status":
+            return _contributor_status(args)
+        elif args.action == "on":
+            return _contributor_on(args)
+        elif args.action == "off":
+            return _contributor_off(args)
+        contributor_parser.print_help()
+        return 0
+    elif args.command == "skills":
+        if args.skills_command == "list":
+            return _skills_list(args)
+        elif args.skills_command == "get":
+            return _skills_get(args)
+        elif args.skills_command == "apply":
+            return _skills_apply(args)
+        elif args.skills_command == "test":
+            return _skills_test(args)
+        elif args.skills_command == "sync":
+            return _skills_sync(args)
+        elif args.skills_command == "approve":
+            return _skills_approve(args)
+        elif args.skills_command == "featured":
+            return _skills_featured(args)
+        elif args.skills_command == "evolution":
+            return _skills_evolution(args)
+        elif args.skills_command == "outcome-review":
+            return _skills_outcome_review(args)
+        elif args.skills_command == "promote":
+            return _skills_promote(args)
+        elif args.skills_command == "retire":
+            return _skills_retire(args)
+        elif args.skills_command == "compose":
+            return _skills_compose(args)
+        else:
+            skills_parser.print_help()
+            return 0
+    elif args.command == "uninstall":
+        return _uninstall(args)
+    elif args.command == "dashboard":
+        return _dashboard(args)
+    elif args.command == "quarantine":
+        from desktop_bridge import cmd_quarantine_list, cmd_quarantine_promote, cmd_quarantine_reject
+        if args.quarantine_command == "list":
+            return cmd_quarantine_list(args)
+        if args.quarantine_command == "promote":
+            return cmd_quarantine_promote(args)
+        if args.quarantine_command == "reject":
+            return cmd_quarantine_reject(args)
+        # No subcommand — show help.
+        quarantine_parser.print_help()
+        return 1
+    elif args.command == "lifecycle":
+        # v7.4.0 — bridge for NEXO Desktop's ConversationLifecycleService.
+        # Both subcommands emit a single JSON line to stdout so the
+        # caller (main.js runNexoCommand) can parse the ack directly.
+        import json as _json
+        import plugins.lifecycle_events as _lifecycle_plugin
+        if args.lifecycle_command == "record":
+            payload_snapshot = args.payload or ""
+            payload_file = (getattr(args, "payload_file", "") or "").strip()
+            if payload_file:
+                try:
+                    payload_snapshot = Path(payload_file).read_text(encoding="utf-8")
+                except Exception as exc:
+                    print(_json.dumps({
+                        "status": "rejected",
+                        "event_id": args.event_id,
+                        "reason": f"payload-file-read-failed:{type(exc).__name__}",
+                    }, ensure_ascii=False))
+                    return 3
+            out = _lifecycle_plugin.handle_nexo_lifecycle_event(
+                event_id=args.event_id,
+                action=args.action,
+                conversation_id=args.conversation_id,
+                session_id=args.session_id or "",
+                reason=args.reason or "user_action",
+                payload_snapshot=payload_snapshot,
+                source=args.source or "desktop",
+                schema_version=1,
+            )
+            print(out)
+            try:
+                parsed = _json.loads(out)
+                status = str(parsed.get("status", ""))
+            except Exception:
+                status = ""
+            # Exit code 0 for terminal ok states AND for canonical_pending
+            # (v7.5: plan handed to Desktop, awaiting complete_canonical).
+            # 2 for retryable_error so Desktop can distinguish "persisted +
+            # processed" from "try again on boot reconciliation".
+            # Rejected is exit 3 (bad input).
+            if status in ("processed", "already_processed", "accepted", "canonical_pending"):
+                return 0
+            if status == "retryable_error":
+                return 2
+            return 3
+        if args.lifecycle_command == "status":
+            out = _lifecycle_plugin.handle_nexo_lifecycle_status(args.event_id)
+            print(out)
+            return 0
+        if args.lifecycle_command == "complete-canonical":
+            out = _lifecycle_plugin.handle_nexo_lifecycle_complete_canonical(
+                event_id=args.event_id,
+                canonical_plan_id=args.plan_id,
+                results=args.results or "",
+            )
+            print(out)
+            try:
+                parsed = _json.loads(out)
+                status = str(parsed.get("status", ""))
+            except Exception:
+                status = ""
+            if status in ("canonical_done", "already_processed"):
+                return 0
+            if status == "retryable_error":
+                return 2
+            return 3
+        if args.lifecycle_command == "wait-for-diary":
+            out = _lifecycle_plugin.handle_nexo_lifecycle_wait_for_diary(
+                event_id=args.event_id,
+                timeout_ms=args.timeout_ms,
+                poll_ms=args.poll_ms,
+            )
+            print(out)
+            try:
+                parsed = _json.loads(out)
+                status = str(parsed.get("status", ""))
+            except Exception:
+                status = ""
+            if status == "ok":
+                return 0
+            if status == "retryable_error":
+                return 2
+            return 3
+        if args.lifecycle_command == "write-fallback-diary":
+            out = _lifecycle_plugin.handle_nexo_lifecycle_write_fallback_diary(
+                event_id=args.event_id,
+                reason=args.reason or "",
+                source=args.source or "desktop-lifecycle-fallback",
+            )
+            print(out)
+            try:
+                parsed = _json.loads(out)
+                status = str(parsed.get("status", ""))
+            except Exception:
+                status = ""
+            if status in ("ok", "processed", "already_processed"):
+                return 0
+            if status == "retryable_error":
+                return 2
+            return 3
+        if args.lifecycle_command == "wait-for-stop":
+            out = _lifecycle_plugin.handle_nexo_lifecycle_wait_for_stop(
+                event_id=args.event_id,
+                timeout_ms=args.timeout_ms,
+                poll_ms=args.poll_ms,
+            )
+            print(out)
+            try:
+                parsed = _json.loads(out)
+                status = str(parsed.get("status", ""))
+            except Exception:
+                status = ""
+            if status == "ok":
+                return 0
+            if status == "retryable_error":
+                return 2
+            return 3
+        if args.lifecycle_command == "stop-nexo-session":
+            out = _lifecycle_plugin.handle_nexo_lifecycle_stop_nexo_session(
+                sid=args.sid,
+            )
+            print(out)
+            try:
+                parsed = _json.loads(out)
+                status = str(parsed.get("status", ""))
+            except Exception:
+                status = ""
+            if status == "ok":
+                return 0
+            if status == "retryable_error":
+                return 2
+            return 3
+        lifecycle_parser.print_help()
+        return 1
+    elif args.command in ("schema", "identity", "onboard", "scan-profile"):
+        from desktop_bridge import cmd_schema, cmd_identity, cmd_onboard, cmd_scan_profile
+        return {
+            "schema": cmd_schema,
+            "identity": cmd_identity,
+            "onboard": cmd_onboard,
+            "scan-profile": cmd_scan_profile,
+        }[args.command](args)
+    elif args.command == "notify":
+        return _notify(args)
+    elif args.command == "health":
+        return _health(args)
+    elif args.command == "logs":
+        return _logs(args)
+    else:
+        _print_help()
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

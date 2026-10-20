@@ -1,0 +1,2042 @@
+from __future__ import annotations
+
+"""Shared client sync for Claude Code, Claude Desktop, and Codex."""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tarfile
+from pathlib import Path
+
+from calibration_runtime import load_runtime_calibration
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    import tomli as tomllib
+
+from bootstrap_docs import sync_client_bootstrap
+from runtime_home import resolve_nexo_home
+
+try:
+    from managed_mcp import (
+        build_managed_server_entries,
+        merge_json_mcp_servers,
+        merge_toml_mcp_servers,
+        reconcile_managed_mcp,
+        remove_json_nexo_managed_mcp_servers,
+        remove_toml_nexo_managed_mcp_servers,
+    )
+except Exception:
+    build_managed_server_entries = None
+    merge_json_mcp_servers = None
+    merge_toml_mcp_servers = None
+    reconcile_managed_mcp = None
+    remove_json_nexo_managed_mcp_servers = None
+    remove_toml_nexo_managed_mcp_servers = None
+
+try:
+    from client_preferences import (
+        BACKEND_NONE,
+        INTERACTIVE_CLIENT_KEYS,
+        detect_installed_clients,
+        normalize_backend_key,
+        normalize_client_key,
+        normalize_client_preferences,
+        resolve_client_runtime_profile,
+    )
+except Exception:
+    BACKEND_NONE = "none"
+    INTERACTIVE_CLIENT_KEYS = ("claude_code", "codex", "claude_desktop")
+
+    def normalize_client_key(value: str | None) -> str:
+        candidate = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "claude": "claude_code",
+            "claude_code": "claude_code",
+            "codex": "codex",
+            "claude_desktop": "claude_desktop",
+            "desktop": "claude_desktop",
+        }
+        return aliases.get(candidate, "")
+
+    def normalize_backend_key(value: str | None) -> str:
+        candidate = normalize_client_key(value)
+        return candidate or (BACKEND_NONE if str(value or "").strip().lower() in {"none", "off", "disabled"} else "")
+
+    def normalize_client_preferences(schedule: dict | None = None) -> dict:
+        return {
+            "interactive_clients": {
+                "claude_code": True,
+                "codex": False,
+                "claude_desktop": False,
+            },
+            "default_terminal_client": "claude_code",
+            "automation_enabled": True,
+            "automation_backend": "claude_code",
+        }
+
+    def resolve_client_runtime_profile(client: str, preferences: dict | None = None) -> dict:
+        defaults = {
+            "claude_code": {"model": "claude-opus-4-8", "reasoning_effort": "max"},
+            "codex": {"model": "gpt-5.5", "reasoning_effort": "xhigh"},
+        }
+        return dict(defaults.get(client, {}))
+
+    def detect_installed_clients(user_home: str | os.PathLike[str] | None = None) -> dict[str, dict]:
+        return {
+            "claude_code": {"installed": False, "path": "", "detected_by": "missing"},
+            "codex": {"installed": False, "path": "", "detected_by": "missing"},
+            "claude_desktop": {"installed": False, "path": "", "detected_by": "missing"},
+        }
+
+
+CLAUDE_CODE_NPM_PACKAGE = "@anthropic-ai/claude-code"
+CODEX_NPM_PACKAGE = "@openai/codex"
+DEFAULT_ASSISTANT_NAME = "Nova"
+HOOK_TIMEOUTS_BY_EVENT = {
+    "SessionStart": 40,
+    "Stop": 15,
+    "PreCompact": 15,
+    "PostCompact": 15,
+    "UserPromptSubmit": 5,
+    # PreToolUse is synchronous on every tool call — keep low. 8s gives room
+    # for DB lookups under load without stalling routine Edit/Write/Bash.
+    "PreToolUse": 8,
+    "PostToolUse": 20,
+    "Notification": 3,
+    "SubagentStop": 10,
+}
+
+
+
+def _user_home() -> Path:
+    return Path(os.environ.get("HOME", str(Path.home()))).expanduser()
+
+
+def _default_nexo_home() -> Path:
+    return resolve_nexo_home(os.environ.get("NEXO_HOME", str(_user_home() / ".nexo")))
+
+
+def _read_json_file(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _resolve_operator_name(nexo_home: Path, explicit: str = "") -> str:
+    explicit = (explicit or "").strip()
+    if explicit:
+        return explicit
+    env_name = os.environ.get("NEXO_NAME", "").strip()
+    if env_name:
+        return env_name
+    calibration = load_runtime_calibration(nexo_home / "personal" / "brain" / "calibration.json")
+    user_payload = calibration.get("user")
+    if isinstance(user_payload, dict):
+        candidate = str(user_payload.get("assistant_name", "")).strip()
+        if candidate:
+            return candidate
+    for key in ("assistant_name", "identity", "operator_name"):
+        candidate = str(calibration.get(key, "")).strip()
+        if candidate:
+            return candidate
+    version_file = nexo_home / "version.json"
+    if version_file.is_file():
+        try:
+            candidate = str(json.loads(version_file.read_text()).get("operator_name", "")).strip()
+            if candidate:
+                return candidate
+        except Exception:
+            pass
+    return DEFAULT_ASSISTANT_NAME
+
+
+def _is_relative_to(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+        return True
+    except Exception:
+        return False
+
+
+def _normalize_managed_runtime_root(nexo_home: Path, candidate: Path) -> Path:
+    raw = candidate.expanduser()
+    if raw.name == "server.py":
+        raw = raw.parent
+    try:
+        resolved = raw.resolve()
+    except Exception:
+        resolved = raw.absolute()
+    core_root = (nexo_home / "core").expanduser()
+    current_root = core_root / "current"
+    preferred_targets = []
+    if (core_root / "server.py").is_file():
+        preferred_targets.append(core_root)
+    if (current_root / "server.py").is_file():
+        preferred_targets.append(current_root)
+    if not preferred_targets:
+        return resolved
+    try:
+        core_resolved = core_root.resolve()
+    except Exception:
+        core_resolved = core_root.absolute()
+    version_root = core_resolved / "versions"
+    try:
+        current_resolved = current_root.resolve()
+    except Exception:
+        current_resolved = current_root.absolute()
+    if resolved == current_resolved or _is_relative_to(resolved, version_root):
+        return preferred_targets[0]
+    return resolved
+
+
+def _resolve_runtime_root(nexo_home: Path, runtime_root: str | os.PathLike[str] | None = None) -> Path:
+    candidates: list[Path] = []
+    if runtime_root:
+        candidates.append(Path(runtime_root).expanduser())
+    code_env = os.environ.get("NEXO_CODE", "").strip()
+    if code_env:
+        code_path = Path(code_env).expanduser()
+        candidates.extend([code_path, code_path / "src"])
+    candidates.extend([nexo_home, Path.cwd(), Path.cwd() / "src"])
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        normalized = _normalize_managed_runtime_root(nexo_home, candidate)
+        resolved = normalized.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if (normalized / "server.py").is_file():
+            return normalized
+    raise FileNotFoundError(f"Could not locate runtime root with server.py (tried {len(seen)} locations)")
+
+
+def _resolve_python(nexo_home: Path, explicit: str = "") -> str:
+    candidates = [
+        explicit,
+        str(nexo_home / ".venv" / "bin" / "python3"),
+        str(nexo_home / ".venv" / "bin" / "python"),
+        str(nexo_home / ".venv" / "Scripts" / "python.exe"),
+        shutil.which("python3") or "",
+        shutil.which("python") or "",
+        sys.executable,
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return str(Path(candidate))
+    return explicit or sys.executable
+
+
+def _cli_install_env(user_home: Path | None = None) -> dict[str, str]:
+    env = os.environ.copy()
+    if user_home is not None:
+        env["HOME"] = str(user_home)
+    return env
+
+
+def _managed_claude_prefix(user_home: Path | None = None) -> Path:
+    explicit = str(os.environ.get("NEXO_CLAUDE_PREFIX", "")).strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    home = user_home or _user_home()
+    return home / ".nexo" / "runtime" / "bootstrap" / "npm-global"
+
+
+def _brain_bundle_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _codex_bundle_dir() -> Path:
+    explicit = str(os.environ.get("NEXO_CODEX_BUNDLE_DIR", "")).strip()
+    if explicit:
+        candidate = Path(explicit).expanduser()
+        if candidate.is_dir():
+            return candidate
+    return _brain_bundle_root() / "codex"
+
+
+def _platform_slug() -> str:
+    if sys.platform.startswith("darwin"):
+        os_part = "darwin"
+    elif sys.platform.startswith("linux"):
+        os_part = "linux"
+    elif sys.platform.startswith("win"):
+        os_part = "win32"
+    else:
+        os_part = sys.platform
+    machine = __import__("platform").machine().lower()
+    if machine in {"x86_64", "amd64"}:
+        arch = "x64"
+    elif machine in {"aarch64", "arm64"}:
+        arch = "arm64"
+    else:
+        arch = machine
+    return f"{os_part}-{arch}"
+
+
+def _install_npm_package_from_bundle(
+    *,
+    bundle_dir: Path,
+    wrapper_pattern: str,
+    package_name: str,
+    managed_prefix: Path,
+    env: dict[str, str],
+    attempts: list[str],
+) -> bool:
+    if not bundle_dir.is_dir():
+        return False
+    all_tgz = sorted(item for item in bundle_dir.iterdir() if item.name.endswith(".tgz"))
+    wrapper_re = re.compile(wrapper_pattern)
+    wrapper = next((item for item in all_tgz if wrapper_re.match(item.name)), None)
+    if not wrapper:
+        return False
+    slug = _platform_slug()
+    native_packs = [
+        item
+        for item in all_tgz
+        if item != wrapper and (f"-{slug}.tgz" in item.name or f"-{slug}-" in item.name)
+    ]
+    tgz_paths = [wrapper, *native_packs] if native_packs else [wrapper]
+    desktop_node, bundled_npm_cli = _bundled_npm_runtime()
+    if desktop_node and bundled_npm_cli:
+        cmd = [
+            desktop_node,
+            bundled_npm_cli,
+            "install",
+            "-g",
+            "--prefix",
+            str(managed_prefix),
+            "--offline",
+            "--no-audit",
+            "--no-fund",
+            *(str(item) for item in tgz_paths),
+        ]
+        run_env = {**env, "ELECTRON_RUN_AS_NODE": "1"}
+    else:
+        cmd = [
+            "npm",
+            "install",
+            "-g",
+            "--prefix",
+            str(managed_prefix),
+            "--offline",
+            "--no-audit",
+            "--no-fund",
+            *(str(item) for item in tgz_paths),
+        ]
+        run_env = env
+    try:
+        install = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=run_env,
+        )
+        if install.returncode == 0:
+            return True
+        attempts.append((install.stderr or install.stdout or f"{package_name} bundled install failed").strip())
+    except Exception as exc:
+        attempts.append(f"{package_name} bundled install failed: {exc}")
+    return False
+
+
+def _install_codex_vendor_from_bundle(*, bundle_dir: Path, managed_prefix: Path, attempts: list[str]) -> bool:
+    package_roots = [
+        managed_prefix / "lib" / "node_modules" / "@openai" / "codex",
+        managed_prefix / "node_modules" / "@openai" / "codex",
+    ]
+    package_root = next((item for item in package_roots if item.exists()), package_roots[0])
+    if not package_root.exists() or not bundle_dir.is_dir():
+        return False
+    slug = _platform_slug()
+    native_packs = sorted(
+        item for item in bundle_dir.iterdir()
+        if item.name.endswith(".tgz") and (f"-{slug}.tgz" in item.name or f"-{slug}-" in item.name)
+    )
+    if not native_packs:
+        attempts.append(f"no bundled Codex native vendor found for {slug}")
+        return False
+    vendor_dest = package_root / "vendor"
+    vendor_dest.mkdir(parents=True, exist_ok=True)
+    for pack in native_packs:
+        try:
+            with tarfile.open(pack, "r:gz") as archive:
+                members = [member for member in archive.getmembers() if member.name.startswith("package/vendor/")]
+                for member in members:
+                    relative = Path(member.name).relative_to("package/vendor")
+                    target = vendor_dest / relative
+                    if member.isdir():
+                        target.mkdir(parents=True, exist_ok=True)
+                        continue
+                    if not member.isfile():
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    source = archive.extractfile(member)
+                    if source is None:
+                        continue
+                    with source, target.open("wb") as out:
+                        shutil.copyfileobj(source, out)
+                    try:
+                        target.chmod(member.mode)
+                    except Exception:
+                        pass
+            return True
+        except Exception as exc:
+            attempts.append(f"Codex native vendor extract failed for {pack.name}: {exc}")
+    return False
+
+
+def _codex_vendor_present(managed_prefix: Path) -> bool:
+    package_roots = [
+        managed_prefix / "lib" / "node_modules" / "@openai" / "codex",
+        managed_prefix / "node_modules" / "@openai" / "codex",
+    ]
+    for package_root in package_roots:
+        vendor_roots = [package_root / "vendor"]
+        optional_root = package_root / "node_modules" / "@openai"
+        if optional_root.is_dir():
+            vendor_roots.extend(item / "vendor" for item in optional_root.glob("codex-*"))
+        existing_vendor_roots = [item for item in vendor_roots if item.exists()]
+        try:
+            for vendor_root in existing_vendor_roots:
+                if any(candidate.is_file() for candidate in vendor_root.rglob("bin/codex*")):
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def _desktop_product_requested(user_home: Path | None = None) -> bool:
+    if str(os.environ.get("NEXO_DESKTOP_MANAGED", "")).strip() == "1":
+        return True
+    home = (user_home or _user_home()).expanduser()
+    mode_paths = [
+        home / ".nexo" / "personal" / "config" / "product-mode.json",
+        home / ".nexo" / "config" / "product-mode.json",
+    ]
+    for path in mode_paths:
+        try:
+            payload = json.loads(path.read_text())
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("desktop_managed") is True:
+            return True
+        if str(payload.get("product_mode") or "").strip().lower() == "desktop_closed_product":
+            return True
+    return False
+
+
+def _bundled_npm_runtime() -> tuple[str, str]:
+    node_bin = str(os.environ.get("NEXO_DESKTOP_NODE", "")).strip()
+    npm_cli = str(os.environ.get("NEXO_DESKTOP_NPM_CLI", "")).strip()
+    if node_bin and npm_cli and Path(node_bin).exists() and Path(npm_cli).exists():
+        return node_bin, npm_cli
+    return "", ""
+
+
+def _persist_managed_claude_path(claude_path: str, *, user_home: Path | None = None) -> None:
+    path_str = str(claude_path or "").strip()
+    if not path_str:
+        return
+    home = user_home or _user_home()
+    targets = [
+        home / ".nexo" / "config" / "claude-cli-path",
+        home / ".nexo" / "personal" / "config" / "claude-cli-path",
+    ]
+    for target in targets:
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(path_str + "\n", encoding="utf-8")
+        except Exception:
+            continue
+
+
+def _installed_client_path(client_key: str, *, user_home: Path | None = None) -> str:
+    info = detect_installed_clients(user_home=user_home).get(client_key, {})
+    if info.get("installed"):
+        return str(info.get("path") or "")
+    return ""
+
+
+def _sync_codex_binary(home_path: Path) -> str:
+    if _desktop_product_requested(home_path):
+        info = detect_installed_clients(user_home=home_path).get("codex", {})
+        return str(info.get("path") or "") if info.get("installed") else ""
+    return shutil.which("codex") or ""
+
+
+def ensure_claude_code_installed(*, user_home: str | os.PathLike[str] | None = None) -> dict:
+    home_path = Path(user_home).expanduser() if user_home else _user_home()
+    desktop_managed = _desktop_product_requested(home_path)
+    existing = _installed_client_path("claude_code", user_home=home_path)
+    if existing:
+        _persist_managed_claude_path(existing, user_home=home_path)
+        return {
+            "ok": True,
+            "client": "claude_code",
+            "installed": True,
+            "changed": False,
+            "action": "already_installed_managed" if desktop_managed else "already_installed",
+            "path": existing,
+            "attempts": [],
+        }
+
+    attempts: list[str] = []
+    env = _cli_install_env(home_path)
+    managed_prefix = _managed_claude_prefix(home_path)
+    env.setdefault("npm_config_prefix", str(managed_prefix))
+    env["PATH"] = os.pathsep.join(
+        [str(managed_prefix / "bin"), *(item for item in str(env.get("PATH", "")).split(os.pathsep) if item)]
+    )
+
+    desktop_node, bundled_npm_cli = _bundled_npm_runtime()
+    if desktop_node and bundled_npm_cli:
+        try:
+            install = subprocess.run(
+                [
+                    desktop_node,
+                    bundled_npm_cli,
+                    "install",
+                    "-g",
+                    "--prefix",
+                    str(managed_prefix),
+                    CLAUDE_CODE_NPM_PACKAGE,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=300,
+                env={**env, "ELECTRON_RUN_AS_NODE": "1"},
+            )
+            if install.returncode != 0:
+                attempts.append((install.stderr or install.stdout or "bundled npm install failed").strip())
+        except Exception as exc:
+            attempts.append(f"bundled npm install failed: {exc}")
+
+        installed_after_bundle = _installed_client_path("claude_code", user_home=home_path)
+        if installed_after_bundle:
+            _persist_managed_claude_path(installed_after_bundle, user_home=home_path)
+            return {
+                "ok": True,
+                "client": "claude_code",
+                "installed": True,
+                "changed": True,
+                "action": "installed_via_bundled_npm",
+                "path": installed_after_bundle,
+                "attempts": attempts,
+            }
+
+    if desktop_managed:
+        error = (
+            "Desktop-managed install requires the NEXO Desktop bundled Claude runtime; "
+            "global `npx`/`npm -g` fallbacks are disabled."
+        )
+        if desktop_node and bundled_npm_cli:
+            error = (
+                "Desktop-managed Claude install did not produce the managed "
+                "`~/.nexo/runtime/bootstrap/npm-global/bin/claude` binary."
+            )
+        return {
+            "ok": False,
+            "client": "claude_code",
+            "installed": False,
+            "changed": False,
+            "action": "managed_install_failed",
+            "path": "",
+            "attempts": attempts,
+            "error": error,
+        }
+
+    try:
+        probe = subprocess.run(
+            ["npx", "-y", CLAUDE_CODE_NPM_PACKAGE, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+        if probe.returncode != 0:
+            attempts.append((probe.stderr or probe.stdout or "npx probe failed").strip())
+    except Exception as exc:
+        attempts.append(f"npx probe failed: {exc}")
+
+    installed_after_probe = _installed_client_path("claude_code", user_home=home_path)
+    if installed_after_probe:
+        _persist_managed_claude_path(installed_after_probe, user_home=home_path)
+        return {
+            "ok": True,
+            "client": "claude_code",
+            "installed": True,
+            "changed": True,
+            "action": "installed_via_npx",
+            "path": installed_after_probe,
+            "attempts": attempts,
+        }
+
+    # v7.12.12 — try npm without sudo first on Linux. Hardcoding `sudo`
+    # used to make sense on stock Ubuntu where /usr/lib/node_modules is
+    # root-owned, but inside the WSL distro NEXO Desktop ships, the
+    # default global prefix is already `/home/<user>/.nexo/runtime/
+    # bootstrap/npm-global` (writable). A blind `sudo` there triggers a
+    # password prompt on a TTY the user cannot see, so the bootstrap
+    # appears stuck. Try unprivileged first; if it fails with EACCES
+    # (insufficient permissions), retry with sudo.
+    install_error = ""
+    install = None
+    base_cmd = ["npm", "install", "-g", CLAUDE_CODE_NPM_PACKAGE]
+    try:
+        install = subprocess.run(
+            base_cmd,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env=env,
+        )
+        if install.returncode != 0:
+            install_error = (install.stderr or install.stdout or "npm install failed").strip()
+            attempts.append(install_error)
+            permission_failure = (
+                "EACCES" in install_error
+                or "permission denied" in install_error.lower()
+                or "operation not permitted" in install_error.lower()
+            )
+            if permission_failure and sys.platform == "linux":
+                attempts.append("retrying with sudo (Linux EACCES fallback)")
+                try:
+                    install = subprocess.run(
+                        ["sudo", "-n", "npm", "install", "-g", CLAUDE_CODE_NPM_PACKAGE],
+                        capture_output=True,
+                        text=True,
+                        timeout=180,
+                        env=env,
+                    )
+                    if install.returncode != 0:
+                        install_error = (install.stderr or install.stdout or "sudo npm install failed").strip()
+                        attempts.append(install_error)
+                    else:
+                        install_error = ""
+                except Exception as exc:
+                    install_error = f"sudo npm install failed: {exc}"
+                    attempts.append(install_error)
+    except Exception as exc:
+        install_error = f"npm install failed: {exc}"
+        attempts.append(install_error)
+
+    installed_path = _installed_client_path("claude_code", user_home=home_path)
+    if installed_path:
+        _persist_managed_claude_path(installed_path, user_home=home_path)
+        return {
+            "ok": True,
+            "client": "claude_code",
+            "installed": True,
+            "changed": True,
+            "action": "installed",
+            "path": installed_path,
+            "attempts": attempts,
+        }
+
+    error = install_error or "Claude Code install did not produce a `claude` binary in PATH"
+    return {
+        "ok": False,
+        "client": "claude_code",
+        "installed": False,
+        "changed": False,
+        "action": "failed",
+        "path": "",
+        "attempts": attempts,
+        "error": error,
+    }
+
+
+def ensure_codex_installed(*, user_home: str | os.PathLike[str] | None = None) -> dict:
+    home_path = Path(user_home).expanduser() if user_home else _user_home()
+    desktop_managed = _desktop_product_requested(home_path)
+    managed_prefix = _managed_claude_prefix(home_path)
+    existing = _installed_client_path("codex", user_home=home_path)
+    if existing and (not desktop_managed or _codex_vendor_present(managed_prefix)):
+        return {
+            "ok": True,
+            "client": "codex",
+            "installed": True,
+            "changed": False,
+            "action": "already_installed_managed" if desktop_managed else "already_installed",
+            "path": existing,
+            "attempts": [],
+        }
+
+    attempts: list[str] = []
+    if existing and desktop_managed:
+        attempts.append("managed Codex wrapper exists but native vendor is missing; repairing bundled vendor")
+    env = _cli_install_env(home_path)
+    env.setdefault("npm_config_prefix", str(managed_prefix))
+    env["PATH"] = os.pathsep.join(
+        [str(managed_prefix / "bin"), *(item for item in str(env.get("PATH", "")).split(os.pathsep) if item)]
+    )
+
+    desktop_node, bundled_npm_cli = _bundled_npm_runtime()
+    bundle_dir = _codex_bundle_dir()
+    if desktop_managed and not (desktop_node and bundled_npm_cli):
+        vendor_installed = _install_codex_vendor_from_bundle(
+            bundle_dir=bundle_dir,
+            managed_prefix=managed_prefix,
+            attempts=attempts,
+        )
+        installed_after_vendor = _installed_client_path("codex", user_home=home_path)
+        if installed_after_vendor and vendor_installed:
+            return {
+                "ok": True,
+                "client": "codex",
+                "installed": True,
+                "changed": True,
+                "action": "installed_bundled_vendor",
+                "path": installed_after_vendor,
+                "attempts": attempts,
+            }
+        return {
+            "ok": False,
+            "client": "codex",
+            "installed": False,
+            "changed": False,
+            "action": "failed",
+            "path": "",
+            "attempts": attempts,
+            "error": (
+                "Desktop-managed Codex install requires the NEXO Desktop bundled Codex runtime; "
+                "global `npm -g` fallbacks are disabled."
+            ),
+        }
+
+    wrapper_installed = _install_npm_package_from_bundle(
+        bundle_dir=bundle_dir,
+        wrapper_pattern=r"^openai-codex-\d+\.\d+\.\d+\.tgz$",
+        package_name=CODEX_NPM_PACKAGE,
+        managed_prefix=managed_prefix,
+        env=env,
+        attempts=attempts,
+    )
+    vendor_installed = _install_codex_vendor_from_bundle(bundle_dir=bundle_dir, managed_prefix=managed_prefix, attempts=attempts)
+    installed_after_bundle = _installed_client_path("codex", user_home=home_path)
+    if installed_after_bundle and vendor_installed:
+        return {
+            "ok": True,
+            "client": "codex",
+            "installed": True,
+            "changed": True,
+            "action": "installed_via_bundled_tarballs",
+            "path": installed_after_bundle,
+            "attempts": attempts,
+        }
+    if wrapper_installed and not vendor_installed:
+        attempts.append("bundled Codex wrapper installed but native vendor extraction failed; falling back to online install")
+
+    if desktop_node and bundled_npm_cli:
+        try:
+            install = subprocess.run(
+                [
+                    desktop_node,
+                    bundled_npm_cli,
+                    "install",
+                    "-g",
+                    "--prefix",
+                    str(managed_prefix),
+                    CODEX_NPM_PACKAGE,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=300,
+                env={**env, "ELECTRON_RUN_AS_NODE": "1"},
+            )
+            if install.returncode != 0:
+                attempts.append((install.stderr or install.stdout or "bundled npm install failed").strip())
+        except Exception as exc:
+            attempts.append(f"bundled npm install failed: {exc}")
+        installed_after_npm = _installed_client_path("codex", user_home=home_path)
+        if installed_after_npm and (not desktop_managed or _codex_vendor_present(managed_prefix)):
+            return {
+                "ok": True,
+                "client": "codex",
+                "installed": True,
+                "changed": True,
+                "action": "installed_via_bundled_npm",
+                "path": installed_after_npm,
+                "attempts": attempts,
+            }
+        if installed_after_npm and desktop_managed:
+            attempts.append("managed Codex wrapper installed but native vendor is missing after bundled npm install")
+
+    if desktop_managed:
+        error = (
+            "Desktop-managed Codex install did not produce the managed "
+            "`~/.nexo/runtime/bootstrap/npm-global/bin/codex` binary."
+        )
+        return {
+            "ok": False,
+            "client": "codex",
+            "installed": False,
+            "changed": False,
+            "action": "failed",
+            "path": "",
+            "attempts": attempts,
+            "error": error,
+        }
+
+    install_error = ""
+    try:
+        install = subprocess.run(
+            ["npm", "install", "-g", "--prefix", str(managed_prefix), CODEX_NPM_PACKAGE],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env=env,
+        )
+        if install.returncode != 0:
+            install_error = (install.stderr or install.stdout or "npm install failed").strip()
+            attempts.append(install_error)
+    except Exception as exc:
+        install_error = f"npm install failed: {exc}"
+        attempts.append(install_error)
+
+    installed_path = _installed_client_path("codex", user_home=home_path)
+    return {
+        "ok": bool(installed_path),
+        "client": "codex",
+        "installed": bool(installed_path),
+        "changed": bool(installed_path),
+        "action": "installed" if installed_path else "failed",
+        "path": installed_path or "",
+        "attempts": attempts,
+        **({} if installed_path else {"error": install_error or "Codex install did not produce a `codex` binary in PATH"}),
+    }
+
+
+def build_server_config(
+    *,
+    nexo_home: str | os.PathLike[str] | None = None,
+    runtime_root: str | os.PathLike[str] | None = None,
+    python_path: str = "",
+    operator_name: str = "",
+    client: str = "",
+) -> dict:
+    nexo_home_path = Path(nexo_home).expanduser() if nexo_home else _default_nexo_home()
+    runtime_root_path = _resolve_runtime_root(nexo_home_path, runtime_root)
+    config = {
+        "command": _resolve_python(nexo_home_path, python_path),
+        "args": [str(runtime_root_path / "server.py")],
+        "env": {
+            "NEXO_HOME": str(nexo_home_path),
+            "NEXO_CODE": str(runtime_root_path),
+        },
+    }
+    resolved_name = _resolve_operator_name(nexo_home_path, explicit=operator_name)
+    if resolved_name:
+        config["env"]["NEXO_NAME"] = resolved_name
+    resolved_client = normalize_client_key(client)
+    if resolved_client:
+        config["env"]["NEXO_MCP_CLIENT"] = resolved_client
+    return config
+
+
+def _managed_mcp_entries_for(client: str, server_config: dict) -> dict:
+    if str(os.environ.get("NEXO_MANAGED_MCP_DISABLE", "")).strip().lower() in {"1", "true", "yes", "on"}:
+        return {}
+    if not build_managed_server_entries or not reconcile_managed_mcp:
+        return {}
+    env = server_config.get("env") if isinstance(server_config.get("env"), dict) else {}
+    nexo_home = str(env.get("NEXO_HOME") or "").strip()
+    runtime_root = str(env.get("NEXO_CODE") or "").strip()
+    if not nexo_home:
+        return {}
+    target_platform = str(
+        os.environ.get("NEXO_MANAGED_MCP_PLATFORM")
+        or env.get("NEXO_MANAGED_MCP_PLATFORM")
+        or ""
+    ).strip()
+    try:
+        plan = reconcile_managed_mcp(
+            nexo_home=nexo_home,
+            runtime_root=runtime_root or None,
+            clients=[client],
+            apply=True,
+            platform=target_platform or None,
+        )
+        providers = plan.get("providers") if isinstance(plan.get("providers"), dict) else {}
+        if not plan.get("ok") or not providers:
+            return {}
+        entries = build_managed_server_entries(
+            client=client,
+            nexo_home=nexo_home,
+            runtime_root=runtime_root or None,
+            platform=target_platform or None,
+        )
+        required_providers = {
+            str((entry.get("nexo") or {}).get("provider_id") or "").strip()
+            for entry in entries.values()
+            if isinstance(entry, dict)
+        }
+        required_providers.discard("")
+        if not required_providers:
+            return {}
+        for provider_id in required_providers:
+            state = providers.get(provider_id) if isinstance(providers.get(provider_id), dict) else {}
+            if state.get("status") != "healthy":
+                return {}
+        return entries
+    except Exception:
+        return {}
+
+
+def _remove_unhealthy_json_managed_mcp(payload: dict) -> dict:
+    if not remove_json_nexo_managed_mcp_servers:
+        return payload
+    return remove_json_nexo_managed_mcp_servers(payload)
+
+
+def _remove_unhealthy_toml_managed_mcp(payload: dict) -> dict:
+    if not remove_toml_nexo_managed_mcp_servers:
+        return payload
+    return remove_toml_nexo_managed_mcp_servers(payload)
+
+
+def _claude_code_settings_path(home: Path | None = None) -> Path:
+    base = home or _user_home()
+    return base / ".claude" / "settings.json"
+
+
+def _claude_code_mcp_path(home: Path | None = None) -> Path:
+    base = home or _user_home()
+    return base / ".claude.json"
+
+
+def _claude_code_cortex_path(home: Path | None = None) -> Path:
+    base = home or _user_home()
+    return base / ".claude" / "mcp-cortex.json"
+
+
+def _claude_desktop_config_path(home: Path | None = None) -> Path:
+    base = home or _user_home()
+    if sys.platform == "darwin":
+        return base / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
+    if os.name == "nt":
+        return base / "AppData" / "Roaming" / "Claude" / "claude_desktop_config.json"
+    return base / ".config" / "Claude" / "claude_desktop_config.json"
+
+
+def _codex_config_path(home: Path | None = None) -> Path:
+    base = home or _user_home()
+    return base / ".codex" / "config.toml"
+
+
+def _codex_hooks_path(home: Path | None = None) -> Path:
+    base = home or _user_home()
+    return base / ".codex" / "hooks.json"
+
+
+def _toml_key(key: str) -> str:
+    if key.replace("_", "").replace("-", "").isalnum():
+        return key
+    escaped = key.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _toml_scalar(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return json.dumps(value)
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return f'"{escaped}"'
+
+
+def _toml_inline_table(payload: dict) -> str:
+    parts = [f"{_toml_key(str(key))} = {_toml_value(value)}" for key, value in payload.items()]
+    return "{ " + ", ".join(parts) + " }"
+
+
+def _toml_value(value) -> str:
+    if isinstance(value, dict):
+        return _toml_inline_table(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    return _toml_scalar(value)
+
+
+def _emit_toml_table(table: dict, prefix: tuple[str, ...] = ()) -> list[str]:
+    scalar_lines: list[str] = []
+    child_tables: list[tuple[str, dict]] = []
+    for key, value in table.items():
+        if isinstance(value, dict):
+            child_tables.append((str(key), value))
+        else:
+            scalar_lines.append(f"{_toml_key(str(key))} = {_toml_value(value)}")
+
+    lines: list[str] = []
+    emit_header = bool(prefix and (scalar_lines or not child_tables))
+    if emit_header:
+        lines.append("[" + ".".join(_toml_key(part) for part in prefix) + "]")
+    lines.extend(scalar_lines)
+
+    for child_key, child_value in child_tables:
+        child_lines = _emit_toml_table(child_value, prefix + (child_key,))
+        if child_lines:
+            if lines:
+                lines.append("")
+            lines.extend(child_lines)
+    return lines
+
+
+def _load_toml_object(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    try:
+        data = tomllib.loads(path.read_text())
+    except Exception as exc:
+        raise ValueError(f"Invalid TOML in {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected TOML table in {path}")
+    return data
+
+
+def _write_toml_object(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = _emit_toml_table(payload)
+    content = "\n".join(lines).rstrip() + "\n"
+    # v7.31.x (Fase 1) — write-if-changed: rewriting an identical config.toml
+    # on every Desktop update churns mtime/content signatures and can
+    # re-trigger Codex's hook/trust confirmation prompt for the operator.
+    try:
+        if path.is_file() and path.read_text() == content:
+            return
+    except Exception:
+        pass  # unreadable existing file -> fall through to a clean write
+    path.write_text(content)
+
+
+def _sync_codex_managed_config(
+    path: Path,
+    *,
+    bootstrap_prompt: str,
+    runtime_profile: dict | None,
+    server_config: dict | None,
+) -> dict:
+    payload = _load_toml_object(path)
+    action = "updated" if payload else "created"
+    runtime_profile = dict(runtime_profile or {})
+    server_config = dict(server_config or {})
+
+    def _looks_like_claude_model(value: str) -> bool:
+        return value.strip().lower().startswith(
+            ("claude", "opus", "sonnet", "haiku")
+        )
+
+    # Heal any pre-existing Claude model written by earlier NEXO versions.
+    existing_model = str(payload.get("model") or "").strip()
+    if existing_model and _looks_like_claude_model(existing_model):
+        payload["model"] = "gpt-5.5"
+
+    # Only write a model from the runtime profile into Codex config if it
+    # looks like a Codex/OpenAI model. Claude models are invalid for Codex
+    # and cause "model not supported" errors on first run.
+    profile_model = (runtime_profile.get("model") or "").strip()
+    if profile_model and not _looks_like_claude_model(profile_model):
+        payload["model"] = profile_model
+    elif profile_model:
+        # Fall back to a known-good Codex default to self-heal.
+        payload["model"] = "gpt-5.5"
+    if "reasoning_effort" in runtime_profile:
+        payload["model_reasoning_effort"] = runtime_profile.get("reasoning_effort") or ""
+
+    features = payload.setdefault("features", {})
+    if isinstance(features, dict):
+        features["hooks"] = True
+        features.pop("codex_hooks", None)
+    else:
+        payload["features"] = {"hooks": True}
+
+    # Codex model APIs used by some accounts reject system-role bootstrap
+    # messages. Keep the durable bootstrap in AGENTS.md and remove any legacy
+    # initial_messages block written by older NEXO versions.
+    payload.pop("initial_messages", None)
+
+    nexo_table = payload.setdefault("nexo", {})
+    codex_table = nexo_table.setdefault("codex", {})
+    codex_table["bootstrap_managed"] = True
+    codex_table["mcp_managed"] = True
+    codex_table["hooks_managed"] = True
+    codex_table["bootstrap_bytes"] = len(bootstrap_prompt.encode("utf-8")) if bootstrap_prompt else 0
+    if runtime_profile.get("model"):
+        # Record the healed/actual model in use, not the raw (possibly Claude) profile.
+        codex_table["managed_model"] = payload.get("model") or runtime_profile["model"]
+    codex_table["managed_reasoning_effort"] = runtime_profile.get("reasoning_effort", "") or ""
+    if server_config:
+        mcp_servers = payload.setdefault("mcp_servers", {})
+        mcp_servers["nexo"] = {
+            "command": server_config.get("command", ""),
+            "args": list(server_config.get("args", []) or []),
+            "env": dict(server_config.get("env", {}) or {}),
+        }
+        codex_table["managed_server_command"] = server_config.get("command", "")
+        managed_entries = _managed_mcp_entries_for("codex", server_config)
+        if managed_entries and merge_toml_mcp_servers:
+            payload = merge_toml_mcp_servers(payload, managed_entries)
+            codex_table = payload.setdefault("nexo", {}).setdefault("codex", {})
+            codex_table["managed_default_mcp_count"] = len(managed_entries)
+        else:
+            payload = _remove_unhealthy_toml_managed_mcp(payload)
+            codex_table = payload.setdefault("nexo", {}).setdefault("codex", {})
+            codex_table["managed_default_mcp_count"] = 0
+
+    # Ensure Codex headless crons (followup-runner, email-monitor, deep-sleep,
+    # etc.) do not stall on approval prompts. Only set defaults when the user
+    # hasn't configured them explicitly — never overwrite existing values.
+    payload.setdefault("approval_policy", "never")
+    payload.setdefault("sandbox_mode", "danger-full-access")
+
+    _write_toml_object(path, payload)
+    return {
+        "ok": True,
+        "action": action,
+        "path": str(path),
+        "bootstrap_managed": True,
+        "mcp_managed": True,
+        "hooks_enabled": True,
+        "model": runtime_profile.get("model", ""),
+        "reasoning_effort": runtime_profile.get("reasoning_effort", "") or "",
+        "managed_default_mcp_count": len(managed_entries) if server_config else 0,
+    }
+
+
+CODEX_SUPPORTED_HOOK_EVENTS = {"PreToolUse"}
+CODEX_PRETOOL_MATCHER = r"^(Bash|shell_command|exec_command)$"
+
+
+def _codex_core_hook_specs(runtime_root: Path) -> list[dict]:
+    specs: list[dict] = []
+    for spec in _core_hook_specs(runtime_root):
+        if spec.get("event") not in CODEX_SUPPORTED_HOOK_EVENTS:
+            continue
+        item = dict(spec)
+        if item.get("event") == "PreToolUse":
+            item["matcher"] = CODEX_PRETOOL_MATCHER
+            item["statusMessage"] = "NEXO guard"
+        specs.append(item)
+    return specs
+
+
+def _merge_codex_hooks(existing_hooks, *, runtime_root: Path, nexo_home: Path) -> tuple[dict, int]:
+    hooks_payload = dict(existing_hooks) if isinstance(existing_hooks, dict) else {}
+    hooks_dir = _resolve_hook_source_dir(runtime_root)
+    managed_count = 0
+    core_hook_specs = _codex_core_hook_specs(runtime_root)
+    current_identities_by_event = _current_core_hook_identities_by_event(core_hook_specs)
+    managed_identities_by_event = _managed_core_hook_identities_by_event(current_identities_by_event)
+
+    for event, managed_identities in managed_identities_by_event.items():
+        sections = _normalize_hook_sections(hooks_payload.get(event))
+        desired_identities = current_identities_by_event.get(event, set())
+        cleaned_sections: list[dict] = []
+        for section in sections:
+            cleaned_hooks = []
+            for hook in section["hooks"]:
+                identity = _hook_identity(hook.get("command", ""))
+                if identity in managed_identities and identity not in desired_identities:
+                    continue
+                cleaned_hooks.append(hook)
+            if cleaned_hooks:
+                cleaned_sections.append(
+                    {
+                        "matcher": section.get("matcher", "*") or "*",
+                        "hooks": cleaned_hooks,
+                    }
+                )
+        if cleaned_sections:
+            hooks_payload[event] = cleaned_sections
+        elif event in hooks_payload and event in current_identities_by_event:
+            hooks_payload.pop(event, None)
+
+    for spec in core_hook_specs:
+        event = spec["event"]
+        sections = _normalize_hook_sections(hooks_payload.get(event))
+        hooks_payload[event] = sections
+        command = _render_hook_command(spec, nexo_home=nexo_home, runtime_root=runtime_root, hooks_dir=hooks_dir)
+        identity = spec["identity"]
+        matcher = spec.get("matcher") or "*"
+
+        found = False
+        for section in sections:
+            for hook in section["hooks"]:
+                if _hook_identity(hook.get("command", "")) != identity:
+                    continue
+                section["matcher"] = matcher
+                hook["type"] = "command"
+                hook["command"] = command
+                if spec.get("timeout"):
+                    hook["timeout"] = spec["timeout"]
+                if spec.get("statusMessage"):
+                    hook["statusMessage"] = spec["statusMessage"]
+                found = True
+                managed_count += 1
+                break
+            if found:
+                break
+
+        if found:
+            continue
+
+        target = None
+        for section in sections:
+            if section.get("matcher", "*") == matcher:
+                target = section
+                break
+        if target is None:
+            target = {"matcher": matcher, "hooks": []}
+            sections.append(target)
+
+        new_hook = {"type": "command", "command": command}
+        if spec.get("timeout"):
+            new_hook["timeout"] = spec["timeout"]
+        if spec.get("statusMessage"):
+            new_hook["statusMessage"] = spec["statusMessage"]
+        target["hooks"].append(new_hook)
+        managed_count += 1
+
+    return hooks_payload, managed_count
+
+
+def _sync_codex_hooks(path: Path, *, runtime_root: Path, nexo_home: Path) -> dict:
+    payload = _load_json_object(path)
+    action = "updated" if payload else "created"
+    payload["hooks"], managed_count = _merge_codex_hooks(
+        payload.get("hooks", {}),
+        runtime_root=runtime_root,
+        nexo_home=nexo_home,
+    )
+    _write_json_object(path, payload)
+    return {
+        "ok": True,
+        "action": action,
+        "path": str(path),
+        "managed_hook_count": managed_count,
+        "pretool_matcher": CODEX_PRETOOL_MATCHER,
+    }
+
+
+def _load_json_object(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except Exception as exc:
+        raise ValueError(f"Invalid JSON in {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected JSON object in {path}")
+    return data
+
+
+def _write_json_object(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+
+
+def _load_manifest_hook_specs(runtime_root: Path) -> list[dict]:
+    hooks_dir = _resolve_hook_source_dir(runtime_root)
+    manifest_path = hooks_dir / "manifest.json"
+    if not manifest_path.is_file():
+        return []
+    try:
+        payload = json.loads(manifest_path.read_text())
+    except Exception:
+        return []
+    hooks = payload.get("hooks") if isinstance(payload, dict) else None
+    if not isinstance(hooks, list):
+        return []
+    specs: list[dict] = []
+    for entry in hooks:
+        if not isinstance(entry, dict):
+            continue
+        event = str(entry.get("event") or "").strip()
+        handler = str(entry.get("handler") or "").strip()
+        if not event or not handler:
+            continue
+        handler_name = Path(handler).name
+        specs.append({
+            "event": event,
+            "identity": handler_name,
+            "timeout": HOOK_TIMEOUTS_BY_EVENT.get(event, 5),
+            "handler": handler_name,
+            "interpreter": "python",
+        })
+    return specs
+
+
+def _core_hook_specs(runtime_root: Path) -> list[dict]:
+    return _load_manifest_hook_specs(runtime_root)
+
+# Claude Code can retain legacy managed hooks from older/plugin-style installs
+# or from transient test runtimes. Treat their handler basenames as managed so
+# the next sync prunes them instead of leaving broken duplicates behind.
+LEGACY_CORE_HOOK_IDENTITIES_BY_EVENT = {
+    "SessionStart": {
+        "daily-briefing-check.sh",
+        "session-start.sh",
+        ".session-start-ts",
+    },
+    "Stop": {
+        "session-stop.sh",
+    },
+    "PreToolUse": {
+        "protocol-pretool-guardrail.sh",
+    },
+    "UserPromptSubmit": {
+        "heartbeat-user-msg.sh",
+    },
+    "PostToolUse": {
+        "heartbeat-guard.sh",
+        "capture-tool-logs.sh",
+        "capture-session.sh",
+        "inbox-hook.sh",
+        "protocol-guardrail.sh",
+        "heartbeat-posttool.sh",
+    },
+    "PreCompact": {
+        "pre-compact.sh",
+    },
+    "PostCompact": {
+        "post-compact.sh",
+    },
+}
+
+def _current_core_hook_identities_by_event(core_hook_specs: list[dict]) -> dict[str, set[str]]:
+    identities: dict[str, set[str]] = {}
+    for spec in core_hook_specs:
+        identities.setdefault(spec["event"], set()).add(spec["identity"])
+    return identities
+
+
+def _managed_core_hook_identities_by_event(current_identities: dict[str, set[str]] | None = None) -> dict[str, set[str]]:
+    managed = {event: set(identities) for event, identities in (current_identities or {}).items()}
+    for event, identities in LEGACY_CORE_HOOK_IDENTITIES_BY_EVENT.items():
+        managed.setdefault(event, set()).update(identities)
+    return managed
+
+def _resolve_hook_source_dir(runtime_root: Path) -> Path:
+    core = runtime_root / "core" / "hooks"
+    if core.is_dir():
+        return core
+    direct = runtime_root / "hooks"
+    if direct.is_dir():
+        return direct
+    sibling = runtime_root.parent / "src" / "hooks"
+    if sibling.is_dir():
+        return sibling
+    fallback = runtime_root.parent / "hooks"
+    if fallback.is_dir():
+        return fallback
+    return direct
+
+
+def _cmd_env_assignment(name: str, value: str | os.PathLike[str]) -> str:
+    # `set "VAR=value"` is the safe cmd.exe form; it preserves spaces and
+    # avoids trailing quote pollution.
+    safe_value = str(value).replace('"', r'\"')
+    return f'set "{name}={safe_value}"'
+
+
+def _cmd_args(*args: str | os.PathLike[str]) -> str:
+    return subprocess.list2cmdline([str(arg) for arg in args])
+
+
+def _render_hook_command(
+    spec: dict,
+    *,
+    nexo_home: Path,
+    runtime_root: Path,
+    hooks_dir: Path,
+    windows_shell: bool | None = None,
+) -> str:
+    command_template = spec.get("command_template")
+    if callable(command_template):
+        return command_template(nexo_home, runtime_root, hooks_dir)
+    handler_name = (spec.get("handler") or spec.get("script") or "").strip()
+    script_path = hooks_dir / handler_name
+    use_windows_shell = (os.name == "nt") if windows_shell is None else bool(windows_shell)
+    env_prefix = (
+        f"{_cmd_env_assignment('NEXO_HOME', nexo_home)} && {_cmd_env_assignment('NEXO_CODE', runtime_root)} && "
+        if use_windows_shell
+        else f"NEXO_HOME={shlex.quote(str(nexo_home))} NEXO_CODE={shlex.quote(str(runtime_root))} "
+    )
+    if spec.get("interpreter") == "python" or handler_name.endswith(".py"):
+        if use_windows_shell:
+            return f"{env_prefix}{_cmd_args(_resolve_python(nexo_home), script_path)}"
+        return env_prefix + f"{shlex.quote(_resolve_python(nexo_home))} {shlex.quote(str(script_path))}"
+    if use_windows_shell:
+        return f"{env_prefix}{_cmd_args('bash', script_path)}"
+    return env_prefix + f"bash {shlex.quote(str(script_path))}"
+
+
+def _hook_identity(command: str) -> str:
+    text = str(command or "")
+    if ".session-start-ts" in text:
+        return "session-start-ts"
+    match = re.search(r"([A-Za-z0-9._-]+\.(?:sh|py))\b", text)
+    if match:
+        return match.group(1)
+    return text.strip()
+
+
+def _normalize_hook_sections(entries) -> list[dict]:
+    normalized: list[dict] = []
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        hooks = entry.get("hooks")
+        if isinstance(hooks, list):
+            normalized.append(
+                {
+                    "matcher": entry.get("matcher", "*") or "*",
+                    "hooks": [dict(hook) for hook in hooks if isinstance(hook, dict)],
+                }
+            )
+            continue
+        if entry.get("command"):
+            hook = {"type": entry.get("type", "command"), "command": entry["command"]}
+            if entry.get("timeout"):
+                hook["timeout"] = entry["timeout"]
+            normalized.append({"matcher": entry.get("matcher", "*") or "*", "hooks": [hook]})
+    return normalized
+
+
+def _merge_core_hooks(existing_hooks, *, runtime_root: Path, nexo_home: Path) -> tuple[dict, int]:
+    hooks_payload = dict(existing_hooks) if isinstance(existing_hooks, dict) else {}
+    hooks_dir = _resolve_hook_source_dir(runtime_root)
+    managed_count = 0
+    core_hook_specs = _core_hook_specs(runtime_root)
+    current_identities_by_event = _current_core_hook_identities_by_event(core_hook_specs)
+    managed_identities_by_event = _managed_core_hook_identities_by_event(current_identities_by_event)
+
+    for event, managed_identities in managed_identities_by_event.items():
+        sections = _normalize_hook_sections(hooks_payload.get(event))
+        desired_identities = current_identities_by_event.get(event, set())
+        cleaned_sections: list[dict] = []
+        for section in sections:
+            cleaned_hooks = []
+            for hook in section["hooks"]:
+                identity = _hook_identity(hook.get("command", ""))
+                if identity in managed_identities and identity not in desired_identities:
+                    continue
+                cleaned_hooks.append(hook)
+            cleaned_sections.append(
+                {
+                    "matcher": section.get("matcher", "*") or "*",
+                    "hooks": cleaned_hooks,
+                }
+            )
+        if cleaned_sections:
+            hooks_payload[event] = cleaned_sections
+        else:
+            hooks_payload.pop(event, None)
+
+    for spec in core_hook_specs:
+        event = spec["event"]
+        sections = _normalize_hook_sections(hooks_payload.get(event))
+        hooks_payload[event] = sections
+        command = _render_hook_command(spec, nexo_home=nexo_home, runtime_root=runtime_root, hooks_dir=hooks_dir)
+        identity = spec["identity"]
+
+        found = False
+        for section in sections:
+            for hook in section["hooks"]:
+                if _hook_identity(hook.get("command", "")) != identity:
+                    continue
+                hook["type"] = "command"
+                hook["command"] = command
+                if spec.get("timeout"):
+                    hook["timeout"] = spec["timeout"]
+                found = True
+                managed_count += 1
+                break
+            if found:
+                break
+
+        if found:
+            continue
+
+        target = None
+        for section in sections:
+            if section.get("matcher", "*") == "*":
+                target = section
+                break
+        if target is None:
+            target = {"matcher": "*", "hooks": []}
+            sections.append(target)
+
+        new_hook = {"type": "command", "command": command}
+        if spec.get("timeout"):
+            new_hook["timeout"] = spec["timeout"]
+        target["hooks"].append(new_hook)
+        managed_count += 1
+
+    return hooks_payload, managed_count
+
+
+def _sync_json_client(path: Path, server_config: dict, label: str, *, managed_metadata: dict | None = None) -> dict:
+    payload = _load_json_object(path)
+    mcp_servers = payload.setdefault("mcpServers", {})
+    if not isinstance(mcp_servers, dict):
+        mcp_servers = {}
+        payload["mcpServers"] = mcp_servers
+    action = "updated" if "nexo" in mcp_servers else "created"
+    mcp_servers["nexo"] = server_config
+    if managed_metadata is not None:
+        nexo_meta = payload.setdefault("nexo", {})
+        if not isinstance(nexo_meta, dict):
+            nexo_meta = {}
+            payload["nexo"] = nexo_meta
+        nexo_meta.update(managed_metadata)
+    managed_entries = _managed_mcp_entries_for(label, server_config)
+    if managed_entries and merge_json_mcp_servers:
+        payload = merge_json_mcp_servers(payload, managed_entries)
+    else:
+        payload = _remove_unhealthy_json_managed_mcp(payload)
+    _write_json_object(path, payload)
+    return {
+        "ok": True,
+        "client": label,
+        "action": action,
+        "path": str(path),
+        "managed_default_mcp_count": len(managed_entries),
+    }
+
+
+def _claude_desktop_managed_metadata(server_config: dict, *, operator_name: str) -> dict:
+    return {
+        "claude_desktop": {
+            "shared_brain_managed": True,
+            "shared_brain_mode": "mcp_only",
+            "managed_operator": operator_name or server_config.get("env", {}).get("NEXO_NAME", "") or "operator",
+            "managed_runtime_home": server_config.get("env", {}).get("NEXO_HOME", ""),
+            "managed_runtime_root": server_config.get("env", {}).get("NEXO_CODE", ""),
+        }
+    }
+
+
+# Minimum permissions allowlist required for NEXO headless automation
+# (followup-runner, email-monitor, deep-sleep, etc.) to work without
+# interactive approval prompts. Without this, Claude Code headless invocations
+# stall waiting for MCP tool approvals.
+#
+# v7.31.x (Fase 1) — "mcp__*" is NOT a valid Claude Code allow rule (allow
+# patterns must name a literal mcp__<server>__ scope; only deny/ask accept
+# bare wildcards). Claude Code skips it and shows a Settings Warning on every
+# launch. List the NEXO-managed servers explicitly instead; user-added
+# servers belong to the user's own config, not to this template.
+_NEXO_HEADLESS_ALLOWLIST = (
+    "Bash",
+    "Read",
+    "Edit",
+    "Write",
+    "Glob",
+    "Grep",
+    "Task",
+    "Skill",
+    "NotebookEdit",
+    "WebSearch",
+    "WebFetch",
+    "mcp__nexo__*",
+    "mcp__nexo_chrome_control__*",
+    "mcp__nexo_desktop_control__*",
+    "mcp__nexo_power_control__*",
+)
+
+# Entries previously pushed by this template that Claude Code rejects as
+# invalid. The sync REMOVES them so already-contaminated installs stop
+# showing the launch warning. Safe: Claude Code was skipping them anyway.
+_NEXO_INVALID_ALLOWLIST_ENTRIES = (
+    "mcp__*",
+)
+
+
+def _ensure_headless_permissions(payload: dict) -> None:
+    """Ensure Claude Code settings.json has the minimum allowlist so headless
+    NEXO crons (followup-runner, email-monitor, etc.) do not stall on MCP
+    tool-approval prompts. Idempotent: only adds missing entries, never
+    removes or reorders existing user customizations."""
+    permissions = payload.get("permissions")
+    if not isinstance(permissions, dict):
+        permissions = {}
+        payload["permissions"] = permissions
+
+    allow_list = permissions.get("allow")
+    if not isinstance(allow_list, list):
+        allow_list = []
+        permissions["allow"] = allow_list
+
+    # v7.31.x (Fase 1) — migrate away invalid entries this template used to
+    # push (Claude Code skips them and warns on every launch).
+    for invalid in _NEXO_INVALID_ALLOWLIST_ENTRIES:
+        while invalid in allow_list:
+            allow_list.remove(invalid)
+
+    existing = {str(item) for item in allow_list if isinstance(item, str)}
+    for entry in _NEXO_HEADLESS_ALLOWLIST:
+        if entry not in existing:
+            allow_list.append(entry)
+            existing.add(entry)
+
+    permissions.setdefault("deny", [])
+    permissions.setdefault("ask", [])
+    permissions.setdefault("defaultMode", "dontAsk")
+
+
+def _sync_claude_code_settings(path: Path, server_config: dict) -> dict:
+    payload = _load_json_object(path)
+    mcp_servers = payload.setdefault("mcpServers", {})
+    if not isinstance(mcp_servers, dict):
+        mcp_servers = {}
+        payload["mcpServers"] = mcp_servers
+    action = "updated" if "nexo" in mcp_servers else "created"
+    mcp_servers["nexo"] = server_config
+
+    runtime_root = Path(server_config.get("env", {}).get("NEXO_CODE", "")).expanduser()
+    nexo_home = Path(server_config.get("env", {}).get("NEXO_HOME", "")).expanduser()
+    payload["hooks"], managed_hook_count = _merge_core_hooks(
+        payload.get("hooks", {}),
+        runtime_root=runtime_root,
+        nexo_home=nexo_home,
+    )
+    managed_entries = _managed_mcp_entries_for("claude_code", server_config)
+    if managed_entries and merge_json_mcp_servers:
+        payload = merge_json_mcp_servers(payload, managed_entries)
+    else:
+        payload = _remove_unhealthy_json_managed_mcp(payload)
+    _ensure_headless_permissions(payload)
+    _write_json_object(path, payload)
+    return {
+        "ok": True,
+        "client": "claude_code",
+        "action": action,
+        "path": str(path),
+        "managed_hook_count": managed_hook_count,
+        "managed_default_mcp_count": len(managed_entries),
+    }
+
+
+def sync_claude_code_model(
+    model: str,
+    *,
+    user_home: str | os.PathLike[str] | None = None,
+) -> dict:
+    """Propagate the NEXO-recommended ``model`` into ``~/.claude/settings.json``.
+
+    Claude Code actually reads the default model from ``settings.json``, not
+    from NEXO's internal ``client_runtime_profiles``. When a NEXO update
+    migrates a user's recommended default (e.g. Opus 4.6 → 4.7) the internal
+    profile changes but Claude Code keeps booting on the old model until this
+    file is rewritten.
+
+    Intentionally conservative — do NOT seed a field the user never had:
+      - ``settings.json`` missing              → skip.
+      - ``settings.json`` exists but has no
+        top-level ``"model"`` key              → skip.
+      - Current value already equals ``model`` → skip (no write).
+      - JSON read/write error                  → ``ok=False``, skip.
+      - Otherwise replace the value.
+
+    Returns a small result dict: ``{ok, action, path, reason?, previous_model?, new_model?}``.
+    ``action`` is ``"updated"`` only when the file was actually rewritten.
+    """
+    result: dict = {"ok": True, "action": "skipped", "path": ""}
+    if not model:
+        result["reason"] = "empty model"
+        return result
+    home_path = Path(user_home).expanduser() if user_home else None
+    path = _claude_code_settings_path(home_path)
+    result["path"] = str(path)
+    if not path.is_file():
+        result["reason"] = "settings.json missing"
+        return result
+    try:
+        raw = path.read_text()
+        payload = json.loads(raw) if raw.strip() else {}
+    except Exception as e:
+        result["ok"] = False
+        result["reason"] = f"read failed: {e}"
+        return result
+    if not isinstance(payload, dict):
+        result["reason"] = "settings.json is not a JSON object"
+        return result
+    if "model" not in payload:
+        result["reason"] = "no model field in settings.json"
+        return result
+    current = payload.get("model")
+    if current == model:
+        result["reason"] = "already matches"
+        return result
+    payload["model"] = model
+    try:
+        _write_json_object(path, payload)
+    except Exception as e:
+        result["ok"] = False
+        result["reason"] = f"write failed: {e}"
+        return result
+    result["action"] = "updated"
+    result["previous_model"] = current
+    result["new_model"] = model
+    return result
+
+
+def sync_claude_code(
+    *,
+    nexo_home: str | os.PathLike[str] | None = None,
+    runtime_root: str | os.PathLike[str] | None = None,
+    python_path: str = "",
+    operator_name: str = "",
+    user_home: str | os.PathLike[str] | None = None,
+    preferences: dict | None = None,
+) -> dict:
+    server_config = build_server_config(
+        nexo_home=nexo_home,
+        runtime_root=runtime_root,
+        python_path=python_path,
+        operator_name=operator_name,
+        client="claude_code",
+    )
+    home_path = Path(user_home).expanduser() if user_home else None
+    result = _sync_claude_code_settings(
+        _claude_code_settings_path(home_path),
+        server_config,
+    )
+    # Claude Code 2.1.x reads user-scoped MCP servers from ~/.claude.json.
+    # Keep settings.json in sync for hooks/runtime preferences, but also write
+    # the managed NEXO MCP server to the root user config so `claude mcp list`
+    # and interactive sessions see the same server.
+    mcp_result = _sync_json_client(
+        _claude_code_mcp_path(home_path),
+        server_config,
+        "claude_code",
+    )
+    result["mcp"] = mcp_result
+    result["mcp_path"] = mcp_result.get("path", "")
+    cortex_result = _sync_json_client(
+        _claude_code_cortex_path(home_path),
+        server_config,
+        "claude_code",
+    )
+    result["cortex_mcp"] = cortex_result
+    result["cortex_mcp_path"] = cortex_result.get("path", "")
+    bootstrap_result = sync_client_bootstrap(
+        "claude_code",
+        nexo_home=nexo_home,
+        operator_name=operator_name,
+        user_home=user_home,
+    )
+    result["bootstrap"] = bootstrap_result
+    if not bootstrap_result.get("ok"):
+        result["ok"] = False
+        result["error"] = bootstrap_result.get("error", "Claude bootstrap sync failed")
+    return result
+
+
+def sync_claude_desktop(
+    *,
+    nexo_home: str | os.PathLike[str] | None = None,
+    runtime_root: str | os.PathLike[str] | None = None,
+    python_path: str = "",
+    operator_name: str = "",
+    user_home: str | os.PathLike[str] | None = None,
+    preferences: dict | None = None,
+) -> dict:
+    server_config = build_server_config(
+        nexo_home=nexo_home,
+        runtime_root=runtime_root,
+        python_path=python_path,
+        operator_name=operator_name,
+        client="claude_desktop",
+    )
+    resolved_name = server_config.get("env", {}).get("NEXO_NAME", "") or _resolve_operator_name(
+        Path(nexo_home).expanduser() if nexo_home else _default_nexo_home(),
+        explicit=operator_name,
+    )
+    return _sync_json_client(
+        _claude_desktop_config_path(Path(user_home).expanduser() if user_home else None),
+        server_config,
+        "claude_desktop",
+        managed_metadata=_claude_desktop_managed_metadata(server_config, operator_name=resolved_name),
+    )
+
+
+def sync_codex(
+    *,
+    nexo_home: str | os.PathLike[str] | None = None,
+    runtime_root: str | os.PathLike[str] | None = None,
+    python_path: str = "",
+    operator_name: str = "",
+    user_home: str | os.PathLike[str] | None = None,
+    preferences: dict | None = None,
+) -> dict:
+    nexo_home_path = Path(nexo_home).expanduser() if nexo_home else _default_nexo_home()
+    home_path = Path(user_home).expanduser() if user_home else _user_home()
+    active_preferences = normalize_client_preferences(preferences)
+    runtime_profile = resolve_client_runtime_profile("codex", preferences=active_preferences)
+    server_config = build_server_config(
+        nexo_home=nexo_home_path,
+        runtime_root=runtime_root,
+        python_path=python_path,
+        operator_name=operator_name,
+        client="codex",
+    )
+    codex_bin = _sync_codex_binary(home_path)
+    config_path = _codex_config_path(home_path)
+    hooks_path = _codex_hooks_path(home_path)
+    if not codex_bin:
+        result = {
+            "ok": True,
+            "client": "codex",
+            "skipped": True,
+            "reason": "codex binary not found in PATH",
+            "path": str(config_path),
+        }
+        bootstrap_result = sync_client_bootstrap(
+            "codex",
+            nexo_home=nexo_home,
+            operator_name=operator_name,
+            user_home=user_home,
+        )
+        result["bootstrap"] = bootstrap_result
+        if bootstrap_result.get("ok"):
+            prompt_text = bootstrap_result.get("content") or ""
+            result["config"] = _sync_codex_managed_config(
+                config_path,
+                bootstrap_prompt=prompt_text,
+                runtime_profile=runtime_profile,
+                server_config=server_config,
+            )
+            result["hooks"] = _sync_codex_hooks(
+                hooks_path,
+                runtime_root=Path(runtime_root).expanduser() if runtime_root else _resolve_runtime_root(nexo_home_path),
+                nexo_home=nexo_home_path,
+            )
+        return result
+
+    cmd = [codex_bin, "mcp", "add", "nexo"]
+    for key, value in sorted(server_config.get("env", {}).items()):
+        cmd.extend(["--env", f"{key}={value}"])
+    cmd.extend(["--", server_config["command"], *server_config.get("args", [])])
+    env = {**os.environ, "HOME": str(home_path)}
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    sync_result = {
+        "ok": True,
+        "client": "codex",
+        "action": "updated",
+        "path": str(config_path),
+        "mode": "cli" if result.returncode == 0 else "config_only",
+    }
+    bootstrap_result = sync_client_bootstrap(
+        "codex",
+        nexo_home=nexo_home_path,
+        operator_name=operator_name,
+        user_home=home_path,
+    )
+    sync_result["bootstrap"] = bootstrap_result
+    if not bootstrap_result.get("ok"):
+        sync_result["ok"] = False
+        sync_result["error"] = bootstrap_result.get("error", "Codex bootstrap sync failed")
+        return sync_result
+    sync_result["config"] = _sync_codex_managed_config(
+        config_path,
+        bootstrap_prompt=bootstrap_result.get("content") or "",
+        runtime_profile=runtime_profile,
+        server_config=server_config,
+    )
+    sync_result["hooks"] = _sync_codex_hooks(
+        hooks_path,
+        runtime_root=Path(runtime_root).expanduser() if runtime_root else _resolve_runtime_root(nexo_home_path),
+        nexo_home=nexo_home_path,
+    )
+    if result.returncode != 0:
+        sync_result["warning"] = (result.stderr or result.stdout or "codex mcp add failed").strip()
+    return sync_result
+
+
+def sync_all_clients(
+    *,
+    nexo_home: str | os.PathLike[str] | None = None,
+    runtime_root: str | os.PathLike[str] | None = None,
+    python_path: str = "",
+    operator_name: str = "",
+    user_home: str | os.PathLike[str] | None = None,
+    enabled_clients: list[str] | tuple[str, ...] | set[str] | None = None,
+    preferences: dict | None = None,
+    auto_install_missing_claude: bool = False,
+    auto_install_missing_codex: bool = False,
+) -> dict:
+    nexo_home_path = Path(nexo_home).expanduser() if nexo_home else _default_nexo_home()
+    guardian_runtime_surfaces_result: dict = {
+        "ok": False,
+        "path": "",
+        "entity_count": 0,
+        "source": "",
+    }
+    try:
+        from guardian_runtime_surfaces import write_guardian_runtime_surfaces
+
+        guardian_runtime_surfaces_result = write_guardian_runtime_surfaces(
+            nexo_home=nexo_home_path,
+        )
+    except Exception as exc:
+        guardian_runtime_surfaces_result = {
+            "ok": False,
+            "error": str(exc),
+            "path": "",
+            "entity_count": 0,
+            "source": "",
+        }
+
+    if enabled_clients is None:
+        if preferences is None:
+            enabled_set = set(INTERACTIVE_CLIENT_KEYS)
+        else:
+            active_preferences = normalize_client_preferences(preferences)
+            enabled_set = {
+                key
+                for key in INTERACTIVE_CLIENT_KEYS
+                if active_preferences.get("interactive_clients", {}).get(key, False)
+            }
+            backend_key = normalize_backend_key(active_preferences.get("automation_backend"))
+            if active_preferences.get("automation_enabled", True) and backend_key and backend_key != BACKEND_NONE:
+                enabled_set.add(backend_key)
+            if not enabled_set:
+                enabled_set.add("claude_code")
+    else:
+        enabled_set = {normalize_client_key(item) for item in enabled_clients if normalize_client_key(item)}
+        if not enabled_set:
+            enabled_set = {"claude_code"}
+
+    install_results: dict[str, dict] = {}
+    if auto_install_missing_claude and "claude_code" in enabled_set:
+        install_results["claude_code"] = ensure_claude_code_installed(user_home=user_home)
+    if auto_install_missing_codex and "codex" in enabled_set:
+        install_results["codex"] = ensure_codex_installed(user_home=user_home)
+
+    def _safe(label: str, fn) -> dict:
+        if label not in enabled_set:
+            return {
+                "ok": True,
+                "client": label,
+                "skipped": True,
+                "reason": "disabled in client preferences",
+            }
+        try:
+            return fn(
+                nexo_home=nexo_home,
+                runtime_root=runtime_root,
+                python_path=python_path,
+                operator_name=operator_name,
+                user_home=user_home,
+                preferences=preferences,
+            )
+        except Exception as exc:
+            return {"ok": False, "client": label, "error": str(exc)}
+
+    results = {
+        "claude_code": _safe("claude_code", sync_claude_code),
+        "claude_desktop": _safe("claude_desktop", sync_claude_desktop),
+        "codex": _safe("codex", sync_codex),
+    }
+    ok = (
+        all(item.get("ok") or item.get("skipped") for item in results.values())
+        and all(item.get("ok") for item in install_results.values())
+    )
+    return {
+        "ok": ok and guardian_runtime_surfaces_result.get("ok", False),
+        "nexo_home": str(nexo_home_path),
+        "runtime_root": str(_resolve_runtime_root(
+            nexo_home_path,
+            runtime_root,
+        )),
+        "enabled_clients": sorted(enabled_set),
+        "guardian_runtime_surfaces": guardian_runtime_surfaces_result,
+        "install_results": install_results,
+        "clients": results,
+    }
+
+
+def format_sync_summary(result: dict) -> str:
+    labels = {
+        "claude_code": "Claude Code",
+        "claude_desktop": "Claude Desktop",
+        "codex": "Codex",
+    }
+    lines = ["SHARED BRAIN SYNC"]
+    for key in ["claude_code", "claude_desktop", "codex"]:
+        item = result.get("clients", {}).get(key, {})
+        label = labels[key]
+        if item.get("skipped"):
+            bootstrap = item.get("bootstrap", {})
+            if bootstrap.get("ok") and not bootstrap.get("skipped"):
+                lines.append(
+                    f"  {label}: skipped ({item.get('reason', 'not available')}); bootstrap {bootstrap.get('action', 'synced')} -> {bootstrap.get('path', '')}"
+                )
+            else:
+                lines.append(f"  {label}: skipped ({item.get('reason', 'not available')})")
+        elif item.get("ok"):
+            bootstrap = item.get("bootstrap", {})
+            suffix = ""
+            if bootstrap.get("ok"):
+                suffix = f"; bootstrap {bootstrap.get('action', 'synced')} -> {bootstrap.get('path', '')}"
+            lines.append(f"  {label}: {item.get('action', 'synced')} -> {item.get('path', '')}{suffix}")
+        else:
+            lines.append(f"  {label}: ERROR -> {item.get('error', 'unknown error')}")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Sync NEXO MCP config across Claude Code, Claude Desktop, and Codex.")
+    parser.add_argument("--nexo-home", default=str(_default_nexo_home()))
+    parser.add_argument("--runtime-root", default="")
+    parser.add_argument("--python", dest="python_path", default="")
+    parser.add_argument("--operator-name", default="")
+    parser.add_argument(
+        "--enabled-client",
+        action="append",
+        dest="enabled_clients",
+        choices=["claude_code", "claude_desktop", "codex"],
+        help="Sync only the specified client(s). Repeat for multiple values.",
+    )
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    result = sync_all_clients(
+        nexo_home=args.nexo_home,
+        runtime_root=args.runtime_root or None,
+        python_path=args.python_path,
+        operator_name=args.operator_name,
+        enabled_clients=args.enabled_clients,
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(format_sync_summary(result))
+    return 0 if result.get("ok") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

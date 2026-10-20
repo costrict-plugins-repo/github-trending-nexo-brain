@@ -1,0 +1,60 @@
+{
+  "schema": "nexo.managed_mcp.lock.v1",
+  "catalog_version": "2026.06.06",
+  "generated_at": "2026-06-06T00:00:00Z",
+  "providers": {
+    "chrome-devtools-mcp": {
+      "source_type": "npm",
+      "package": "chrome-devtools-mcp",
+      "version": "1.4.0",
+      "integrity": "sha512-OOT5mYMUbqqgpIGx0s0TgxnlicRSDm3yhZWzK3pWkB6TUPb+WdpI0j6OQoTnNZ9mqn9rwXiCOLzY4UALp+XsiQ==",
+      "tarball": "https://registry.npmjs.org/chrome-devtools-mcp/-/chrome-devtools-mcp-1.4.0.tgz",
+      "bin": "chrome-devtools-mcp",
+      "engines": {
+        "node": "^20.19.0 || ^22.12.0 || >=23"
+      }
+    },
+    "mac-use-mcp": {
+      "source_type": "npm",
+      "package": "mac-use-mcp",
+      "version": "1.1.1",
+      "integrity": "sha512-UcVkzvHuw+f21nEZwb3MwdqWGxLK/nYlhN55SRD6FZ2yn2t3ji0zKLD2XvQLp0ugeYyS92TqVgnw6E4P5VB+bg==",
+      "tarball": "https://registry.npmjs.org/mac-use-mcp/-/mac-use-mcp-1.1.1.tgz",
+      "bin": "mac-use-mcp",
+      "engines": {
+        "node": ">=22"
+      }
+    },
+    "native-devtools-mcp": {
+      "source_type": "npm",
+      "package": "native-devtools-mcp",
+      "version": "0.10.1",
+      "integrity": "sha512-TIR8QCKzYCaHY+N1IWB7OM6pZH49HJxRj1dZjT4RNkviA1QpgINm8H95ohMCbf4ZC5jdFssMlb9KmWNZnCeCSw==",
+      "tarball": "https://registry.npmjs.org/native-devtools-mcp/-/native-devtools-mcp-0.10.1.tgz",
+      "bin": "native-devtools-mcp",
+      "engines": {
+        "node": ">=18"
+      }
+    },
+    "open-computer-use": {
+      "source_type": "npm",
+      "package": "open-computer-use",
+      "version": "0.1.54",
+      "integrity": "sha512-UFaKT9xcAQIUN6mcvdvtepHmh3kUs1fwSwL30sDha6+4IbT/Khn1sEGqRskmJSnU4XPGF6v7pdQ5oETQxQMNCw==",
+      "tarball": "https://registry.npmjs.org/open-computer-use/-/open-computer-use-0.1.54.tgz",
+      "bin": "open-computer-use-mcp",
+      "engines": {}
+    },
+    "desktop-commander": {
+      "source_type": "npm",
+      "package": "@wonderwhy-er/desktop-commander",
+      "version": "0.2.43",
+      "integrity": "sha512-MFXMu+26p4xywjClqep3pDq9auAOENtYTnG/CYvfoz6fvrYnT/fWb8hfsRGUE7eXntIzmM2rXkGM7y1LwItQrA==",
+      "tarball": "https://registry.npmjs.org/@wonderwhy-er/desktop-commander/-/desktop-commander-0.2.43.tgz",
+      "bin": "desktop-commander",
+      "engines": {
+        "node": ">=18.0.0"
+      }
+    }
+  }
+}

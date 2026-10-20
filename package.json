@@ -1,0 +1,104 @@
+{
+  "name": "nexo-brain",
+  "version": "7.38.7",
+  "mcpName": "io.github.wazionapps/nexo",
+  "description": "NEXO runtime core for NEXO Desktop. Provides local memory, Deep Sleep, Evolution support-ticket mode, skills, watchdog, and MCP tooling for the Desktop product.",
+  "homepage": "https://nexo-desktop.com",
+  "bin": {
+    "nexo-brain": "bin/nexo-brain.js",
+    "nexo": "bin/nexo.js",
+    "nexo-managed-mcp": "bin/nexo-managed-mcp.js"
+  },
+  "keywords": [
+    "claude-code",
+    "mcp",
+    "cognitive-architecture",
+    "memory",
+    "ai-assistant",
+    "vector-search",
+    "atkinson-shiffrin",
+    "knowledge-graph",
+    "hnsw",
+    "claim-graph",
+    "dashboard",
+    "launchagent",
+    "systemd",
+    "linux",
+    "autonomous-agent",
+    "somatic-markers",
+    "nervous-system",
+    "i18n",
+    "openclaw",
+    "openclaw-plugin",
+    "auto-update",
+    "auto-diary",
+    "plugin-system",
+    "schedule-json",
+    "nexo-home",
+    "deep-sleep",
+    "emotional-intelligence",
+    "overnight-analysis",
+    "cron-manifest",
+    "session-tone",
+    "mood-tracking",
+    "productivity-analysis",
+    "runtime-cli",
+    "doctor",
+    "executable-skills",
+    "work-continuity",
+    "personal-scripts",
+    "script-registry",
+    "claude-code-plugin",
+    "nexo-chat"
+  ],
+  "author": "NEXO Cognitive S.L. <info@nexo-desktop.com>",
+  "license": "AGPL-3.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wazionapps/nexo.git"
+  },
+  "scripts": {
+    "postinstall": "node bin/postinstall.js"
+  },
+  "runtimeDependencies": [
+    {
+      "name": "@anthropic-ai/claude-code",
+      "type": "npm-global",
+      "optional": false
+    },
+    {
+      "name": "@openai/codex",
+      "type": "npm-global",
+      "optional": true
+    }
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin/nexo-brain.js",
+    "bin/nexo.js",
+    "bin/nexo-managed-mcp.js",
+    "bin/windows-wsl-bridge.js",
+    "bin/postinstall.js",
+    "scripts/sync_release_artifacts.py",
+    "src/",
+    "src/resonance_tiers.json",
+    "src/hooks/manifest.json",
+    "community/",
+    "!src/**/__pycache__",
+    "!src/**/*.pyc",
+    "!src/**/*.pyo",
+    "templates/",
+    "!templates/**/__pycache__",
+    "!templates/**/*.pyc",
+    "!templates/**/*.pyo",
+    "codex/openai-codex-0.133.0.tgz",
+    ".claude-plugin/",
+    ".mcp.json",
+    "hooks/hooks.json",
+    "tool-enforcement-map.json",
+    "README.md",
+    "LICENSE"
+  ]
+}

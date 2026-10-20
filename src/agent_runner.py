@@ -1,0 +1,1565 @@
+from __future__ import annotations
+
+"""Terminal client launchers and headless automation backend runner."""
+
+import json
+import os
+import re
+import paths
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from functools import lru_cache
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    import tomli as tomllib
+
+from client_preferences import (
+    BACKEND_NONE,
+    CLIENT_CLAUDE_CODE,
+    CLIENT_CODEX,
+    client_to_provider,
+    TERMINAL_CLIENT_KEYS,
+    load_client_preferences,
+    _desktop_product_requested,
+    _managed_codex_binary,
+    _managed_codex_vendor_present,
+    normalize_client_key,
+    resolve_automation_backend,
+    resolve_client_runtime_profile,
+    resolve_terminal_client,
+)
+from claude_cli import resolve_claude_cli as _shared_resolve_claude_cli
+from core_prompts import render_core_prompt
+
+
+NEXO_HOME = Path(os.environ.get("NEXO_HOME", str(Path.home() / ".nexo")))
+CLAUDE_LEGACY_MODEL_HINTS = {"opus", "sonnet"}
+MODEL_PRICING_USD_PER_1M = {
+    # Pricing snapshot used only when the backend does not return explicit cost.
+    # Codex model names map to the current GPT-5 family pricing.
+    "gpt-5.5": {"input": 1.25, "cached_input": 0.125, "output": 10.0},
+    "gpt-5.4": {"input": 1.25, "cached_input": 0.125, "output": 10.0},
+    "gpt-5.4-mini": {"input": 0.25, "cached_input": 0.025, "output": 2.0},
+}
+class AgentRunnerError(RuntimeError):
+    """Base exception for runner failures."""
+
+
+class TerminalClientUnavailableError(AgentRunnerError):
+    """Raised when the requested interactive client cannot be launched."""
+
+
+class AutomationBackendUnavailableError(AgentRunnerError):
+    """Raised when the configured automation backend is unavailable."""
+
+
+def _automation_provider_for_backend(backend: str) -> str:
+    return client_to_provider(backend) or ""
+
+def _canonical_pricing_model(model: str) -> str:
+    lowered = str(model or "").strip().lower()
+    lowered = lowered.split("[", 1)[0]
+    aliases = {
+        "gpt-5": "gpt-5.5",
+        "gpt-5.5": "gpt-5.5",
+        "gpt-5.4": "gpt-5.4",
+        "gpt-5-mini": "gpt-5.4-mini",
+        "gpt-5.4-mini": "gpt-5.4-mini",
+    }
+    return aliases.get(lowered, lowered)
+
+
+def _estimate_openai_cost_usd(model: str, *, input_tokens: int, cached_input_tokens: int, output_tokens: int) -> tuple[float | None, str]:
+    pricing = MODEL_PRICING_USD_PER_1M.get(_canonical_pricing_model(model))
+    if not pricing:
+        return None, "pricing_unavailable"
+    total = 0.0
+    total += (max(0, int(input_tokens or 0)) / 1_000_000.0) * pricing["input"]
+    total += (max(0, int(cached_input_tokens or 0)) / 1_000_000.0) * pricing["cached_input"]
+    total += (max(0, int(output_tokens or 0)) / 1_000_000.0) * pricing["output"]
+    return round(total, 6), "pricing_snapshot"
+
+
+def _safe_json_loads(raw: str) -> dict | list | None:
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def _extract_claude_telemetry(raw_stdout: str, *, requested_output_format: str) -> tuple[str, dict]:
+    payload = _safe_json_loads(raw_stdout) if str(raw_stdout or "").strip().startswith("{") else None
+    if not isinstance(payload, dict):
+        return raw_stdout or "", {
+            "telemetry_source": "missing",
+            "cost_source": "missing",
+            "usage": {},
+            "warnings": ["backend did not return parseable JSON telemetry"],
+        }
+
+    # Two shapes can arrive in raw_stdout:
+    #   (a) Classic Claude CLI wrapper:
+    #       {"result": "<agent text or stringified JSON>", "usage": {...}, "total_cost_usd": N}
+    #   (b) Direct agent JSON (Claude CLI 2.1+ with bare_mode + output_format=json
+    #       + a prompt that requests raw JSON only). The wrapper is dropped and
+    #       the entire payload IS the agent's answer, e.g. {"subject":..., "body":...}.
+    # Pre-7.17.1 only handled (a): payload.get("result", "") returned "" in case (b),
+    # which left result.stdout empty for the caller. morning-agent then raised
+    # "Morning agent returned invalid JSON output" on every cron tick even though
+    # the agent had answered correctly and the answer was already persisted in
+    # automation_runs.metadata.raw. The branch below normalises both shapes.
+    if "result" in payload:
+        result_payload = payload["result"]
+        telemetry_payload = payload
+    else:
+        result_payload = payload
+        telemetry_payload = {}
+
+    if requested_output_format and requested_output_format.lower() == "json" and not isinstance(result_payload, str):
+        final_stdout = json.dumps(result_payload, ensure_ascii=False)
+    else:
+        final_stdout = result_payload if isinstance(result_payload, str) else json.dumps(result_payload, ensure_ascii=False)
+
+    usage = telemetry_payload.get("usage") or {}
+    model_usage = telemetry_payload.get("modelUsage") or {}
+    explicit_cost = telemetry_payload.get("total_cost_usd")
+    if explicit_cost is None and isinstance(model_usage, dict):
+        explicit_cost = sum(
+            float((item or {}).get("costUSD") or 0.0)
+            for item in model_usage.values()
+            if isinstance(item, dict)
+        )
+
+    return final_stdout, {
+        "telemetry_source": "claude_json",
+        "cost_source": "backend",
+        "usage": {
+            "input_tokens": int(usage.get("input_tokens") or 0),
+            "cached_input_tokens": int(usage.get("cache_read_input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0),
+        },
+        "total_cost_usd": float(explicit_cost) if explicit_cost is not None else None,
+        "raw": payload,
+        "warnings": [],
+    }
+
+
+def _extract_codex_telemetry(stream_stdout: str, *, final_stdout: str, model: str) -> tuple[str, dict]:
+    usage_payload: dict = {}
+    raw_events: list[dict] = []
+    for line in str(stream_stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        payload = _safe_json_loads(line)
+        if not isinstance(payload, dict):
+            continue
+        raw_events.append(payload)
+        if payload.get("type") == "turn.completed" and isinstance(payload.get("usage"), dict):
+            usage_payload = payload["usage"]
+
+    usage = {
+        "input_tokens": int(usage_payload.get("input_tokens") or 0),
+        "cached_input_tokens": int(usage_payload.get("cached_input_tokens") or 0),
+        "output_tokens": int(usage_payload.get("output_tokens") or 0),
+    }
+    total_cost_usd = usage_payload.get("total_cost_usd")
+    cost_source = "backend" if total_cost_usd is not None else "missing"
+    warnings: list[str] = []
+    if total_cost_usd is None:
+        estimated_cost, estimated_source = _estimate_openai_cost_usd(
+            model,
+            input_tokens=usage["input_tokens"],
+            cached_input_tokens=usage["cached_input_tokens"],
+            output_tokens=usage["output_tokens"],
+        )
+        total_cost_usd = estimated_cost
+        cost_source = estimated_source
+        if estimated_cost is None:
+            warnings.append(f"no pricing snapshot available for model `{model}`")
+
+    if not usage_payload:
+        warnings.append("backend did not return usage telemetry")
+
+    return final_stdout, {
+        "telemetry_source": "codex_jsonl",
+        "cost_source": cost_source,
+        "usage": usage,
+        "total_cost_usd": float(total_cost_usd) if total_cost_usd is not None else None,
+        "raw": raw_events[-8:],
+        "warnings": warnings,
+    }
+
+
+def _append_stderr(stderr: str, message: str) -> str:
+    bits = [part for part in [str(stderr or "").rstrip(), str(message or "").strip()] if part]
+    if not bits:
+        return ""
+    return "\n".join(bits) + "\n"
+
+
+def _record_automation_start(
+    *,
+    caller: str,
+    backend: str,
+    provider: str = "",
+    session_type: str,
+    task_profile: str,
+    model: str,
+    reasoning_effort: str,
+    resonance_tier: str,
+    cwd: Path,
+    output_format: str,
+    prompt: str,
+    pid: int | None = None,
+) -> tuple[int | None, str]:
+    """Insert an automation_runs row at START time with ended_at=NULL.
+
+    Returns ``(row_id, error_message)``. Row_id is ``None`` if the insert
+    fails for any reason — callers should degrade gracefully (telemetry is
+    best-effort, never blocking the actual automation call).
+    """
+    try:
+        from db._core import get_db
+    except Exception as exc:
+        return None, f"automation telemetry unavailable: {exc}"
+
+    try:
+        conn = get_db()
+        cur = conn.execute(
+            """
+            INSERT INTO automation_runs (
+                caller, backend, provider, session_type, task_profile, model,
+                reasoning_effort, resonance_tier, cwd, output_format,
+                prompt_chars, status, started_at, pid
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', datetime('now'), ?)
+            """,
+            (
+                caller or "",
+                backend,
+                provider or _automation_provider_for_backend(backend),
+                session_type or "headless",
+                task_profile or "default",
+                model or "",
+                reasoning_effort or "",
+                resonance_tier or "",
+                str(cwd),
+                output_format or "text",
+                len(prompt or ""),
+                int(pid) if pid is not None else None,
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid), ""
+    except Exception as exc:
+        return None, f"automation telemetry unavailable: {exc}"
+
+
+def _record_automation_end(
+    *,
+    row_id: int | None,
+    returncode: int,
+    duration_ms: int,
+    telemetry: dict,
+) -> tuple[bool, str]:
+    """Close an automation_runs row opened by _record_automation_start.
+
+    Falls back to a fresh INSERT when ``row_id`` is None so callers that
+    never got a start row (start failed, or pre-v5.9.0 code paths) still
+    leave a completion trace.
+    """
+    try:
+        from db._core import get_db
+    except Exception as exc:
+        return False, f"automation telemetry unavailable: {exc}"
+
+    usage = (telemetry or {}).get("usage") or {}
+    metadata = json.dumps(
+        {
+            "warnings": (telemetry or {}).get("warnings") or [],
+            "raw": (telemetry or {}).get("raw") or {},
+            "automation_contract": (telemetry or {}).get("automation_contract") or "",
+        },
+        ensure_ascii=False,
+    )
+    status = "ok" if int(returncode) == 0 else "failed"
+
+    try:
+        conn = get_db()
+        if row_id is not None:
+            conn.execute(
+                """
+                UPDATE automation_runs
+                   SET returncode=?, duration_ms=?,
+                       input_tokens=?, cached_input_tokens=?, output_tokens=?,
+                       total_cost_usd=?, telemetry_source=?, cost_source=?,
+                       status=?, metadata=?, ended_at=datetime('now')
+                 WHERE id=?
+                """,
+                (
+                    int(returncode),
+                    int(duration_ms),
+                    int(usage.get("input_tokens") or 0),
+                    int(usage.get("cached_input_tokens") or 0),
+                    int(usage.get("output_tokens") or 0),
+                    (telemetry or {}).get("total_cost_usd"),
+                    (telemetry or {}).get("telemetry_source", ""),
+                    (telemetry or {}).get("cost_source", ""),
+                    status,
+                    metadata,
+                    int(row_id),
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO automation_runs (
+                    backend, task_profile, model, reasoning_effort, cwd,
+                    output_format, prompt_chars, returncode, duration_ms,
+                    input_tokens, cached_input_tokens, output_tokens,
+                    total_cost_usd, telemetry_source, cost_source, status,
+                    metadata, ended_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                """,
+                (
+                    "", "default", "", "", "", "text", 0,
+                    int(returncode),
+                    int(duration_ms),
+                    int(usage.get("input_tokens") or 0),
+                    int(usage.get("cached_input_tokens") or 0),
+                    int(usage.get("output_tokens") or 0),
+                    (telemetry or {}).get("total_cost_usd"),
+                    (telemetry or {}).get("telemetry_source", ""),
+                    (telemetry or {}).get("cost_source", ""),
+                    status,
+                    metadata,
+                ),
+            )
+        conn.commit()
+        return True, ""
+    except Exception as exc:
+        return False, f"automation telemetry unavailable: {exc}"
+
+
+def _record_automation_run(
+    *,
+    backend: str,
+    provider: str = "",
+    task_profile: str,
+    model: str,
+    reasoning_effort: str,
+    cwd: Path,
+    output_format: str,
+    prompt: str,
+    returncode: int,
+    duration_ms: int,
+    telemetry: dict,
+    caller: str = "",
+    session_type: str = "headless",
+    resonance_tier: str = "",
+) -> tuple[bool, str]:
+    """Backwards-compatible facade for code paths that record in a single
+    shot (no separate start row). Prefer the split start/end pair going
+    forward so interactive sessions and long-running jobs can be seen
+    while they are still in flight."""
+    row_id, err = _record_automation_start(
+        caller=caller,
+        backend=backend,
+        provider=provider or _automation_provider_for_backend(backend),
+        session_type=session_type,
+        task_profile=task_profile,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        resonance_tier=resonance_tier,
+        cwd=cwd,
+        output_format=output_format,
+        prompt=prompt,
+    )
+    if err and row_id is None:
+        pass  # fall through, end will insert a single row
+    return _record_automation_end(
+        row_id=row_id,
+        returncode=returncode,
+        duration_ms=duration_ms,
+        telemetry=telemetry,
+    )
+
+
+def _record_backend_unavailable(
+    *,
+    backend: str,
+    caller: str,
+    cwd: Path,
+    prompt: str,
+) -> None:
+    profile = resolve_client_runtime_profile(backend)
+    _record_automation_run(
+        backend=backend,
+        provider=_automation_provider_for_backend(backend),
+        task_profile="default",
+        model=profile.get("model", ""),
+        reasoning_effort=profile.get("reasoning_effort", ""),
+        cwd=cwd,
+        output_format="text",
+        prompt=prompt,
+        returncode=2,
+        duration_ms=0,
+        telemetry={
+            "telemetry_source": "backend_unavailable",
+            "cost_source": "missing",
+            "usage": {},
+            "warnings": ["backend_unavailable", "fallback_blocked"],
+            "raw": {
+                "event": "backend_unavailable",
+                "backend": backend,
+                "provider": _automation_provider_for_backend(backend),
+                "fallback_policy": "fail_closed",
+            },
+        },
+        caller=caller,
+        session_type="headless",
+    )
+
+
+def _resolve_claude_cli() -> str:
+    return _shared_resolve_claude_cli()
+
+
+def _resolve_codex_cli() -> str:
+    home = Path.home()
+    if _desktop_product_requested(home):
+        managed_path = _managed_codex_binary(home)
+        return managed_path if managed_path and _managed_codex_vendor_present(home) else ""
+    env_path = os.environ.get("CODEX_BIN", "").strip()
+    if env_path and Path(env_path).exists():
+        return env_path
+    managed_path = _managed_codex_binary(home)
+    if managed_path and _managed_codex_vendor_present(home):
+        return managed_path
+    return shutil.which("codex") or ""
+
+
+def _codex_config_path() -> Path:
+    return Path.home() / ".codex" / "config.toml"
+
+
+def _headless_env(env: dict | None = None) -> dict:
+    merged = os.environ.copy()
+    if env:
+        merged.update(env)
+    merged["NEXO_HEADLESS"] = "1"
+    merged["NEXO_AUTOMATION"] = "1"
+    merged.pop("CLAUDECODE", None)
+    merged.pop("CLAUDE_CODE", None)
+    return merged
+
+
+_MUTATING_TOOL_NAMES = frozenset({
+    "write",
+    "edit",
+    "multiedit",
+    "notebookedit",
+    "delete",
+    "bash",
+    "shell",
+})
+
+
+def _runner_mutating_tools_allowed(allowed_tools: str) -> bool:
+    text = str(allowed_tools or "").strip().lower()
+    if not text:
+        return True
+    parts = {part.strip().split(":", 1)[0].lower() for part in re.split(r"[,;\s]+", text) if part.strip()}
+    return bool(parts & _MUTATING_TOOL_NAMES)
+
+
+_RUNNER_GUARD_EXEC_INVOCATION_PATTERN = re.compile(
+    r"\b(?:python3?|python|node|nodejs|bash|sh|zsh|ruby|deno|perl|pwsh|powershell|"
+    r"npx|pnpm|yarn|uv|pipx|env)\b\s+"
+    r"(/[^\s'\"`<>]+|[A-Za-z]:\\[^\s'\"`<>]+)"
+)
+
+
+def _extract_runner_guard_paths(prompt: str, cwd: Path) -> list[str]:
+    """Return paths that the prompt seems to instruct the agent to *edit*.
+
+    Paths that appear immediately after a known interpreter
+    (``python3 /path/to/tool.py ...``) are stripped out: those are
+    subprocess executions, not edits, and the runner guard must not treat
+    them as protected-file writes. Without this exclusion the email-monitor
+    prompt — which explicitly instructs the agent to invoke
+    ``~/.nexo/core/scripts/nexo-send-reply.py`` to deliver the reply —
+    triggers the ``runtime-core`` blocking rule on every email and the
+    session aborts with exit 2 before any reply is generated.
+    """
+    found: set[str] = set()
+    text = str(prompt or "")
+
+    exec_only_paths: set[str] = set()
+    for match in _RUNNER_GUARD_EXEC_INVOCATION_PATTERN.finditer(text):
+        candidate = match.group(1).rstrip(".,);:]")
+        if candidate:
+            exec_only_paths.add(candidate)
+            try:
+                exec_only_paths.add(str(Path(candidate).expanduser().resolve(strict=False)))
+            except Exception:
+                pass
+
+    for match in re.findall(r"(?<![A-Za-z0-9_])(?:/[^\s'\"`<>]+|[A-Za-z]:\\[^\s'\"`<>]+)", text):
+        cleaned = match.rstrip(".,);:]")
+        # Drop trailing slashes — `/tmp/` and friends are directories, not
+        # edit targets. Without this the followup-runner prompt's mention
+        # of `/tmp/` reached `handle_guard_check`, which tried to `open()`
+        # the directory and crashed the whole pre-emptive guard.
+        cleaned = cleaned.rstrip("/")
+        if not cleaned or cleaned in exec_only_paths:
+            continue
+        found.add(cleaned)
+    for match in re.findall(r"(?<![A-Za-z0-9_])(?:src|scripts|tests|docs|lib|renderer|app)/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+", text):
+        resolved = str((cwd / match.rstrip(".,);:]")).resolve())
+        if resolved in exec_only_paths:
+            continue
+        found.add(resolved)
+    try:
+        resolved_cwd = cwd.resolve()
+    except Exception:
+        resolved_cwd = cwd
+    runtime_core = NEXO_HOME / "core"
+    try:
+        if resolved_cwd == runtime_core or runtime_core in resolved_cwd.parents:
+            found.add(str(resolved_cwd))
+    except Exception:
+        pass
+    return sorted(found)
+
+
+def _run_headless_runner_guard(*, caller: str, cwd: Path, prompt: str, allowed_tools: str) -> dict:
+    """Pre-emptive runner guard — observational, never blocking.
+
+    The pre-emptive guard scans the *prompt text* for paths the agent might
+    edit. That is heuristic: it cannot tell whether a path will actually be
+    written, read, executed, or just mentioned in passing. Treating the
+    learnings/blocking-rules surfaced by that heuristic as hard blockers
+    has caused a year's worth of operational pain — every time a learning's
+    ``applies_to`` happens to match a path the prompt mentions for any
+    reason, every cron, every email-monitor session, every Deep Sleep
+    synth aborts with exit 2.
+
+    The authoritative gate is the PreToolUse hook
+    (``hook_guardrails._collect_runtime_core_write_blocks`` and the
+    learning-aware blocks alongside it). That layer fires only when the
+    agent *actually attempts* a Write/Edit, with severity ``error``, and
+    prevents the protected mutation. The pre-emptive guard's job is to
+    surface relevant learnings/schemas to the agent up front so it can
+    reason about them, plus log to ``guard_checks`` for observability —
+    not to abort the run on a regex match.
+
+    Therefore this function always returns ``blocked=False``. Errors from
+    ``handle_guard_check`` are also non-blocking; we let the run start so
+    the PreToolUse layer can do its job, and we log the unavailability for
+    diagnostics.
+    """
+    if not _runner_mutating_tools_allowed(allowed_tools):
+        return {"blocked": False, "skipped": "read_only_tools"}
+    guard_paths = _extract_runner_guard_paths(prompt, cwd)
+    if not guard_paths:
+        return {"blocked": False, "skipped": "no_explicit_paths"}
+    summary = ""
+    try:
+        runtime_root = str(NEXO_HOME)
+        if runtime_root and runtime_root not in sys.path:
+            sys.path.insert(0, runtime_root)
+        from plugins.guard import handle_guard_check  # type: ignore
+
+        # We still pass ``enforce_runtime_core_block="false"`` because that
+        # opt-out predates the advisory-only switch and other callers may
+        # still rely on it. With the advisory contract in place this flag
+        # is effectively redundant, but kept for back-compat.
+        output = handle_guard_check(
+            files=",".join(guard_paths),
+            area=f"runner:{caller or 'headless'}",
+            project_hint=f"headless runner caller={caller or 'unknown'} cwd={cwd}",
+            include_schemas="true",
+            enforce_runtime_core_block="false",
+        )
+        summary = str(output or "")
+    except Exception as exc:
+        # Guard unavailable is observational, not blocking. The PreToolUse
+        # hook will catch any actual protected write at execute time.
+        summary = f"Runner guard unavailable: {exc}"
+    return {
+        "blocked": False,
+        "summary": summary,
+        "paths": guard_paths,
+        "advisory": True,
+    }
+
+
+def _load_client_bootstrap_prompt(client: str) -> str:
+    try:
+        from bootstrap_docs import load_bootstrap_prompt
+    except Exception:
+        return ""
+    return load_bootstrap_prompt(client, nexo_home=NEXO_HOME, user_home=Path.home())
+
+
+def _codex_managed_initial_messages_enabled() -> bool:
+    config_path = _codex_config_path()
+    if not config_path.is_file():
+        return False
+    try:
+        payload = tomllib.loads(config_path.read_text())
+    except Exception:
+        return False
+    return bool(
+        payload.get("nexo", {})
+        .get("codex", {})
+        .get("bootstrap_managed")
+    )
+
+
+def _codex_interactive_launch_flags() -> list[str]:
+    return ["--sandbox", "danger-full-access", "--ask-for-approval", "never"]
+
+
+@lru_cache(maxsize=1)
+def _interactive_startup_prompt_text() -> str:
+    return render_core_prompt("interactive-startup")
+
+
+def _interactive_startup_prompt(client: str) -> str:
+    client_key = normalize_client_key(client)
+    if client_key in {CLIENT_CLAUDE_CODE, CLIENT_CODEX}:
+        return _interactive_startup_prompt_text()
+    return ""
+
+
+def _interactive_target_cwd(target: str | os.PathLike[str]) -> str:
+    candidate = Path(target).expanduser()
+    if candidate.exists() and candidate.is_file():
+        candidate = candidate.parent
+    try:
+        resolved = candidate.resolve()
+    except Exception:
+        resolved = candidate
+    if resolved.exists():
+        return str(resolved)
+    return str(Path.cwd())
+
+
+def _resolve_interactive_model_and_effort(
+    caller: str,
+    backend: str,
+    *,
+    preferences: dict | None = None,
+    tier: str | None = None,
+) -> tuple[str, str]:
+    """Return ``(model, effort)`` for an interactive launch.
+
+    v6.0.4 — interactive launchers (nexo chat, dashboard followup) were
+    picking the command flags straight from ``client_runtime_profiles``
+    (config/schedule.json), ignoring the user's ``default_resonance``
+    preference in calibration.json. That meant Preferences → "Alto"
+    never reached ``nexo chat`` even though the same preference was
+    applied correctly in headless runs (run_automation_prompt) and in
+    NEXO Desktop (lib/claude-runtime.js).
+
+    Resolution order (mirrors run_automation_prompt):
+      1. resonance_map → (model, effort) for the registered caller,
+         honouring user_default and the explicit tier override.
+      2. If the resonance_map is unavailable or returns blanks, fall
+         back to ``client_runtime_profiles`` so we stay backward
+         compatible with pre-6.0.0 installs missing resonance_tiers.json.
+    """
+    profile = resolve_client_runtime_profile(backend, preferences=preferences)
+    model = ""
+    effort = ""
+    try:
+        from resonance_map import resolve_model_and_effort
+
+        user_default = ""
+        if isinstance(preferences, dict):
+            user_default = str(preferences.get("default_resonance") or "").strip()
+        explicit_tier = (tier or "").strip() or None
+        mapped_model, mapped_effort = resolve_model_and_effort(
+            caller,
+            backend,
+            user_default=user_default or None,
+            explicit_tier=explicit_tier,
+        )
+        if mapped_model:
+            model = mapped_model
+        if mapped_effort:
+            effort = mapped_effort
+    except Exception:
+        # resonance_map missing or caller not registered — fall back to the
+        # legacy client_runtime_profiles path so nothing explodes.
+        pass
+    if not model:
+        model = profile.get("model", "")
+    if not effort:
+        effort = profile.get("reasoning_effort", "")
+    return model, effort
+
+
+def build_interactive_client_command(
+    *,
+    target: str | os.PathLike[str],
+    client: str | None = None,
+    preferences: dict | None = None,
+    caller: str = "nexo_chat",
+    tier: str | None = None,
+) -> tuple[str, list[str]]:
+    prefs = preferences or load_client_preferences()
+    selected = resolve_terminal_client(client, preferences=prefs)
+    target_path = str(Path(target).expanduser())
+    resolved_model, resolved_effort = _resolve_interactive_model_and_effort(
+        caller, selected, preferences=prefs, tier=tier
+    )
+    startup_prompt = _interactive_startup_prompt(selected)
+
+    if selected == CLIENT_CLAUDE_CODE:
+        claude_bin = _resolve_claude_cli()
+        if not claude_bin:
+            raise TerminalClientUnavailableError(
+                "Claude Code launcher not found in PATH. Install `claude` first."
+            )
+        cmd = [claude_bin]
+        if resolved_model:
+            cmd.extend(["--model", resolved_model])
+        if resolved_effort:
+            cmd.extend(["--effort", resolved_effort])
+        cmd.append("--dangerously-skip-permissions")
+        if startup_prompt:
+            cmd.append(startup_prompt)
+        return selected, cmd
+
+    if selected == CLIENT_CODEX:
+        codex_bin = _resolve_codex_cli()
+        if not codex_bin:
+            raise TerminalClientUnavailableError(
+                "Codex launcher not found in PATH. Install `codex` first or reconfigure NEXO."
+            )
+        cmd = [codex_bin, *_codex_interactive_launch_flags()]
+        if resolved_model:
+            cmd.extend(["-m", resolved_model])
+        if resolved_effort:
+            cmd.extend(["-c", f'model_reasoning_effort="{resolved_effort}"'])
+        cmd.extend(["-C", target_path])
+        if startup_prompt:
+            cmd.append(startup_prompt)
+        return selected, cmd
+
+    raise TerminalClientUnavailableError(f"Unsupported terminal client: {selected}")
+
+
+def launch_interactive_client(
+    *,
+    target: str | os.PathLike[str],
+    client: str | None = None,
+    env: dict | None = None,
+    preferences: dict | None = None,
+) -> subprocess.CompletedProcess:
+    return run_automation_interactive(
+        caller="nexo_chat",
+        target=target,
+        client=client,
+        env=env,
+        preferences=preferences,
+    )
+
+
+def run_automation_interactive(
+    *,
+    caller: str,
+    target: str | os.PathLike[str],
+    client: str | None = None,
+    env: dict | None = None,
+    preferences: dict | None = None,
+    session_type: str = "interactive_chat",
+    tier: str = "",
+) -> subprocess.CompletedProcess:
+    """Launch an interactive Claude/Codex session with automation_runs logging.
+
+    Unlike ``run_automation_prompt`` the child inherits stdin/stdout/stderr
+    from the current terminal so the user can carry a normal conversation.
+    We still record the run in the ``automation_runs`` table: a row is
+    INSERTed at spawn time with ``ended_at IS NULL`` and UPDATEd when the
+    session exits. Rows that die before the UPDATE (crash, kill -9) can be
+    reconciled later by the watchdog via the ``pid`` column.
+
+    ``caller`` must be registered in ``src/resonance_map.py`` (typically
+    ``nexo_chat``, ``desktop_new_session``, or ``nexo_update_interactive``).
+    The resonance tier resolves through the user's default preference so
+    the interactive surface honours whatever the user selected.
+    """
+    prefs = preferences or load_client_preferences()
+    # v6.0.4 — caller+tier propagate into the builder so interactive launches
+    # honour default_resonance (previously ignored for nexo chat).
+    resolved_client, cmd = build_interactive_client_command(
+        target=target,
+        client=client,
+        preferences=prefs,
+        caller=caller,
+        tier=(tier or "").strip() or None,
+    )
+    launch_env = os.environ.copy()
+    if env:
+        launch_env.update(env)
+    cwd_path = Path(_interactive_target_cwd(target))
+
+    # Best-effort resonance lookup — interactive sessions do not swap the
+    # command (the user chose Claude or Codex explicitly), but we still
+    # record which tier they are running at so telemetry is honest.
+    resonance_tier = ""
+    try:
+        from resonance_map import resolve_tier_for_caller
+        user_default = ""
+        if isinstance(prefs, dict):
+            user_default = str(prefs.get("default_resonance") or "").strip()
+        # v6.0.2 — respect explicit ``tier`` override so personal/* callers
+        # can force a resonance without registering in the core map.
+        explicit_tier_arg = (tier or "").strip() or None
+        resonance_tier = resolve_tier_for_caller(
+            caller,
+            user_default=user_default or None,
+            explicit_tier=explicit_tier_arg,
+        )
+    except Exception:
+        resonance_tier = ""
+
+    # model / effort come from the pre-built command; we don't replay them
+    # here (build_interactive_client_command already embedded them).
+    row_id, _record_err = _record_automation_start(
+        caller=caller,
+        backend=resolved_client,
+        provider=_automation_provider_for_backend(resolved_client),
+        session_type=session_type,
+        task_profile="",
+        model="",
+        reasoning_effort="",
+        resonance_tier=resonance_tier,
+        cwd=cwd_path,
+        output_format="interactive",
+        prompt="",
+    )
+
+    started_wall = time.perf_counter()
+    try:
+        result = subprocess.run(cmd, env=launch_env, cwd=str(cwd_path))
+    finally:
+        duration_ms = int((time.perf_counter() - started_wall) * 1000)
+        try:
+            _record_automation_end(
+                row_id=row_id,
+                returncode=getattr(result, "returncode", -1)
+                if "result" in locals()
+                else -1,
+                duration_ms=duration_ms,
+                telemetry={},
+            )
+        except Exception:
+            pass
+    return result
+
+
+def build_followup_terminal_shell_command(
+    followup_reference: str,
+    *,
+    client: str | None = None,
+    preferences: dict | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    caller: str = "nexo_followup_terminal",
+    tier: str | None = None,
+) -> tuple[str, str]:
+    prefs = preferences or load_client_preferences()
+    selected = resolve_terminal_client(client, preferences=prefs)
+    resolved_model, resolved_effort = _resolve_interactive_model_and_effort(
+        caller, selected, preferences=prefs, tier=tier
+    )
+    prompt = f"NEXO: execute followup from file $(cat {followup_reference})"
+
+    if selected == CLIENT_CLAUDE_CODE:
+        claude_bin = _resolve_claude_cli()
+        if not claude_bin:
+            raise TerminalClientUnavailableError(
+                "Claude Code launcher not found in PATH. Install `claude` first."
+            )
+        cmd = [claude_bin]
+        if resolved_model:
+            cmd.extend(["--model", resolved_model])
+        if resolved_effort:
+            cmd.extend(["--effort", resolved_effort])
+        cmd.extend(["--dangerously-skip-permissions", prompt])
+        return selected, shlex.join(cmd)
+
+    if selected == CLIENT_CODEX:
+        codex_bin = _resolve_codex_cli()
+        if not codex_bin:
+            raise TerminalClientUnavailableError(
+                "Codex launcher not found in PATH. Install `codex` first or reconfigure NEXO."
+            )
+        target_cwd = str(Path(cwd).expanduser()) if cwd else str(Path.home())
+        cmd = [codex_bin, *_codex_interactive_launch_flags()]
+        if resolved_model:
+            cmd.extend(["-m", resolved_model])
+        if resolved_effort:
+            cmd.extend(["-c", f'model_reasoning_effort="{resolved_effort}"'])
+        cmd.extend(["-C", target_cwd, prompt])
+        return selected, shlex.join(cmd)
+
+    raise TerminalClientUnavailableError(f"Unsupported terminal client: {selected}")
+
+
+def _resolve_runtime_model_and_effort(
+    client: str,
+    *,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    preferences: dict | None = None,
+) -> tuple[str, str]:
+    profile = resolve_client_runtime_profile(client, preferences=preferences)
+    requested_model = str(model or "").strip()
+    requested_effort = str(reasoning_effort or "").strip().lower()
+
+    if client == CLIENT_CODEX:
+        if not requested_model or requested_model.lower() in CLAUDE_LEGACY_MODEL_HINTS:
+            requested_model = profile["model"]
+    elif client == CLIENT_CLAUDE_CODE:
+        if not requested_model or requested_model.lower() in CLAUDE_LEGACY_MODEL_HINTS:
+            requested_model = profile["model"]
+    elif not requested_model:
+        requested_model = profile["model"]
+
+    if not requested_effort:
+        requested_effort = profile["reasoning_effort"]
+
+    return requested_model, requested_effort
+
+
+def _backend_is_available(backend: str) -> bool:
+    if backend == CLIENT_CLAUDE_CODE:
+        return bool(_resolve_claude_cli())
+    if backend == CLIENT_CODEX:
+        return bool(_resolve_codex_cli())
+    return False
+
+
+def _resolve_available_backend(selected_backend: str, *, preferences: dict | None = None) -> str:
+    return selected_backend
+
+
+def _build_codex_prompt(
+    prompt: str,
+    *,
+    output_format: str = "",
+    append_system_prompt: str = "",
+    allowed_tools: str = "",
+    include_protocol_contract: bool = True,
+) -> str:
+    instructions: list[str] = []
+    if include_protocol_contract:
+        instructions.append(render_core_prompt("codex-protocol-contract"))
+    if append_system_prompt:
+        instructions.append(f"SYSTEM INSTRUCTIONS:\n{append_system_prompt}")
+    if output_format and output_format.lower() == "text":
+        instructions.append("FINAL RESPONSE FORMAT: plain text only.")
+    elif output_format:
+        instructions.append(f"FINAL RESPONSE FORMAT: {output_format}.")
+    if allowed_tools:
+        instructions.append(
+            "TOOLING SCOPE: Prefer to stay within capabilities equivalent to "
+            f"{allowed_tools} unless that would make the task fail."
+        )
+    if instructions:
+        return "\n\n".join([*instructions, prompt])
+    return prompt
+
+
+def _build_enforcement_system_prompt() -> str:
+    """Build a system prompt fragment from tool-enforcement-map.json for headless sessions.
+
+    Reads the map and generates concise enforcement rules that the model must follow.
+    Only includes 'must' and 'should' level tools — 'none' tools are omitted.
+    """
+    map_path = NEXO_HOME / "tool-enforcement-map.json"
+    if not map_path.exists():
+        for candidate in [
+            # .resolve() handles the $NEXO_HOME symlink -> core/ case.
+            Path(__file__).resolve().parent / "tool-enforcement-map.json",
+            Path(__file__).parent / "tool-enforcement-map.json",
+            Path(__file__).parent.parent / "tool-enforcement-map.json",
+        ]:
+            if candidate.exists():
+                map_path = candidate
+                break
+        else:
+            return ""
+    try:
+        data = json.loads(map_path.read_text())
+    except Exception:
+        return ""
+
+    lines = ["[PROTOCOL ENFORCEMENT — these rules are mandatory]"]
+    must_rules = []
+    should_rules = []
+
+    for tool_name, tool in data.get("tools", {}).items():
+        enf = tool.get("enforcement", {})
+        level = enf.get("level", "none")
+        if level == "none":
+            continue
+        rules = enf.get("rules", [])
+        rule_descs = [r.get("description", "") for r in rules if r.get("description")]
+        notes = enf.get("notes", "")
+        if rule_descs:
+            desc = f"{tool_name}: {'; '.join(rule_descs)}"
+        elif notes:
+            desc = f"{tool_name}: {notes[:120]}"
+        else:
+            rule_types = [r.get("type", "") for r in rules]
+            desc = f"{tool_name} ({', '.join(rule_types)})" if rule_types else tool_name
+        if level == "must":
+            must_rules.append(desc)
+        elif level == "should":
+            should_rules.append(desc)
+
+    if must_rules:
+        lines.append("MUST (violation creates protocol debt):")
+        for r in must_rules:
+            lines.append(f"  - {r}")
+    if should_rules:
+        lines.append("SHOULD (recommended, check if relevant):")
+        for r in should_rules:
+            lines.append(f"  - {r}")
+
+    return "\n".join(lines) if (must_rules or should_rules) else ""
+
+
+_ANTHROPIC_API_KEY_SEARCH_PATHS = (
+    Path.home() / ".claude" / "anthropic-api-key.txt",
+    paths.config_dir() / "anthropic-api-key.txt",
+)
+
+
+def _resolve_anthropic_api_key() -> str:
+    """Locate a legacy Anthropic API key for opt-in bare-mode invocations.
+
+    ``claude --bare`` skips macOS Keychain auth entirely, so the child
+    must find the API key in ``ANTHROPIC_API_KEY`` or via ``apiKeyHelper``.
+    Rather than forcing the operator to export the key in every shell, we
+    check the two conventional NEXO locations:
+
+        ~/.claude/anthropic-api-key.txt
+        ~/.nexo/config/anthropic-api-key.txt
+
+    Returns the trimmed key string, or "" if none is available. Callers
+    that want to run in bare mode must fall back to non-bare execution
+    when this returns empty.
+    """
+    env_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    for path in _ANTHROPIC_API_KEY_SEARCH_PATHS:
+        try:
+            if path.is_file():
+                key = path.read_text().strip()
+                if key:
+                    return key
+        except OSError:
+            continue
+    return ""
+
+
+def _allow_anthropic_api_key_bare_mode() -> bool:
+    value = os.environ.get("NEXO_ALLOW_ANTHROPIC_API_BARE", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+# v7.26 provider-runtime contract: Desktop-managed automation must use the
+# selected account runtime (Claude Code or Codex), not an Anthropic API key
+# side path. Bare mode remains a hidden legacy opt-in for controlled local
+# experiments only via NEXO_ALLOW_ANTHROPIC_API_BARE=1.
+BARE_MODE_SAFE_CALLERS: frozenset[str] = frozenset()
+
+# Execution contracts keep background agents disciplined without polluting
+# machine-only child calls that must return strict JSON.
+AUTOMATION_CONTRACT_FULL_NEXO_AGENT = "full_nexo_agent"
+AUTOMATION_CONTRACT_SUPERVISED_CHILD = "supervised_child"
+AUTOMATION_CONTRACT_STRICT_CHILD = "strict_child_json"
+AUTOMATION_CONTRACT_PUBLIC_CHILD = "public_isolated_child"
+AUTOMATION_CONTRACT_DEFAULT = AUTOMATION_CONTRACT_SUPERVISED_CHILD
+
+FULL_NEXO_AGENT_CALLERS: frozenset[str] = frozenset({
+    "catchup/morning",
+    "daily_self_audit",
+    "email_monitor",
+    "evolution/run",
+    "followup_runner",
+    "immune/scan",
+    "postmortem_consolidator",
+    "sleep/nightly",
+})
+
+STRICT_CHILD_CALLERS: frozenset[str] = frozenset({
+    "automation_probe",
+    "check_context",
+    "deep-sleep/extract",
+    "deep-sleep/synthesize",
+    "learning_validator",
+    "morning_agent",
+})
+
+PUBLIC_CHILD_CALLERS: frozenset[str] = frozenset()
+
+MACHINE_ONLY_LANGUAGE_CONTRACT_CALLERS: frozenset[str] = frozenset({
+    "automation_probe",
+    "check_context",
+    "learning_validator",
+})
+
+
+def _automation_contract_for_caller(caller: str) -> str:
+    clean = str(caller or "").strip()
+    if clean in FULL_NEXO_AGENT_CALLERS:
+        return AUTOMATION_CONTRACT_FULL_NEXO_AGENT
+    if clean in STRICT_CHILD_CALLERS:
+        return AUTOMATION_CONTRACT_STRICT_CHILD
+    if clean in PUBLIC_CHILD_CALLERS:
+        return AUTOMATION_CONTRACT_PUBLIC_CHILD
+    return AUTOMATION_CONTRACT_DEFAULT
+
+
+def _caller_uses_global_discipline(caller: str) -> bool:
+    return _automation_contract_for_caller(caller) == AUTOMATION_CONTRACT_FULL_NEXO_AGENT
+
+
+def _build_supervised_child_system_prompt() -> str:
+    return (
+        "You are running as a supervised NEXO automation child. "
+        "Return the requested result for this job only. Do not open or close "
+        "NEXO tasks, reminders, diary entries, sessions, or followups from "
+        "inside this child process; the parent NEXO runner owns lifecycle, "
+        "timeouts, evidence, retries, and durable state. If the requested "
+        "work cannot be completed safely, return a concise failure reason."
+    )
+
+
+def _should_apply_operator_language_contract(caller: str) -> bool:
+    clean = str(caller or "").strip()
+    if not clean:
+        return False
+    return clean not in MACHINE_ONLY_LANGUAGE_CONTRACT_CALLERS
+
+
+def _apply_operator_language_contract(prompt: str, *, caller: str) -> str:
+    if not _should_apply_operator_language_contract(caller):
+        return prompt
+    try:
+        from operator_language import append_operator_language_contract
+
+        return append_operator_language_contract(prompt)
+    except Exception:
+        return prompt
+
+
+def run_automation_prompt(
+    prompt: str,
+    *,
+    caller: str = "",
+    backend: str | None = None,
+    task_profile: str = "",
+    cwd: str | os.PathLike[str] | None = None,
+    env: dict | None = None,
+    model: str = "",
+    reasoning_effort: str = "",
+    tier: str = "",
+    timeout: int = 300,
+    output_format: str = "",
+    append_system_prompt: str = "",
+    allowed_tools: str = "",
+    extra_args: list[str] | tuple[str, ...] | None = None,
+    bare_mode: bool | None = None,
+) -> subprocess.CompletedProcess:
+    prefs = load_client_preferences()
+    selected_backend = backend or resolve_automation_backend(preferences=prefs)
+    if selected_backend == BACKEND_NONE:
+        raise AutomationBackendUnavailableError("Automation backend is disabled in config.")
+    selected_backend = _resolve_available_backend(selected_backend, preferences=prefs)
+    if not _backend_is_available(selected_backend):
+        cwd_path = Path(cwd).expanduser().resolve() if cwd else Path.cwd()
+        _record_backend_unavailable(
+            backend=selected_backend,
+            caller=caller,
+            cwd=cwd_path,
+            prompt=prompt,
+        )
+        raise AutomationBackendUnavailableError(
+            f"{selected_backend} automation backend selected but launcher is not installed; fallback blocked."
+        )
+
+    # Fase 1.6 — provider circuit breaker. "Installed" is not "available":
+    # with credits exhausted / rate limited / auth expired, every headless
+    # cron used to launch a session that died mid-flight, burned its retry
+    # budget and escalated to the operator per-item. The breaker fails fast
+    # with a queue-me signal instead; one probe per retry window re-tests.
+    from provider_circuit_breaker import raise_if_unavailable
+    raise_if_unavailable(selected_backend)
+
+    # Resonance map decides (model, effort) for every call. ``caller`` is
+    # MANDATORY — every script that invokes the automation backend must be
+    # registered in src/resonance_map.py so its reasoning budget is a
+    # deliberate choice rather than an accident of the global default.
+    #
+    # Explicit ``model`` or ``reasoning_effort`` arguments still override
+    # the mapped value (required for edge cases like the fallback JSON-
+    # conversion call inside extract.py that runs on a shorter budget).
+    from resonance_map import (
+        resolve_model_and_effort,
+        resolve_tier_for_caller,
+        UnregisteredCallerError,
+    )
+    if not caller:
+        raise UnregisteredCallerError(
+            "run_automation_prompt requires caller=. Register a new entry in "
+            "src/resonance_map.py under USER_FACING_CALLERS or "
+            "SYSTEM_OWNED_CALLERS and pass the id here."
+        )
+    user_default = ""
+    if isinstance(prefs, dict):
+        user_default = str(prefs.get("default_resonance") or "").strip()
+    # v6.0.2 — ``tier`` kwarg propagates to the resolver as ``explicit_tier``
+    # so personal/* callers can pin their reasoning budget per-invocation
+    # without editing the registry. Registered callers remain unchanged.
+    explicit_tier_arg = (tier or "").strip() or None
+    # This raises UnregisteredCallerError if caller is unknown — the
+    # same fail-closed rule we wanted. No silent fallback.
+    resonance_tier = resolve_tier_for_caller(
+        caller,
+        user_default=user_default or None,
+        explicit_tier=explicit_tier_arg,
+    )
+    mapped_model, mapped_effort = resolve_model_and_effort(
+        caller,
+        selected_backend,
+        user_default=user_default or None,
+        explicit_tier=explicit_tier_arg,
+    )
+    if mapped_model and not model:
+        model = mapped_model
+    if mapped_effort and not reasoning_effort:
+        reasoning_effort = mapped_effort
+
+    automation_contract = _automation_contract_for_caller(caller)
+    enforcement_fragment = _build_enforcement_system_prompt() if _caller_uses_global_discipline(caller) else ""
+    if enforcement_fragment:
+        if append_system_prompt:
+            append_system_prompt = append_system_prompt + "\n\n" + enforcement_fragment
+        else:
+            append_system_prompt = enforcement_fragment
+    elif automation_contract == AUTOMATION_CONTRACT_SUPERVISED_CHILD:
+        supervised_fragment = _build_supervised_child_system_prompt()
+        if append_system_prompt:
+            append_system_prompt = append_system_prompt + "\n\n" + supervised_fragment
+        else:
+            append_system_prompt = supervised_fragment
+
+    prompt = _apply_operator_language_contract(prompt, caller=caller)
+
+    cwd_path = Path(cwd).expanduser().resolve() if cwd else Path.cwd()
+    run_env = _headless_env(env)
+    extra_args = list(extra_args or [])
+    requested_output_format = output_format or "text"
+    resolved_model, resolved_effort = _resolve_runtime_model_and_effort(
+        selected_backend,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        preferences=prefs,
+    )
+    guard_result = _run_headless_runner_guard(
+        caller=caller,
+        cwd=cwd_path,
+        prompt=prompt,
+        allowed_tools=allowed_tools,
+    )
+    if guard_result.get("blocked"):
+        stderr = "NEXO runner guard blocked this automation before editing shared files.\n"
+        summary = str(guard_result.get("summary") or "").strip()
+        if summary:
+            stderr = _append_stderr(stderr, summary)
+        return subprocess.CompletedProcess(["nexo-runner-guard"], 2, "", stderr)
+    started_at = time.perf_counter()
+
+    if selected_backend == CLIENT_CLAUDE_CODE:
+        claude_bin = _resolve_claude_cli()
+        if not claude_bin:
+            raise AutomationBackendUnavailableError(
+                "Claude Code automation backend selected but `claude` is not installed."
+            )
+
+        # bare_mode: when the caller only needs the model (no MCP tool
+        # calls, no CLAUDE.md context, no plugins) we pass Claude CLI's
+        # --bare flag. That skips hooks, LSP, plugin sync, CLAUDE.md
+        # auto-discovery, keychain reads, and background prefetches —
+        # reducing the per-invocation overhead from ~9s to ~2s on 2.1.x.
+        # Concretely: deep-sleep/extract was running 57min on Session 1
+        # because each extract attempt inherited ~15KB of NEXO CLAUDE.md
+        # system prompt it did not need. With --bare that extraction
+        # completes in seconds.
+        #
+        # Selection rules:
+        #   - bare_mode=True explicit → allow only when the legacy API-key
+        #     escape hatch is enabled.
+        #   - bare_mode=None (default) + caller in BARE_MODE_SAFE_CALLERS
+        #     → auto-enable. v7.26 keeps this set empty for provider parity.
+        #   - bare_mode=False → never.
+        #   - --bare disables keychain auth, so the legacy path requires
+        #     ANTHROPIC_API_KEY. If disabled or missing, use normal account auth.
+        resolved_bare = False
+        if bare_mode is True:
+            resolved_bare = True
+        elif bare_mode is None and caller in BARE_MODE_SAFE_CALLERS:
+            resolved_bare = True
+
+        bare_api_key = ""
+        if resolved_bare:
+            if not _allow_anthropic_api_key_bare_mode():
+                resolved_bare = False
+            else:
+                bare_api_key = _resolve_anthropic_api_key()
+                if not bare_api_key:
+                    # Silent fallback: we would rather take the slower path
+                    # than force the caller to fail-closed on an env quirk.
+                    resolved_bare = False
+        # Headless claude -p does NOT reliably honour permissions.allow from
+        # settings.json for MCP tool calls — it can stall waiting for an
+        # approval that will never come in non-interactive mode. All NEXO
+        # headless automation (followup-runner, email-monitor, deep-sleep,
+        # etc.) therefore must pass --dangerously-skip-permissions explicitly
+        # so the process actually runs instead of zombying. Interactive
+        # sessions (`nexo chat`) never go through this code path and keep
+        # their normal approval prompts.
+        cmd = [claude_bin, "-p", prompt]
+        if resolved_bare:
+            cmd.append("--bare")
+            # Guarantee the child sees the API key regardless of how the
+            # parent's env was sanitized by _headless_env.
+            run_env = dict(run_env)
+            run_env["ANTHROPIC_API_KEY"] = bare_api_key
+        else:
+            run_env = dict(run_env)
+            run_env.pop("ANTHROPIC_API_KEY", None)
+            cmd.append("--dangerously-skip-permissions")
+        if resolved_model:
+            cmd.extend(["--model", resolved_model])
+        if resolved_effort:
+            cmd.extend(["--effort", resolved_effort])
+        cmd.extend(["--output-format", "json"])
+        if append_system_prompt:
+            cmd.extend(["--append-system-prompt", append_system_prompt])
+        if allowed_tools:
+            cmd.extend(["--allowedTools", allowed_tools])
+        cmd.extend(extra_args)
+        if _caller_uses_global_discipline(caller):
+            try:
+                import sys as _sys
+                if str(NEXO_HOME) not in _sys.path:
+                    _sys.path.insert(0, str(NEXO_HOME))
+                from enforcement_engine import run_with_enforcement
+                result = run_with_enforcement(
+                    cmd,
+                    prompt=prompt,
+                    cwd=str(cwd_path),
+                    env=run_env,
+                    timeout=timeout,
+                )
+            except ImportError:
+                result = subprocess.run(
+                    cmd,
+                    cwd=str(cwd_path),
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    env=run_env,
+                )
+        else:
+            result = subprocess.run(
+                cmd,
+                cwd=str(cwd_path),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=run_env,
+            )
+        final_stdout, telemetry = _extract_claude_telemetry(
+            result.stdout or "",
+            requested_output_format=requested_output_format,
+        )
+        telemetry["automation_contract"] = automation_contract
+        recorded, record_error = _record_automation_run(
+            backend=selected_backend,
+            provider=_automation_provider_for_backend(selected_backend),
+            task_profile=task_profile,
+            model=resolved_model,
+            reasoning_effort=resolved_effort,
+            cwd=cwd_path,
+            output_format=requested_output_format,
+            prompt=prompt,
+            returncode=result.returncode,
+            duration_ms=int((time.perf_counter() - started_at) * 1000),
+            telemetry=telemetry,
+            caller=caller,
+            session_type="headless",
+            resonance_tier=resonance_tier,
+        )
+        stderr = result.stderr or ""
+        if not recorded:
+            stderr = _append_stderr(stderr, record_error)
+        _record_provider_breaker_outcome(selected_backend, result.returncode, final_stdout, stderr)
+        return subprocess.CompletedProcess(
+            cmd,
+            result.returncode,
+            final_stdout,
+            stderr,
+        )
+
+    if selected_backend == CLIENT_CODEX:
+        codex_bin = _resolve_codex_cli()
+        if not codex_bin:
+            raise AutomationBackendUnavailableError(
+                "Codex automation backend selected but `codex` is not installed."
+            )
+        with tempfile.TemporaryDirectory(prefix="nexo-codex-") as tmpdir:
+            output_path = Path(tmpdir) / "last-message.txt"
+            cmd = [
+                codex_bin,
+                "exec",
+                "--skip-git-repo-check",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--ephemeral",
+                "--json",
+                "-C",
+                str(cwd_path),
+                "-o",
+                str(output_path),
+            ]
+            if resolved_model:
+                cmd.extend(["-m", resolved_model])
+            if resolved_effort:
+                cmd.extend(["-c", f'model_reasoning_effort="{resolved_effort}"'])
+            cmd.extend(extra_args)
+            cmd.append(
+                _build_codex_prompt(
+                    prompt,
+                    output_format=output_format,
+                    append_system_prompt=append_system_prompt,
+                    allowed_tools=allowed_tools,
+                    include_protocol_contract=_caller_uses_global_discipline(caller),
+                )
+            )
+            result = subprocess.run(
+                cmd,
+                cwd=str(cwd_path),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=run_env,
+            )
+            raw_stdout = result.stdout or ""
+            stdout = output_path.read_text() if output_path.exists() else raw_stdout
+            final_stdout, telemetry = _extract_codex_telemetry(
+                raw_stdout,
+                final_stdout=stdout,
+                model=resolved_model,
+            )
+            telemetry["automation_contract"] = automation_contract
+            recorded, record_error = _record_automation_run(
+                backend=selected_backend,
+                provider=_automation_provider_for_backend(selected_backend),
+                task_profile=task_profile,
+                model=resolved_model,
+                reasoning_effort=resolved_effort,
+                cwd=cwd_path,
+                output_format=requested_output_format,
+                prompt=prompt,
+                returncode=result.returncode,
+                duration_ms=int((time.perf_counter() - started_at) * 1000),
+                telemetry=telemetry,
+                caller=caller,
+                session_type="headless",
+                resonance_tier=resonance_tier,
+            )
+            stderr = result.stderr or ""
+            if not recorded:
+                stderr = _append_stderr(stderr, record_error)
+            _record_provider_breaker_outcome(selected_backend, result.returncode, final_stdout, stderr)
+            return subprocess.CompletedProcess(
+                cmd,
+                result.returncode,
+                final_stdout,
+                stderr,
+            )
+
+    raise AutomationBackendUnavailableError(f"Unsupported automation backend: {selected_backend}")
+
+
+def _record_provider_breaker_outcome(backend: str, returncode: int | None, stdout: str, stderr: str) -> None:
+    """Fase 1.6 — feed the circuit breaker after every headless session.
+
+    Success closes the breaker; classified failures (credits/rate-limit/auth)
+    open it immediately so the NEXT cron fails fast and queues instead of
+    launching another doomed session. Best-effort: breaker bookkeeping must
+    never mask the session result.
+    """
+    try:
+        from provider_circuit_breaker import classify_session_failure, record_session_outcome
+        reason = classify_session_failure(returncode, stdout or "", stderr or "")
+        record_session_outcome(backend, ok=(reason is None), reason=reason)
+    except Exception:
+        pass
+
+
+def probe_automation_backend(
+    *,
+    backend: str | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    timeout: int = 60,
+    caller: str = "automation_probe",
+) -> dict:
+    selected_backend = backend or resolve_automation_backend()
+    if selected_backend == BACKEND_NONE:
+        return {
+            "ok": False,
+            "backend": BACKEND_NONE,
+            "reason": "automation disabled in config",
+        }
+    try:
+        result = run_automation_prompt(
+            render_core_prompt("automation-backend-probe"),
+            backend=selected_backend,
+            cwd=cwd,
+            timeout=timeout,
+            output_format="text",
+            caller=caller,
+        )
+    except AutomationBackendUnavailableError as exc:
+        return {
+            "ok": False,
+            "backend": selected_backend,
+            "reason": str(exc),
+        }
+    output = (result.stdout or "").strip()
+    return {
+        "ok": result.returncode == 0 and "OK" in output,
+        "backend": selected_backend,
+        "returncode": result.returncode,
+        "stdout": output,
+        "stderr": (result.stderr or "").strip(),
+    }

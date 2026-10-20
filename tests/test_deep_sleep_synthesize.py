@@ -1,0 +1,184 @@
+"""Regression tests for Deep Sleep synthesis fallbacks."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SYNTHESIZE_PATH = ROOT / "src" / "scripts" / "deep-sleep" / "synthesize.py"
+
+
+def _load_module():
+    spec = importlib.util.spec_from_file_location("test_deep_sleep_synthesize_module", SYNTHESIZE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_synthesize_uses_shared_headless_timeout():
+    module = _load_module()
+    from constants import AUTOMATION_SUBPROCESS_TIMEOUT
+
+    assert module.CLAUDE_TIMEOUT == AUTOMATION_SUBPROCESS_TIMEOUT
+    assert module.CLAUDE_TIMEOUT == 10800
+
+
+def test_synthesize_accepts_nested_direct_write(monkeypatch, tmp_path):
+    module = _load_module()
+
+    deep_sleep_dir = tmp_path / "operations" / "deep-sleep"
+    run_dir = deep_sleep_dir / "2026-04-05"
+    run_dir.mkdir(parents=True)
+
+    (deep_sleep_dir / "2026-04-05-extractions.json").write_text(
+        json.dumps({"total_findings": 3, "sessions_analyzed": 2}),
+        encoding="utf-8",
+    )
+    (deep_sleep_dir / "2026-04-05-context.txt").write_text("context", encoding="utf-8")
+    (run_dir / "long-horizon-context.json").write_text("{}", encoding="utf-8")
+
+    nested_output = {
+        "date": "2026-04-05",
+        "actions": [{"type": "learning_add", "text": "Recovered from nested synthesis path"}],
+        "cross_session_patterns": [],
+        "morning_agenda": [],
+        "context_packets": [],
+        "summary": "ok",
+    }
+    (run_dir / "synthesis.json").write_text(json.dumps(nested_output), encoding="utf-8")
+
+    monkeypatch.setattr(module, "DEEP_SLEEP_DIR", deep_sleep_dir)
+    monkeypatch.setattr(module, "collect_skill_runtime_candidates", lambda _date: (run_dir / "runtime.json", {"scriptable": [], "improvements": []}))
+    monkeypatch.setattr(
+        module,
+        "run_automation_prompt",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="Síntesis completada y escrita en `/tmp/fake/synthesis.json`.\n\nResumen en texto, no JSON.",
+            stderr="",
+        ),
+    )
+
+    monkeypatch.setattr(sys, "argv", ["synthesize.py", "2026-04-05"])
+    module.main()
+
+    output_file = deep_sleep_dir / "2026-04-05-synthesis.json"
+    assert output_file.exists()
+    payload = json.loads(output_file.read_text(encoding="utf-8"))
+    assert payload["actions"][0]["text"] == "Recovered from nested synthesis path"
+
+
+def test_backfill_engineering_actions_reports_product_gap_for_scripts():
+    module = _load_module()
+    payload = {
+        "date": "2026-04-05",
+        "cross_session_patterns": [
+            {
+                "pattern": "Releases often need a same-day hotfix",
+                "sessions": ["one", "two"],
+                "severity": "high",
+                "evidence": [{"type": "transcript", "quote": "hotfix again"}],
+                "proposed_fix": {
+                    "title": "Add pre-release validation script",
+                    "description": "Add a pre-release validation script that runs doctor, parity, tests, and publish checks before cutting a release.",
+                    "deliverable": "script",
+                    "confidence": 0.91,
+                },
+            }
+        ],
+        "actions": [],
+    }
+
+    result = module.backfill_engineering_actions(payload)
+
+    assert len(result["actions"]) == 1
+    action = result["actions"][0]
+    assert action["action_type"] == "product_gap_report"
+    assert action["action_class"] == "auto_apply"
+    assert action["content"]["description"].startswith("Add a pre-release validation script")
+    assert action["content"]["deliverable"] == "script"
+    assert action["content"]["sessions_count"] == 2
+    assert action["content"]["evidence_count"] == 1
+    assert action["dedupe_key"].startswith("product-gap:")
+
+
+def test_backfill_engineering_actions_keeps_manual_checklist_as_followup():
+    module = _load_module()
+    payload = {
+        "date": "2026-04-05",
+        "cross_session_patterns": [
+            {
+                "pattern": "Release notes often miss verification",
+                "sessions": ["one", "two"],
+                "severity": "medium",
+                "evidence": [{"type": "transcript", "quote": "missing checks"}],
+                "proposed_fix": {
+                    "title": "Review release checklist",
+                    "description": "Review the release checklist with explicit validation evidence.",
+                    "deliverable": "checklist",
+                    "confidence": 0.8,
+                },
+            }
+        ],
+        "actions": [],
+    }
+
+    result = module.backfill_engineering_actions(payload)
+
+    assert len(result["actions"]) == 1
+    action = result["actions"][0]
+    assert action["action_type"] == "followup_create"
+    assert action["action_class"] == "draft_for_morning"
+    assert action["dedupe_key"].startswith("engineering-fix:")
+
+
+def test_write_agent_start_packet_compacts_synthesis(monkeypatch, tmp_path):
+    module = _load_module()
+    deep_sleep_dir = tmp_path / "operations" / "deep-sleep"
+    deep_sleep_dir.mkdir(parents=True)
+    monkeypatch.setattr(module, "DEEP_SLEEP_DIR", deep_sleep_dir)
+
+    payload = {
+        "date": "2026-06-03",
+        "summary": "Continue the release without touching runtime core.",
+        "morning_agenda": [
+            {"priority": "P0", "title": "Run release gates", "description": "Verify package readiness."}
+        ],
+        "context_packets": [
+            {
+                "topic": "Deep Sleep",
+                "last_state": "P0 fixed; P1 pending.",
+                "key_files": ["src/scripts/nexo-sleep.py"],
+            }
+        ],
+        "actions": [
+            {
+                "action_type": "followup_create",
+                "action_class": "draft_for_morning",
+                "impact": "high",
+                "confidence": 0.76,
+                "content": {"title": "Decide release scope."},
+            }
+        ],
+    }
+
+    packet_file = module.write_agent_start_packet(payload, "2026-06-03")
+
+    packet = json.loads(packet_file.read_text(encoding="utf-8"))
+    assert packet["date"] == "2026-06-03"
+    assert packet["summary"].startswith("Continue the release")
+    assert packet["agenda"][0]["title"] == "Run release gates"
+    assert packet["context_packets"][0]["topic"] == "Deep Sleep"
+    assert packet["review_items"][0]["title"] == "Decide release scope."
+    assert packet["counts"] == {
+        "actions": 1,
+        "agenda": 1,
+        "context_packets": 1,
+        "review_items": 1,
+    }

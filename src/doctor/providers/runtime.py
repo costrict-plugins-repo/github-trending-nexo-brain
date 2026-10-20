@@ -1,0 +1,4348 @@
+"""Runtime tier checks — read-only health checks from existing artifacts. Target <5s."""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import paths
+import platform
+import plistlib
+import re
+import shlex
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    import tomli as tomllib
+
+from client_preferences import (
+    detect_installed_clients,
+    normalize_client_preferences,
+    resolve_client_runtime_profile,
+)
+from claude_cli import (
+    desktop_product_requested as _desktop_product_requested,
+    managed_claude_binary as _managed_claude_binary,
+    managed_claude_prefix as _managed_claude_prefix,
+)
+from cron_recovery import is_cron_enabled, resolve_declared_schedule, should_run_at_load
+from doctor.models import DoctorCheck, safe_check
+from runtime_power import reload_launchagent_plist
+
+NEXO_HOME = Path(os.environ.get("NEXO_HOME", str(Path.home() / ".nexo")))
+NEXO_CODE = Path(os.environ.get("NEXO_CODE", str(Path(__file__).resolve().parents[2])))
+LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
+PROTECTED_MACOS_ROOTS = (
+    Path.home() / "Documents",
+    Path.home() / "Desktop",
+    Path.home() / "Downloads",
+    Path.home() / "Library" / "Mobile Documents",
+)
+
+# Freshness thresholds in seconds
+IMMUNE_FRESHNESS = 3600  # 1 hour (runs every 30 min)
+WATCHDOG_FRESHNESS = 3600  # 1 hour (runs every 30 min)
+RUNNER_HEALTH_FRESHNESS = 43200  # 12 hours (runner-health-check runs every 6h)
+DEFAULT_CRON_THRESHOLD = 7200  # Fallback when manifest data is unavailable
+LIVE_PROTOCOL_SESSION_FRESHNESS = 1800  # 30 minutes
+AUTOMATION_TELEMETRY_USAGE_WARN_COVERAGE = 99.0
+SPECIAL_ENV_NORMALIZE_IDS = {"prevent-sleep", "tcc-approve"}
+OPTIONALS_FILE = paths.config_dir() / "optionals.json"
+SCHEDULE_FILE = paths.config_dir() / "schedule.json"
+PACKAGE_JSON = NEXO_CODE / "package.json"
+CHANGELOG_FILE = NEXO_CODE / "CHANGELOG.md"
+CORE_AUTOMATION_CALLERS_BY_CRON = {
+    "catchup": ("catchup/morning",),
+    "deep-sleep": ("deep-sleep/extract", "deep-sleep/synthesize"),
+    "email-monitor": ("email_monitor",),
+    "evolution": ("evolution/run",),
+    "followup-runner": ("followup_runner",),
+    "morning-agent": ("morning_agent",),
+    "sleep": ("sleep/nightly",),
+}
+REPAIR_BASELINE_FILE = "last-repair-baseline.json"
+
+
+def _post_update_repair_baseline_epoch() -> float:
+    path = paths.operations_dir() / REPAIR_BASELINE_FILE
+    if not path.is_file():
+        return 0.0
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return 0.0
+    if not isinstance(payload, dict):
+        return 0.0
+    for key in ("last_repair_epoch", "timestamp_epoch"):
+        try:
+            value = float(payload.get(key) or 0)
+        except Exception:
+            value = 0.0
+        if value > 0:
+            return value
+    raw_iso = str(payload.get("last_repair_at") or payload.get("timestamp") or "").strip()
+    if not raw_iso:
+        return 0.0
+    try:
+        parsed = dt.datetime.fromisoformat(raw_iso.replace("Z", "+00:00"))
+    except Exception:
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.timestamp()
+
+
+def _history_cutoff_epoch(*, days: int) -> float:
+    return max(time.time() - (days * 86400), _post_update_repair_baseline_epoch())
+
+
+def _history_baseline_sqlite() -> str:
+    epoch = _post_update_repair_baseline_epoch()
+    if epoch <= 0:
+        return ""
+    return dt.datetime.fromtimestamp(epoch, tz=dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _evolution_objective_payload() -> dict:
+    candidates = [
+        NEXO_HOME / "brain" / "evolution-objective.json",
+        NEXO_HOME / "cortex" / "evolution-objective.json",
+    ]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text())
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return {}
+
+
+def _is_evolution_disabled() -> bool:
+    payload = _evolution_objective_payload()
+    return payload.get("evolution_enabled") is False
+
+
+def _expected_runtime_code_dir() -> Path:
+    packaged = NEXO_HOME / "core"
+    if packaged.exists() or not (NEXO_HOME / "server.py").is_file():
+        return packaged
+    return NEXO_HOME
+
+
+def _recorded_source_root() -> Path | None:
+    version_file = NEXO_HOME / "version.json"
+    try:
+        payload = json.loads(version_file.read_text())
+    except Exception:
+        return None
+    source = payload.get("source")
+    if not source:
+        return None
+    candidate = Path(str(source)).expanduser()
+    if (candidate / "package.json").is_file() and (candidate / "CHANGELOG.md").is_file():
+        return candidate
+    return None
+
+
+def _release_root() -> Path:
+    source_root = _recorded_source_root()
+    candidates = [
+        source_root,
+        PACKAGE_JSON.parent,
+        CHANGELOG_FILE.parent,
+        NEXO_CODE,
+        NEXO_CODE.parent,
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate = Path(candidate)
+        if (candidate / "package.json").is_file() and (candidate / "CHANGELOG.md").is_file():
+            return candidate
+    return Path(NEXO_CODE)
+
+
+def _has_release_publish_context(release_root: Path) -> bool:
+    git_dir = release_root / ".git"
+    if git_dir.exists() or git_dir.is_file():
+        return True
+    if _recorded_source_root() is not None:
+        return True
+    try:
+        release_root_resolved = release_root.resolve()
+        nexo_home_resolved = NEXO_HOME.resolve()
+    except Exception:
+        release_root_resolved = release_root
+        nexo_home_resolved = NEXO_HOME
+    if release_root_resolved == nexo_home_resolved:
+        return False
+    has_release_files = (
+        (release_root / "package.json").is_file()
+        and (release_root / "CHANGELOG.md").is_file()
+        and (release_root / "scripts" / "sync_release_artifacts.py").is_file()
+    )
+    return has_release_files
+
+
+def _package_json_path() -> Path:
+    if PACKAGE_JSON.is_file():
+        return PACKAGE_JSON
+    return _release_root() / "package.json"
+
+
+def _changelog_path() -> Path:
+    if CHANGELOG_FILE.is_file():
+        return CHANGELOG_FILE
+    return _release_root() / "CHANGELOG.md"
+
+
+def _codex_bootstrap_config_status() -> dict:
+    path = Path.home() / ".codex" / "config.toml"
+    if not path.is_file():
+        return {"exists": False, "path": str(path), "bootstrap_managed": False}
+    try:
+        payload = tomllib.loads(path.read_text())
+    except Exception as exc:
+        return {
+            "exists": True,
+            "path": str(path),
+            "bootstrap_managed": False,
+            "error": str(exc),
+        }
+    managed = bool(payload.get("nexo", {}).get("codex", {}).get("bootstrap_managed"))
+    mcp_managed = bool(payload.get("nexo", {}).get("codex", {}).get("mcp_managed"))
+    initial_messages = payload.get("initial_messages", [])
+    has_initial_messages = bool(initial_messages)
+    mcp_server = payload.get("mcp_servers", {}).get("nexo", {})
+    return {
+        "exists": True,
+        "path": str(path),
+        "bootstrap_managed": managed,
+        "mcp_managed": mcp_managed,
+        "has_initial_messages": has_initial_messages,
+        "model": str(payload.get("model", "") or ""),
+        "reasoning_effort": str(payload.get("model_reasoning_effort", "") or ""),
+        "has_mcp_server": isinstance(mcp_server, dict) and bool(mcp_server.get("command")) and bool(mcp_server.get("args")),
+        "mcp_runtime_home": str((mcp_server.get("env") or {}).get("NEXO_HOME", "") or ""),
+        "mcp_runtime_root": str((mcp_server.get("env") or {}).get("NEXO_CODE", "") or ""),
+    }
+
+
+def _codex_hooks_config_status() -> dict:
+    path = Path.home() / ".codex" / "hooks.json"
+    if not path.is_file():
+        return {
+            "exists": False,
+            "path": str(path),
+            "pretool_managed": False,
+            "pretool_command": "",
+        }
+    try:
+        payload = json.loads(path.read_text())
+    except Exception as exc:
+        return {
+            "exists": True,
+            "path": str(path),
+            "pretool_managed": False,
+            "pretool_command": "",
+            "error": str(exc),
+        }
+    hooks = payload.get("hooks") if isinstance(payload, dict) else {}
+    pretool = hooks.get("PreToolUse") if isinstance(hooks, dict) else []
+    for section in pretool or []:
+        if not isinstance(section, dict):
+            continue
+        matcher = str(section.get("matcher") or "")
+        for hook in section.get("hooks") or []:
+            if not isinstance(hook, dict):
+                continue
+            command = str(hook.get("command") or "")
+            if "pre_tool_use.py" not in command:
+                continue
+            return {
+                "exists": True,
+                "path": str(path),
+                "pretool_managed": True,
+                "pretool_command": command,
+                "pretool_matcher": matcher,
+            }
+    return {
+        "exists": True,
+        "path": str(path),
+        "pretool_managed": False,
+        "pretool_command": "",
+    }
+
+
+def _claude_desktop_shared_brain_status() -> dict:
+    path = Path.home() / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
+    if not path.is_file():
+        return {"exists": False, "path": str(path), "shared_brain_managed": False}
+    try:
+        payload = json.loads(path.read_text())
+    except Exception as exc:
+        return {
+            "exists": True,
+            "path": str(path),
+            "shared_brain_managed": False,
+            "error": str(exc),
+        }
+    mcp_server = (payload.get("mcpServers") or {}).get("nexo", {})
+    metadata = ((payload.get("nexo") or {}).get("claude_desktop") or {})
+    return {
+        "exists": True,
+        "path": str(path),
+        "has_mcp_server": isinstance(mcp_server, dict) and bool(mcp_server.get("command")) and bool(mcp_server.get("args")),
+        "shared_brain_managed": bool(metadata.get("shared_brain_managed")),
+        "shared_brain_mode": str(metadata.get("shared_brain_mode", "") or ""),
+        "managed_runtime_home": str(metadata.get("managed_runtime_home", "") or ""),
+        "managed_runtime_root": str(metadata.get("managed_runtime_root", "") or ""),
+    }
+
+
+def _recent_codex_session_parity_status(*, days: int = 7, max_files: int = 24) -> dict:
+    roots = [
+        Path.home() / ".codex" / "sessions",
+        Path.home() / ".codex" / "archived_sessions",
+    ]
+    cutoff = _history_cutoff_epoch(days=days)
+    candidates: list[tuple[float, Path]] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in root.rglob("*.jsonl"):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime >= cutoff:
+                candidates.append((mtime, path))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    files = [path for _, path in candidates[:max_files]]
+
+    status = {
+        "files": len(files),
+        "history_baseline_epoch": _post_update_repair_baseline_epoch(),
+        "bootstrap_sessions": 0,
+        "startup_sessions": 0,
+        "heartbeat_sessions": 0,
+        "zero_tool_bootstrap_sessions": 0,
+        "origins": set(),
+        "samples": [],
+    }
+    for path in files:
+        saw_bootstrap = False
+        saw_startup = False
+        saw_heartbeat = False
+        tool_call_count = 0
+        origin = ""
+        try:
+            with path.open() as fh:
+                for raw in fh:
+                    if (
+                        not saw_bootstrap
+                        and (
+                            "NEXO Shared Brain for Codex" in raw
+                            or "<!-- nexo-codex-agents-version:" in raw
+                            or "You are NEXO" in raw
+                        )
+                    ):
+                        saw_bootstrap = True
+                    try:
+                        event = json.loads(raw)
+                    except Exception:
+                        continue
+                    payload = event.get("payload", {})
+                    if event.get("type") == "session_meta" and isinstance(payload, dict):
+                        origin = str(payload.get("originator", "") or payload.get("source", "") or "")
+                    if event.get("type") != "response_item" or not isinstance(payload, dict):
+                        continue
+                    if payload.get("type") != "function_call":
+                        continue
+                    tool_call_count += 1
+                    name = str(payload.get("name", "") or "")
+                    if name in {"mcp__nexo__nexo_startup", "nexo_startup"}:
+                        saw_startup = True
+                    elif name in {"mcp__nexo__nexo_heartbeat", "nexo_heartbeat"}:
+                        saw_heartbeat = True
+                    if saw_bootstrap and saw_startup and saw_heartbeat and origin:
+                        break
+        except Exception:
+            continue
+        if origin:
+            status["origins"].add(origin)
+        if saw_bootstrap:
+            status["bootstrap_sessions"] += 1
+        if saw_startup:
+            status["startup_sessions"] += 1
+        if saw_heartbeat:
+            status["heartbeat_sessions"] += 1
+        if saw_bootstrap and tool_call_count == 0:
+            status["zero_tool_bootstrap_sessions"] += 1
+        status["samples"].append(
+            {
+                "file": str(path),
+                "bootstrap": saw_bootstrap,
+                "startup": saw_startup,
+                "heartbeat": saw_heartbeat,
+                "tool_call_count": tool_call_count,
+                "zero_tool_bootstrap": bool(saw_bootstrap and tool_call_count == 0),
+                "origin": origin,
+            }
+        )
+    status["origins"] = sorted(status["origins"])
+    return status
+
+
+def _normalize_path_token(value: str) -> str:
+    return str(value or "").replace("\\", "/").rstrip("/").lower()
+
+
+def _split_applies_to(applies_to: str) -> list[str]:
+    return [item.strip() for item in str(applies_to or "").split(",") if item.strip()]
+
+
+def _applies_to_matches_file(applies_to: str, filepath: str) -> bool:
+    file_path = Path(filepath)
+    file_norm = _normalize_path_token(str(file_path))
+    parent_norm = _normalize_path_token(str(file_path.parent))
+    filename = file_path.name.lower()
+    stem = file_path.stem.lower()
+    parent_name = file_path.parent.name.lower()
+
+    for raw in _split_applies_to(applies_to):
+        token_norm = _normalize_path_token(raw)
+        if not token_norm:
+            continue
+        if "/" in token_norm:
+            if (
+                file_norm == token_norm
+                or file_norm.endswith(f"/{token_norm}")
+                or file_norm.startswith(f"{token_norm}/")
+                or parent_norm == token_norm
+                or parent_norm.endswith(f"/{token_norm}")
+            ):
+                return True
+            continue
+        if token_norm in {filename, stem, parent_name}:
+            return True
+    return False
+
+
+def _parse_jsonish_arguments(arguments) -> dict:
+    if isinstance(arguments, dict):
+        return arguments
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _resolve_candidate_path(token: str, cwd: str) -> str:
+    token = str(token or "").strip()
+    if not token:
+        return ""
+    if token.startswith("~"):
+        token = str(Path(token).expanduser())
+    path = Path(token)
+    if not path.is_absolute():
+        if not cwd.strip():
+            return ""
+        path = Path(cwd).expanduser() / path
+    return str(path.resolve())
+
+
+def _extract_shell_file_candidates(command: str, cwd: str) -> list[str]:
+    if not command.strip():
+        return []
+    try:
+        tokens = shlex.split(command)
+    except Exception:
+        tokens = command.split()
+
+    candidates: list[str] = []
+    seen = set()
+    shell_noise = {"&&", "||", "|", ";", ">", ">>", "<", "<<<"}
+    suffixes = {
+        ".py", ".md", ".json", ".jsonl", ".sh", ".txt", ".toml", ".yaml", ".yml",
+        ".js", ".ts", ".tsx", ".jsx", ".php", ".sql", ".rs", ".go", ".c", ".cpp",
+        ".h", ".css", ".html",
+    }
+    for token in tokens:
+        if token in shell_noise or token.startswith("-"):
+            continue
+        if not token.startswith(("/", "~", ".")) and "/" not in token and Path(token).suffix.lower() not in suffixes:
+            continue
+        resolved = _resolve_candidate_path(token, cwd)
+        normalized = _normalize_path_token(resolved)
+        if resolved and normalized not in seen:
+            seen.add(normalized)
+            candidates.append(resolved)
+    return candidates
+
+
+def _classify_shell_operation(command: str) -> str:
+    if not command.strip():
+        return "read"
+    try:
+        tokens = shlex.split(command)
+    except Exception:
+        tokens = command.split()
+    if not tokens:
+        return "read"
+    base = Path(tokens[0]).name.lower()
+    if base in {"rm", "unlink", "rmdir"}:
+        return "delete"
+    if base in {"mv", "cp", "touch", "install"}:
+        return "write"
+    if base == "sed" and "-i" in tokens:
+        return "write"
+    if base == "perl" and any(token == "-i" or token.startswith("-i") for token in tokens[1:]):
+        return "write"
+    return "read"
+
+
+def _extract_shell_file_touches(command: str, cwd: str) -> list[tuple[str, str]]:
+    operation = _classify_shell_operation(command)
+    return [(candidate, operation) for candidate in _extract_shell_file_candidates(command, cwd)]
+
+
+def _extract_apply_patch_targets(patch_text: str, cwd: str) -> list[tuple[str, str]]:
+    targets: list[tuple[str, str]] = []
+    seen = set()
+    for raw_line in str(patch_text or "").splitlines():
+        line = raw_line.strip()
+        prefix = None
+        operation = "write"
+        if line.startswith("*** Update File: "):
+            prefix = "*** Update File: "
+        elif line.startswith("*** Add File: "):
+            prefix = "*** Add File: "
+        elif line.startswith("*** Delete File: "):
+            prefix = "*** Delete File: "
+            operation = "delete"
+        if not prefix:
+            continue
+        resolved = _resolve_candidate_path(line[len(prefix):].strip(), cwd)
+        normalized = _normalize_path_token(resolved)
+        if resolved and normalized not in seen:
+            seen.add(normalized)
+            targets.append((resolved, operation))
+    return targets
+
+
+def _extract_declared_file_targets(args: dict, cwd: str) -> set[str]:
+    raw_items: list[str] = []
+    for key in ("files", "paths", "file_paths"):
+        value = args.get(key)
+        if isinstance(value, str):
+            raw_items.extend(part.strip() for part in value.split(",") if part.strip())
+        elif isinstance(value, list):
+            raw_items.extend(str(item).strip() for item in value if str(item).strip())
+    for key in ("file_path", "path"):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            raw_items.append(value.strip())
+    resolved = set()
+    for item in raw_items:
+        candidate = _resolve_candidate_path(item, cwd)
+        if candidate:
+            resolved.add(_normalize_path_token(candidate))
+    return resolved
+
+
+_CODEX_BOOTSTRAP_READ_EXEMPT_FILENAMES = {"calibration.json", "project-atlas.json"}
+
+
+def _is_codex_bootstrap_runtime_read_exempt(
+    touched: str,
+    operation: str,
+    bootstrap_context_phase: bool,
+) -> bool:
+    if not bootstrap_context_phase or operation != "read":
+        return False
+    normalized = _normalize_path_token(touched)
+    if Path(normalized).name not in _CODEX_BOOTSTRAP_READ_EXEMPT_FILENAMES:
+        return False
+    return "/.nexo/" in normalized
+
+
+def _load_active_conditioned_learnings() -> list[dict]:
+    db_path = paths.db_path()
+    if not db_path.is_file():
+        return []
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(str(db_path), timeout=2)
+        try:
+            conn.row_factory = sqlite3.Row
+            table = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='learnings'"
+            ).fetchone()
+            if not table:
+                return []
+            rows = conn.execute(
+                """SELECT id, title, applies_to
+                   FROM learnings
+                   WHERE status = 'active' AND COALESCE(applies_to, '') != ''
+                   ORDER BY updated_at DESC, id DESC"""
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+    except Exception:
+        return []
+
+
+def _recent_codex_conditioned_file_discipline_status(*, days: int = 7, max_files: int = 24) -> dict:
+    conditioned = _load_active_conditioned_learnings()
+    status = {
+        "files": 0,
+        "conditioned_rules": len(conditioned),
+        "conditioned_sessions": 0,
+        "conditioned_touches": 0,
+        "read_without_protocol": 0,
+        "write_without_protocol": 0,
+        "write_without_guard_ack": 0,
+        "delete_without_protocol": 0,
+        "delete_without_guard_ack": 0,
+        "latest_violation_age_seconds": None,
+        "samples": [],
+    }
+    if not conditioned:
+        return status
+
+    roots = [
+        Path.home() / ".codex" / "sessions",
+        Path.home() / ".codex" / "archived_sessions",
+    ]
+    cutoff = _history_cutoff_epoch(days=days)
+    candidates: list[tuple[float, Path]] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in root.rglob("*.jsonl"):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime >= cutoff:
+                candidates.append((mtime, path))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    files = candidates[:max_files]
+    status["files"] = len(files)
+    status["history_baseline_epoch"] = _post_update_repair_baseline_epoch()
+
+    for file_mtime, path in files:
+        cwd = ""
+        protocol_active = False
+        protocol_files: set[str] = set()
+        guard_files: set[str] = set()
+        guard_ack = False
+        bootstrap_context_phase = True
+        session_touches = 0
+        session_samples: list[dict] = []
+
+        try:
+            with path.open() as fh:
+                for raw in fh:
+                    try:
+                        event = json.loads(raw)
+                    except Exception:
+                        continue
+                    event_age_seconds = None
+                    event_ts = _parse_timestamp(str(event.get("timestamp", "") or ""))
+                    if event_ts is not None:
+                        event_age_seconds = max(0.0, time.time() - event_ts.timestamp())
+                    payload = event.get("payload", {})
+                    if event.get("type") == "session_meta" and isinstance(payload, dict):
+                        cwd = str(payload.get("cwd", "") or "")
+                        continue
+                    if event.get("type") != "response_item" or not isinstance(payload, dict):
+                        continue
+                    if payload.get("type") != "function_call":
+                        continue
+
+                    name = str(payload.get("name", "") or "")
+                    args = _parse_jsonish_arguments(payload.get("arguments"))
+
+                    if name in {"mcp__nexo__nexo_startup", "nexo_startup"}:
+                        continue
+                    if name in {"mcp__nexo__nexo_task_open", "nexo_task_open"}:
+                        bootstrap_context_phase = False
+                        protocol_active = True
+                        protocol_files.update(_extract_declared_file_targets(args, cwd))
+                        continue
+                    if name in {
+                        "mcp__nexo__nexo_guard_check",
+                        "nexo_guard_check",
+                        "mcp__nexo__nexo_guard_file_check",
+                        "nexo_guard_file_check",
+                    }:
+                        bootstrap_context_phase = False
+                        guard_files.update(_extract_declared_file_targets(args, cwd))
+                        continue
+                    if name in {"mcp__nexo__nexo_task_acknowledge_guard", "nexo_task_acknowledge_guard"}:
+                        guard_ack = True
+                        continue
+
+                    touched_files: list[tuple[str, str]] = []
+                    if name in {"exec_command", "functions.exec_command"}:
+                        touched_files = _extract_shell_file_touches(str(args.get("cmd", "") or ""), cwd)
+                    elif name in {"apply_patch", "functions.apply_patch"}:
+                        patch_text = payload.get("arguments", "")
+                        touched_files = _extract_apply_patch_targets(str(patch_text or ""), cwd)
+
+                    if not touched_files:
+                        continue
+
+                    for touched, operation in touched_files:
+                        if _is_codex_bootstrap_runtime_read_exempt(
+                            touched,
+                            operation,
+                            bootstrap_context_phase,
+                        ):
+                            continue
+                        matches = [row for row in conditioned if _applies_to_matches_file(str(row.get("applies_to", "")), touched)]
+                        if not matches:
+                            continue
+                        session_touches += 1
+                        status["conditioned_touches"] += 1
+                        normalized = _normalize_path_token(touched)
+                        has_protocol = protocol_active or normalized in protocol_files
+                        has_guard_review = normalized in guard_files
+                        if operation == "read":
+                            if not has_protocol and not has_guard_review:
+                                status["read_without_protocol"] += 1
+                                age_seconds = (
+                                    event_age_seconds
+                                    if event_age_seconds is not None
+                                    else max(0.0, time.time() - float(file_mtime))
+                                )
+                                current_latest = status.get("latest_violation_age_seconds")
+                                if current_latest is None or age_seconds < float(current_latest):
+                                    status["latest_violation_age_seconds"] = round(age_seconds, 1)
+                                session_samples.append(
+                                    {"kind": "read_without_protocol", "file": touched, "tool": name}
+                                )
+                        elif operation in {"write", "delete"}:
+                            if not has_protocol and not has_guard_review:
+                                status["write_without_protocol"] += 1
+                                if operation == "delete":
+                                    status["delete_without_protocol"] += 1
+                                age_seconds = (
+                                    event_age_seconds
+                                    if event_age_seconds is not None
+                                    else max(0.0, time.time() - float(file_mtime))
+                                )
+                                current_latest = status.get("latest_violation_age_seconds")
+                                if current_latest is None or age_seconds < float(current_latest):
+                                    status["latest_violation_age_seconds"] = round(age_seconds, 1)
+                                session_samples.append(
+                                    {
+                                        "kind": f"{operation}_without_protocol",
+                                        "file": touched,
+                                        "tool": name,
+                                    }
+                                )
+                            elif not guard_ack:
+                                status["write_without_guard_ack"] += 1
+                                if operation == "delete":
+                                    status["delete_without_guard_ack"] += 1
+                                age_seconds = (
+                                    event_age_seconds
+                                    if event_age_seconds is not None
+                                    else max(0.0, time.time() - float(file_mtime))
+                                )
+                                current_latest = status.get("latest_violation_age_seconds")
+                                if current_latest is None or age_seconds < float(current_latest):
+                                    status["latest_violation_age_seconds"] = round(age_seconds, 1)
+                                session_samples.append(
+                                    {
+                                        "kind": f"{operation}_without_guard_ack",
+                                        "file": touched,
+                                        "tool": name,
+                                    }
+                                )
+        except Exception:
+            continue
+
+        if session_touches:
+            status["conditioned_sessions"] += 1
+            for sample in session_samples[:3]:
+                if len(status["samples"]) >= 6:
+                    break
+                status["samples"].append({"session_file": str(path), **sample})
+
+    return status
+
+
+def _open_protocol_debt_summary(*debt_types: str) -> dict:
+    db_path = paths.db_path()
+    summary = {"available": False, "open_total": 0, "counts": {}}
+    if not db_path.is_file() or not debt_types:
+        return summary
+
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=2)
+        try:
+            conn.row_factory = sqlite3.Row
+            table = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='protocol_debt'"
+            ).fetchone()
+            if not table:
+                return summary
+            placeholders = ",".join("?" for _ in debt_types)
+            rows = conn.execute(
+                f"""SELECT debt_type, COUNT(*) AS total
+                    FROM protocol_debt
+                    WHERE status = 'open' AND debt_type IN ({placeholders})
+                    GROUP BY debt_type""",
+                tuple(debt_types),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return summary
+
+    counts = {str(row["debt_type"]): int(row["total"] or 0) for row in rows}
+    summary["available"] = True
+    summary["counts"] = counts
+    summary["open_total"] = sum(counts.values())
+    return summary
+
+
+def _client_assumption_regressions() -> list[str]:
+    src_root = NEXO_CODE if (NEXO_CODE / "server.py").is_file() else (NEXO_CODE / "src")
+    if not src_root.is_dir():
+        return []
+    src_root = src_root.resolve()
+    backup_root = (paths.backups_dir()).resolve()
+    contrib_root = (NEXO_HOME / "contrib").resolve()
+    allowed_relative_paths = {
+        Path("scripts") / "deep-sleep" / "collect.py",
+        Path("doctor") / "providers" / "runtime.py",
+    }
+    offenders: list[str] = []
+    for path in src_root.rglob("*.py"):
+        resolved = path.resolve()
+        try:
+            if resolved.is_relative_to(backup_root):
+                continue
+        except Exception:
+            pass
+        try:
+            if resolved.is_relative_to(contrib_root):
+                continue
+        except Exception:
+            pass
+        try:
+            relative_path = resolved.relative_to(src_root)
+        except Exception:
+            relative_path = path.relative_to(src_root)
+        if "versions" in relative_path.parts:
+            continue
+        try:
+            text = path.read_text()
+        except Exception:
+            continue
+        if ".claude/projects" in text and relative_path not in allowed_relative_paths:
+            offenders.append(f"{relative_path} hardcodes ~/.claude/projects")
+    collect_path = src_root / "scripts" / "deep-sleep" / "collect.py"
+    try:
+        collect_text = collect_path.read_text()
+    except Exception:
+        collect_text = ""
+    if collect_text and (".claude/projects" in collect_text) and (".codex" not in collect_text or "find_codex_session_files" not in collect_text):
+        offenders.append("deep-sleep/collect.py references Claude transcripts without Codex transcript parity")
+    return offenders
+
+
+def _file_age_seconds(path: Path) -> float | None:
+    """Return file age in seconds, or None if not found."""
+    try:
+        if path.is_file():
+            return time.time() - path.stat().st_mtime
+    except Exception:
+        pass
+    return None
+
+
+def _load_json(path: Path) -> dict:
+    return json.loads(path.read_text())
+
+
+def _latest_cron_run_age_seconds(cron_id: str) -> float | None:
+    db_path = paths.db_path()
+    if not db_path.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=2)
+        try:
+            conn.row_factory = sqlite3.Row
+            table = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='cron_runs'"
+            ).fetchone()
+            if not table:
+                return None
+            row = conn.execute(
+                "SELECT MAX(started_at) AS last_run FROM cron_runs WHERE cron_id = ?",
+                (cron_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+    last_run = row["last_run"] if row else None
+    parsed = _parse_timestamp(last_run) if last_run else None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return max(0.0, time.time() - parsed.timestamp())
+
+
+def _latest_periodic_summary(kind: str) -> dict | None:
+    pattern = f"*-{kind}-summary.json"
+    candidates: list[tuple[str, Path]] = []
+    for path in (paths.operations_dir() / "deep-sleep").glob(pattern):
+        try:
+            payload = json.loads(path.read_text())
+        except Exception:
+            continue
+        label = str(payload.get("label", "") or "")
+        if label:
+            candidates.append((label, path))
+    if not candidates:
+        return None
+    _, path = sorted(candidates, key=lambda item: item[0])[-1]
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _package_version() -> str:
+    try:
+        payload = json.loads(_package_json_path().read_text())
+    except Exception:
+        return ""
+    return str(payload.get("version", "") or "").strip()
+
+
+def _top_changelog_version() -> str:
+    try:
+        text = _changelog_path().read_text(encoding="utf-8")
+    except Exception:
+        return ""
+    match = re.search(r"^## \[([^\]]+)\]", text, flags=re.MULTILINE)
+    return match.group(1).strip() if match else ""
+
+
+def _count_checks(checks) -> int:
+    if isinstance(checks, list):
+        return len(checks)
+    if isinstance(checks, dict):
+        total = 0
+        for value in checks.values():
+            if isinstance(value, list):
+                total += len(value)
+            elif value:
+                total += 1
+        return total
+    return 0
+
+
+def _parse_timestamp(value: str) -> dt.datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return dt.datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+def _enabled_optionals() -> dict[str, bool]:
+    try:
+        if OPTIONALS_FILE.is_file():
+            data = json.loads(OPTIONALS_FILE.read_text())
+            if isinstance(data, dict):
+                return {str(k): bool(v) for k, v in data.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def _enabled_manifest_crons() -> list[dict]:
+    manifest_candidates = [
+        paths.crons_dir() / "manifest.json",
+        NEXO_HOME / "crons" / "manifest.json",
+        NEXO_CODE / "crons" / "manifest.json",
+    ]
+    optionals = _enabled_optionals()
+    schedule = {}
+    try:
+        if SCHEDULE_FILE.is_file():
+            loaded = _load_json(SCHEDULE_FILE)
+            if isinstance(loaded, dict):
+                schedule = loaded
+    except Exception:
+        pass
+    for manifest_path in manifest_candidates:
+        if not manifest_path.is_file():
+            continue
+        try:
+            data = _load_json(manifest_path)
+        except Exception:
+            continue
+
+        enabled = []
+        for cron in data.get("crons", []):
+            cron_id = cron.get("id")
+            if not cron_id:
+                continue
+            if not is_cron_enabled(
+                cron,
+                optionals=optionals,
+                schedule_data=schedule,
+                system=os.environ.get("NEXO_PLATFORM") or platform.system(),
+            ):
+                continue
+            enabled.append(cron)
+        return enabled
+    return []
+
+
+def _cron_expectations() -> dict[str, dict]:
+    expectations = {}
+    for cron in _enabled_manifest_crons():
+        cron_id = cron.get("id")
+        if not cron_id or cron.get("keep_alive"):
+            continue
+        if cron.get("run_at_load") and not cron.get("interval_seconds") and not cron.get("schedule"):
+            continue
+
+        interval_seconds = cron.get("interval_seconds")
+        schedule = cron.get("schedule") or {}
+        if interval_seconds:
+            threshold = max(int(interval_seconds) * 3, int(interval_seconds) + 600)
+            label = f"every {int(interval_seconds) // 60}m"
+        elif "weekday" in schedule:
+            threshold = 8 * 86400
+            label = "weekly"
+        elif "hour" in schedule and "minute" in schedule:
+            threshold = 36 * 3600
+            label = "daily"
+        else:
+            threshold = DEFAULT_CRON_THRESHOLD
+            label = "custom"
+
+        expectations[cron_id] = {"threshold": threshold, "label": label}
+    return expectations
+
+
+def _run_at_load_cron_ids() -> set[str]:
+    ids: set[str] = set()
+    for cron_id, expected in _launchagent_schedule_expectations().items():
+        if expected.get("RunAtLoad") is not True:
+            continue
+        if expected.get("StartInterval") or expected.get("StartCalendarInterval") or expected.get("KeepAlive"):
+            continue
+        ids.add(cron_id)
+    return ids
+
+
+def _launchd_calendar_weekdays(schedule: dict) -> list[int]:
+    raw = schedule.get("weekdays") or schedule.get("Weekdays")
+    if raw is None and "weekday" in schedule:
+        raw = [schedule.get("weekday")]
+    if raw is None and "Weekday" in schedule:
+        raw = [schedule.get("Weekday")]
+    if isinstance(raw, str):
+        parts = [part.strip() for part in raw.replace("+", ",").split(",")]
+    elif isinstance(raw, (list, tuple, set)):
+        parts = list(raw)
+    else:
+        return []
+    selected: set[int] = set()
+    for part in parts:
+        try:
+            selected.add(int(part) % 7)
+        except Exception:
+            continue
+    if len(selected) >= 7:
+        return []
+    return [day for day in (1, 2, 3, 4, 5, 6, 0) if day in selected]
+
+
+def _launchd_calendar_interval(schedule: dict) -> dict | list[dict]:
+    base = {}
+    if "hour" in schedule:
+        base["Hour"] = schedule["hour"]
+    if "minute" in schedule:
+        base["Minute"] = schedule["minute"]
+    weekdays = _launchd_calendar_weekdays(schedule)
+    if weekdays:
+        if len(weekdays) == 1:
+            return {**base, "Weekday": weekdays[0]}
+        return [{**base, "Weekday": day} for day in weekdays]
+    return base
+
+
+def _launchagent_schedule_expectations() -> dict[str, dict]:
+    expectations = {}
+    for cron in _enabled_manifest_crons():
+        cron_id = cron.get("id")
+        if not cron_id:
+            continue
+
+        expected = {
+            "StartInterval": None,
+            "StartCalendarInterval": None,
+            "RunAtLoad": None,
+            "KeepAlive": None,
+            "WatchPaths": None,
+            "schedule_configured": False,
+        }
+        if cron.get("keep_alive"):
+            expected["RunAtLoad"] = True
+            expected["KeepAlive"] = True
+            expected["schedule_configured"] = True
+        elif "interval_seconds" in cron:
+            expected["StartInterval"] = int(cron["interval_seconds"])
+            expected["RunAtLoad"] = True if should_run_at_load(cron) else None
+            expected["schedule_configured"] = True
+        elif "schedule" in cron:
+            schedule = resolve_declared_schedule(cron)
+            expected["StartCalendarInterval"] = _launchd_calendar_interval(schedule)
+            expected["RunAtLoad"] = True if should_run_at_load(cron) else None
+            expected["schedule_configured"] = True
+        elif should_run_at_load(cron):
+            expected["RunAtLoad"] = True
+            expected["schedule_configured"] = True
+        if cron.get("watch_paths"):
+            expected["WatchPaths"] = [
+                str(Path(str(path)).expanduser()) if str(path).startswith("~") else str(path)
+                for path in cron.get("watch_paths", [])
+            ]
+        expectations[cron_id] = expected
+    return expectations
+
+
+def _managed_launchagent_plists() -> list[tuple[str, Path]]:
+    ids = set()
+    for cron_id, expected in _launchagent_schedule_expectations().items():
+        if expected.get("schedule_configured"):
+            ids.add(cron_id)
+
+    plists = []
+    for cron_id in sorted(ids):
+        plist_path = LAUNCH_AGENTS_DIR / f"com.nexo.{cron_id}.plist"
+        if plist_path.is_file():
+            plists.append((cron_id, plist_path))
+    return plists
+
+
+def _known_nexo_launchagent_ids() -> set[str]:
+    ids = set()
+    for cron_id, expected in _launchagent_schedule_expectations().items():
+        if expected.get("schedule_configured"):
+            ids.add(cron_id)
+    try:
+        from db import init_db, list_personal_script_schedules
+
+        init_db()
+        for schedule in list_personal_script_schedules():
+            cron_id = str(schedule.get("cron_id", "") or "").strip()
+            if cron_id:
+                ids.add(cron_id)
+    except Exception:
+        pass
+    return ids
+
+
+def _discover_actual_nexo_launchagent_ids() -> tuple[set[str], dict[str, str]]:
+    ids: set[str] = set()
+    evidence: dict[str, str] = {}
+
+    if LAUNCH_AGENTS_DIR.is_dir():
+        for plist_path in sorted(LAUNCH_AGENTS_DIR.glob("com.nexo.*.plist")):
+            cron_id = plist_path.stem.removeprefix("com.nexo.")
+            ids.add(cron_id)
+            evidence.setdefault(cron_id, f"plist on disk: {plist_path}")
+
+    if platform.system() != "Darwin":
+        return ids, evidence
+
+    try:
+        result = subprocess.run(
+            ["launchctl", "list"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return ids, evidence
+
+    for raw_line in (result.stdout or "").splitlines():
+        parts = raw_line.split()
+        if not parts:
+            continue
+        label = parts[-1].strip()
+        if not label.startswith("com.nexo."):
+            continue
+        cron_id = label.removeprefix("com.nexo.")
+        ids.add(cron_id)
+        evidence.setdefault(cron_id, f"loaded in launchctl: {label}")
+    return ids, evidence
+
+
+def _extract_launchctl_value(output: str, prefix: str) -> str | None:
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(prefix):
+            return stripped[len(prefix):].strip()
+    return None
+
+
+def _is_protected_macos_path(value: str | os.PathLike[str] | None) -> bool:
+    if not value or platform.system() != "Darwin":
+        return False
+    try:
+        raw = str(value).replace("~", str(Path.home()), 1)
+        candidate = Path(raw).expanduser().resolve(strict=False)
+    except Exception:
+        return False
+    return any(candidate == root or root in candidate.parents for root in PROTECTED_MACOS_ROOTS)
+
+
+def _plist_runtime_paths(plist_data: dict) -> list[str]:
+    paths: list[str] = []
+    env = plist_data.get("EnvironmentVariables") or {}
+    for key in ("NEXO_HOME", "NEXO_CODE"):
+        value = env.get(key)
+        if value:
+            paths.append(str(value))
+    for arg in plist_data.get("ProgramArguments") or []:
+        arg_str = str(arg)
+        if arg_str.startswith("/") or arg_str.startswith("~"):
+            paths.append(arg_str)
+    return paths
+
+
+def _recent_permission_denial(cron_id: str, max_age_seconds: int = 7 * 86400) -> bool:
+    stderr_path = paths.logs_dir() / f"{cron_id}-stderr.log"
+    age = _file_age_seconds(stderr_path)
+    if age is None or age > max_age_seconds:
+        return False
+    try:
+        tail = "\n".join(stderr_path.read_text(errors="ignore").splitlines()[-50:])
+    except Exception:
+        return False
+    return "Operation not permitted" in tail
+
+
+def _repair_launchagents(items: list[tuple[str, Path]]) -> tuple[bool, list[str]]:
+    evidence = []
+    ok = True
+    for cron_id, plist_path in items:
+        label = f"com.nexo.{cron_id}"
+        result = reload_launchagent_plist(plist_path, label=label, timeout=5)
+        if not result.get("ok"):
+            ok = False
+            evidence.append(f"{label}: {result.get('error') or result.get('bootstrap_error') or 'reload failed'}")
+    return ok, evidence
+
+
+def _repair_special_launchagent_plists(items: list[tuple[str, Path]]) -> tuple[bool, list[str]]:
+    evidence: list[str] = []
+    ok = True
+    expected_code = _expected_runtime_code_dir()
+    for cron_id, plist_path in items:
+        if cron_id not in SPECIAL_ENV_NORMALIZE_IDS:
+            continue
+        try:
+            with plist_path.open("rb") as fh:
+                plist_data = plistlib.load(fh)
+            env = plist_data.setdefault("EnvironmentVariables", {})
+            changed = False
+            if env.get("NEXO_CODE") != str(expected_code):
+                env["NEXO_CODE"] = str(expected_code)
+                changed = True
+            if env.get("NEXO_HOME") != str(NEXO_HOME):
+                env["NEXO_HOME"] = str(NEXO_HOME)
+                changed = True
+            if changed:
+                with plist_path.open("wb") as fh:
+                    plistlib.dump(plist_data, fh)
+                evidence.append(f"com.nexo.{cron_id}: normalized special LaunchAgent env")
+        except Exception as e:
+            ok = False
+            evidence.append(f"com.nexo.{cron_id}: {e}")
+    return ok, evidence
+
+
+def _sync_launchagents_from_manifest() -> tuple[bool, list[str]]:
+    sync_path = paths.crons_dir() / "sync.py"
+    if not sync_path.is_file():
+        sync_path = NEXO_CODE / "crons" / "sync.py"
+    if not sync_path.is_file():
+        return False, [f"cron sync script not found at {sync_path}"]
+
+    try:
+        runtime_code = paths.core_dir()
+        result = subprocess.run(
+            [sys.executable, str(sync_path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={**os.environ, "NEXO_HOME": str(NEXO_HOME), "NEXO_CODE": str(runtime_code)},
+        )
+    except Exception as e:
+        return False, [f"cron sync failed: {e}"]
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "cron sync failed"
+        return False, [detail]
+    return True, []
+
+
+def check_immune_status() -> DoctorCheck:
+    """Check immune system status freshness."""
+    status_file = paths.coordination_dir() / "immune-status.json"
+    age = _file_age_seconds(status_file)
+
+    if age is None:
+        return DoctorCheck(
+            id="runtime.immune_freshness",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary="Immune status file not found",
+            evidence=[f"Expected: {status_file}"],
+            repair_plan=["Check if immune cron is installed and running"],
+            escalation_prompt="Immune system has never run or status file was deleted.",
+        )
+
+    age_min = age / 60
+
+    # Read status for additional context even when the file is stale so the
+    # doctor can distinguish a dead immune cron from an intentional skip window.
+    try:
+        data = _load_json(status_file)
+        counts = data.get("counts") or {}
+        ok_count = int(counts.get("OK", 0) or 0)
+        warn_count = int(counts.get("WARN", 0) or 0)
+        fail_count = int(counts.get("FAIL", 0) or 0)
+        checks_count = _count_checks(data.get("checks"))
+        if fail_count > 0:
+            status = "critical"
+            severity = "error"
+            overall = "fail"
+        elif warn_count > 0:
+            status = "degraded"
+            severity = "warn"
+            overall = "warn"
+        else:
+            status = "healthy"
+            severity = "info"
+            overall = "ok"
+        evidence: list[str] = []
+        if age > IMMUNE_FRESHNESS:
+            cron_age = _latest_cron_run_age_seconds("immune")
+            if cron_age is not None and cron_age <= IMMUNE_FRESHNESS:
+                evidence.append(
+                    f"immune cron ran {cron_age / 60:.0f} minutes ago; reusing last reported status while the cron remains alive"
+                )
+                summary = (
+                    f"Immune cron is alive; last status reused ({age_min:.0f} min old file)"
+                    if status == "healthy"
+                    else f"Immune cron is alive; last {overall} status reused ({age_min:.0f} min old file)"
+                )
+                return DoctorCheck(
+                    id="runtime.immune_freshness",
+                    tier="runtime",
+                    status=status,
+                    severity=severity,
+                    summary=summary,
+                    evidence=evidence,
+                )
+            return DoctorCheck(
+                id="runtime.immune_freshness",
+                tier="runtime",
+                status="degraded",
+                severity="warn",
+                summary=f"Immune status stale ({age_min:.0f} min old, threshold {IMMUNE_FRESHNESS // 60} min)",
+                evidence=[f"{status_file} last modified {age_min:.0f} minutes ago"],
+                repair_plan=[
+                    "Check LaunchAgent/systemd timer for immune cron",
+                    "nexo scripts call nexo_schedule_status --input '{}'",
+                ],
+                escalation_prompt="Investigate why immune system stopped refreshing.",
+            )
+        return DoctorCheck(
+            id="runtime.immune_freshness",
+            tier="runtime",
+            status=status,
+            severity=severity,
+            summary=(
+                f"Immune: {overall} "
+                f"({ok_count} OK, {warn_count} WARN, {fail_count} FAIL; "
+                f"{checks_count} checks, {age_min:.0f} min ago)"
+            ),
+        )
+    except Exception as e:
+        return DoctorCheck(
+            id="runtime.immune_freshness",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary=f"Immune status unreadable ({age_min:.0f} min ago)",
+            evidence=[str(e)],
+        )
+
+
+def check_watchdog_status() -> DoctorCheck:
+    """Check watchdog status freshness."""
+    status_file = paths.operations_dir() / "watchdog-status.json"
+    age = _file_age_seconds(status_file)
+
+    if age is None:
+        return DoctorCheck(
+            id="runtime.watchdog_freshness",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary="Watchdog status file not found",
+            evidence=[f"Expected: {status_file}"],
+            repair_plan=["Check if watchdog cron is installed and running"],
+            escalation_prompt="Watchdog has never run or status file was deleted.",
+        )
+
+    age_min = age / 60
+    if age > WATCHDOG_FRESHNESS:
+        return DoctorCheck(
+            id="runtime.watchdog_freshness",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary=f"Watchdog status stale ({age_min:.0f} min old)",
+            evidence=[
+                f"{status_file} last modified {age_min:.0f} minutes ago",
+                f"Expected freshness threshold: {WATCHDOG_FRESHNESS // 60} minutes",
+            ],
+            repair_plan=[
+                "Inspect LaunchAgent or systemd timer for watchdog",
+                "Check for macOS sandbox errors in stderr logs",
+            ],
+            escalation_prompt="Investigate why watchdog stopped refreshing despite timer being installed.",
+        )
+
+    # Read for detail
+    try:
+        data = _load_json(status_file)
+        summary = data.get("summary") or {}
+        monitors = summary.get("total", "?")
+        passes = summary.get("pass", "?")
+        warns = int(summary.get("warn", 0) or 0)
+        fails = int(summary.get("fail", 0) or 0)
+        overall = str(summary.get("overall", "UNKNOWN")).upper()
+        if overall == "FAIL" or fails > 0:
+            status = "critical"
+            severity = "error"
+        elif overall == "WARN" or warns > 0:
+            status = "degraded"
+            severity = "warn"
+        else:
+            status = "healthy"
+            severity = "info"
+        return DoctorCheck(
+            id="runtime.watchdog_freshness",
+            tier="runtime",
+            status=status,
+            severity=severity,
+            summary=(
+                f"Watchdog: {passes}/{monitors} pass, {warns} warn, {fails} fail "
+                f"({age_min:.0f} min ago)"
+            ),
+        )
+    except Exception as e:
+        return DoctorCheck(
+            id="runtime.watchdog_freshness",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary=f"Watchdog status unreadable ({age_min:.0f} min ago)",
+            evidence=[str(e)],
+        )
+
+
+def check_runner_health_status() -> DoctorCheck:
+    """Check runner-health-report.json freshness and overall status."""
+    schedule = {}
+    try:
+        if SCHEDULE_FILE.is_file():
+            schedule = _load_json(SCHEDULE_FILE)
+    except Exception:
+        schedule = {}
+
+    prefs = normalize_client_preferences(schedule)
+    if not prefs.get("automation_enabled", True):
+        return DoctorCheck(
+            id="runtime.runner_health",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary="Automation disabled; runner health check not expected",
+        )
+
+    report_file = paths.operations_dir() / "runner-health-report.json"
+    age = _file_age_seconds(report_file)
+    if age is None:
+        return DoctorCheck(
+            id="runtime.runner_health",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary="Runner health report not found",
+            evidence=[f"Expected: {report_file}"],
+            repair_plan=[
+                "Check that runner-health-check exists in crons/manifest.json and was synced into LaunchAgents/systemd",
+                "Verify followup-runner and morning-agent are enabled under automation",
+            ],
+            escalation_prompt="Automation runners are enabled but runner-health-report.json was never produced.",
+        )
+
+    age_hours = age / 3600
+    if age > RUNNER_HEALTH_FRESHNESS:
+        return DoctorCheck(
+            id="runtime.runner_health",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary=f"Runner health report stale ({age_hours:.1f}h old)",
+            evidence=[
+                f"{report_file} last modified {age_hours:.1f} hours ago",
+                f"Expected freshness threshold: {RUNNER_HEALTH_FRESHNESS / 3600:.0f} hours",
+            ],
+            repair_plan=[
+                "Inspect runner-health-check cron installation and recent stderr",
+                "Verify automation crons are installed from the manifest, not a stale legacy process list",
+            ],
+        )
+
+    try:
+        data = _load_json(report_file)
+        runners = data.get("runners") or []
+        overall = str(data.get("overall", "UNKNOWN")).upper()
+        fail_count = sum(1 for runner in runners if str(runner.get("status", "")).upper() == "FAIL")
+        warn_count = sum(1 for runner in runners if str(runner.get("status", "")).upper() == "WARN")
+        if overall == "FAIL" or fail_count > 0:
+            status = "critical"
+            severity = "error"
+        elif overall == "WARN" or warn_count > 0:
+            status = "degraded"
+            severity = "warn"
+        else:
+            status = "healthy"
+            severity = "info"
+        return DoctorCheck(
+            id="runtime.runner_health",
+            tier="runtime",
+            status=status,
+            severity=severity,
+            summary=(
+                f"Runner health: {overall} ({len(runners)} runner(s), {warn_count} warn, {fail_count} fail, "
+                f"{age_hours:.1f}h ago)"
+            ),
+        )
+    except Exception as e:
+        return DoctorCheck(
+            id="runtime.runner_health",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary=f"Runner health report unreadable ({age_hours:.1f}h ago)",
+            evidence=[str(e)],
+        )
+
+
+def check_stale_sessions() -> DoctorCheck:
+    """Check for stale sessions from DB."""
+    try:
+        import sqlite3
+        db_path = paths.db_path()
+        if not db_path.is_file():
+            return DoctorCheck(
+                id="runtime.stale_sessions",
+                tier="runtime",
+                status="healthy",
+                severity="info",
+                summary="No DB to check sessions",
+            )
+        conn = sqlite3.connect(str(db_path), timeout=2)
+        try:
+            conn.row_factory = sqlite3.Row
+            cutoff = time.time() - 7200
+            day_ago = time.time() - 86400
+            rows = conn.execute(
+                "SELECT COUNT(*) as cnt FROM sessions WHERE last_update_epoch < ? AND last_update_epoch > ?",
+                (cutoff, day_ago),
+            ).fetchone()
+        finally:
+            conn.close()
+        count = rows["cnt"] if rows else 0
+        if count > 0:
+            return DoctorCheck(
+                id="runtime.stale_sessions",
+                tier="runtime",
+                status="degraded",
+                severity="warn",
+                summary=f"{count} stale session{'s' if count > 1 else ''} (no heartbeat >2h)",
+                repair_plan=["auto_close_sessions cron should handle this automatically"],
+            )
+        return DoctorCheck(
+            id="runtime.stale_sessions",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary="No stale sessions",
+        )
+    except Exception as e:
+        return DoctorCheck(
+            id="runtime.stale_sessions",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary=f"Session check failed: {e}",
+        )
+
+
+def check_cron_freshness() -> DoctorCheck:
+    """Check cron_runs table for recent executions."""
+    try:
+        import sqlite3
+        db_path = paths.db_path()
+        if not db_path.is_file():
+            return DoctorCheck(
+                id="runtime.cron_freshness",
+                tier="runtime",
+                status="healthy",
+                severity="info",
+                summary="No DB to check cron runs",
+            )
+        conn = sqlite3.connect(str(db_path), timeout=2)
+        try:
+            # Check if cron_runs table exists
+            tables = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='cron_runs'"
+            ).fetchone()
+            if not tables:
+                return DoctorCheck(
+                    id="runtime.cron_freshness",
+                    tier="runtime",
+                    status="healthy",
+                    severity="info",
+                    summary="No cron_runs table yet",
+                )
+            # Latest run per cron
+            rows = conn.execute(
+                """
+                SELECT cr.cron_id, cr.started_at, cr.ended_at, cr.exit_code
+                FROM cron_runs cr
+                INNER JOIN (
+                    SELECT cron_id, MAX(started_at) AS last_run
+                    FROM cron_runs
+                    GROUP BY cron_id
+                ) latest
+                  ON latest.cron_id = cr.cron_id
+                 AND latest.last_run = cr.started_at
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+
+        stale = []
+        expectations = _cron_expectations()
+        ignored_crons = _run_at_load_cron_ids()
+        tracked_crons = set(expectations)
+        now = time.time()
+        for row in rows:
+            cron_id = row[0]
+            if cron_id in ignored_crons:
+                continue
+            if cron_id not in tracked_crons:
+                continue
+            parsed = _parse_timestamp(row[1]) if row[1] else None
+            if parsed is None:
+                stale.append(f"{cron_id}: unreadable timestamp {row[1]!r}")
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=dt.timezone.utc)
+
+            age = now - parsed.timestamp()
+            expected = expectations.get(cron_id, {"threshold": DEFAULT_CRON_THRESHOLD, "label": "runtime default"})
+            in_flight = row[2] is None and row[3] is None
+            if in_flight and age <= max(expected["threshold"] * 4, 3600):
+                continue
+            if age > expected["threshold"]:
+                if in_flight:
+                    stale.append(
+                        f"{cron_id}: in-flight for {int(age / 60)}m (expected {expected['label']})"
+                    )
+                else:
+                    stale.append(f"{cron_id}: {int(age / 3600)}h ago (expected {expected['label']})")
+
+        if stale:
+            return DoctorCheck(
+                id="runtime.cron_freshness",
+                tier="runtime",
+                status="degraded",
+                severity="warn",
+                summary=f"{len(stale)} cron(s) haven't run recently",
+                evidence=stale,
+            )
+        return DoctorCheck(
+            id="runtime.cron_freshness",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary=f"All {len(tracked_crons)} tracked crons ran recently",
+        )
+    except Exception as e:
+        return DoctorCheck(
+            id="runtime.cron_freshness",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary=f"Cron check failed: {e}",
+        )
+
+
+def check_launchagent_integrity(fix: bool = False) -> DoctorCheck:
+    """Check that core LaunchAgents are loaded from the real plist paths, not temp installs."""
+    if platform.system() != "Darwin":
+        return DoctorCheck(
+            id="runtime.launchagents",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary="LaunchAgent integrity check skipped on non-macOS",
+        )
+
+    managed = _managed_launchagent_plists()
+    if not managed:
+        return DoctorCheck(
+            id="runtime.launchagents",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary="No managed LaunchAgents found on disk",
+        )
+
+    uid = str(os.getuid())
+    problems = []
+    problem_items: list[tuple[str, Path]] = []
+    tmp_drift = False
+    tcc_risk = False
+    tcc_failure = False
+    schedule_expectations = _launchagent_schedule_expectations()
+    for cron_id, plist_path in managed:
+        label = f"com.nexo.{cron_id}"
+        had_problem = False
+        try:
+            result = subprocess.run(
+                ["launchctl", "print", f"gui/{uid}/{label}"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+        except Exception as e:
+            problems.append(f"{label}: launchctl print failed ({e})")
+            continue
+
+        output = (result.stdout or "") + (result.stderr or "")
+        if result.returncode != 0 or "Could not find service" in output:
+            problems.append(f"{label}: not loaded")
+            had_problem = True
+            problem_items.append((cron_id, plist_path))
+            continue
+
+        expected_path = str(plist_path)
+        actual_path = _extract_launchctl_value(output, "path = ")
+        if actual_path != expected_path:
+            problems.append(f"{label}: loaded from {actual_path or 'unknown path'}")
+            had_problem = True
+            if actual_path and "/tmp/" in actual_path:
+                tmp_drift = True
+
+        try:
+            with plist_path.open("rb") as fh:
+                plist_data = plistlib.load(fh)
+            env = plist_data.get("EnvironmentVariables") or {}
+        except Exception as e:
+            problems.append(f"{label}: plist unreadable ({e})")
+            continue
+
+        protected_refs = [path for path in _plist_runtime_paths(plist_data) if _is_protected_macos_path(path)]
+        if protected_refs:
+            tcc_risk = True
+            if _recent_permission_denial(cron_id):
+                tcc_failure = True
+                problems.append(
+                    f"{label}: recent 'Operation not permitted' while using protected macOS path {protected_refs[0]}"
+                )
+            else:
+                problems.append(f"{label}: runtime points into protected macOS path {protected_refs[0]}")
+            had_problem = True
+
+        for env_key in ("NEXO_HOME", "NEXO_CODE"):
+            expected_value = env.get(env_key)
+            if not expected_value:
+                continue
+            marker = f"{env_key} => {expected_value}"
+            if marker not in output:
+                problems.append(f"{label}: {env_key} drift")
+                had_problem = True
+                if "/tmp/" in output:
+                    tmp_drift = True
+
+        expected_schedule = schedule_expectations.get(cron_id)
+        if expected_schedule is not None and expected_schedule.get("schedule_configured"):
+            actual_schedule = {
+                "StartInterval": plist_data.get("StartInterval"),
+                "StartCalendarInterval": plist_data.get("StartCalendarInterval"),
+                "RunAtLoad": plist_data.get("RunAtLoad"),
+                "KeepAlive": plist_data.get("KeepAlive"),
+                "WatchPaths": plist_data.get("WatchPaths"),
+            }
+            target_schedule = {
+                "StartInterval": expected_schedule.get("StartInterval"),
+                "StartCalendarInterval": expected_schedule.get("StartCalendarInterval"),
+                "RunAtLoad": expected_schedule.get("RunAtLoad"),
+                "KeepAlive": expected_schedule.get("KeepAlive"),
+                "WatchPaths": expected_schedule.get("WatchPaths"),
+            }
+            if actual_schedule != target_schedule:
+                problems.append(
+                    f"{label}: schedule drift "
+                    f"(actual={actual_schedule}, expected={target_schedule})"
+                )
+                had_problem = True
+
+        if had_problem:
+            problem_items.append((cron_id, plist_path))
+
+    if not problems:
+        return DoctorCheck(
+            id="runtime.launchagents",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary=f"LaunchAgents aligned for {len(managed)} managed job(s)",
+        )
+
+    check = DoctorCheck(
+        id="runtime.launchagents",
+        tier="runtime",
+        status="critical" if (tmp_drift or tcc_failure) else "degraded",
+        severity="error" if (tmp_drift or tcc_failure) else "warn",
+        summary=(
+            f"LaunchAgent drift detected in {len(problems)} job(s)"
+            if not tcc_risk
+            else f"LaunchAgent drift or TCC/runtime path risk detected in {len(problems)} job(s)"
+        ),
+        evidence=problems[:10],
+        repair_plan=[
+            "Reload the affected LaunchAgents from ~/Library/LaunchAgents",
+            "Re-sync core cron plists from crons/manifest.json if the schedule drifted",
+            "If any job is loaded from /tmp, boot it out before bootstrapping the real plist",
+            "If any core job points into Documents/Desktop/Downloads, re-sync it so it runs from NEXO_HOME instead",
+        ],
+        escalation_prompt=(
+            "Launchd is serving stale or drifted NEXO jobs. Compare loaded job paths with plist paths on disk, "
+            "and treat recent 'Operation not permitted' against Documents/Desktop/Downloads as a TCC/runtime path issue."
+        ),
+    )
+    if tcc_risk:
+        check.repair_plan.append(
+            "On macOS, grant Full Disk Access manually if protected folders are required; "
+            "NEXO can only open the System Settings pane and verify best effort"
+        )
+
+    if fix:
+        sync_ok, sync_evidence = _sync_launchagents_from_manifest()
+        special_ok, special_evidence = _repair_special_launchagent_plists(problem_items)
+        repaired, repair_evidence = _repair_launchagents(problem_items)
+        if sync_ok and special_ok and repaired:
+            post_check = check_launchagent_integrity(fix=False)
+            if post_check.status == "healthy":
+                post_check.fixed = True
+                post_check.summary += " (fixed)"
+                return post_check
+        check.evidence.extend((sync_evidence + special_evidence + repair_evidence)[:10])
+    return check
+
+
+def check_launchagent_inventory() -> DoctorCheck:
+    """Check that every discovered com.nexo LaunchAgent is known to core or the personal registry."""
+    if platform.system() != "Darwin":
+        return DoctorCheck(
+            id="runtime.launchagent_inventory",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary="LaunchAgent inventory check skipped on non-macOS",
+        )
+
+    actual_ids, actual_evidence = _discover_actual_nexo_launchagent_ids()
+    if not actual_ids:
+        return DoctorCheck(
+            id="runtime.launchagent_inventory",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary="No com.nexo LaunchAgents discovered on this Mac",
+        )
+
+    try:
+        from script_registry import sync_personal_scripts
+
+        sync_personal_scripts(prune_missing=True)
+    except Exception:
+        pass
+
+    known_ids = _known_nexo_launchagent_ids()
+    unknown_ids = sorted(actual_ids - known_ids)
+    if not unknown_ids:
+        return DoctorCheck(
+            id="runtime.launchagent_inventory",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary=f"LaunchAgent inventory aligned ({len(actual_ids)} discovered, all known to NEXO)",
+        )
+
+    evidence = [actual_evidence.get(cron_id, f"com.nexo.{cron_id}") for cron_id in unknown_ids[:10]]
+    return DoctorCheck(
+        id="runtime.launchagent_inventory",
+        tier="runtime",
+        status="degraded",
+        severity="warn",
+        summary=f"Unknown com.nexo LaunchAgents detected ({len(unknown_ids)})",
+        evidence=evidence,
+        repair_plan=[
+            "If it is a personal automation, register/sync it through nexo scripts sync/reconcile",
+            "If it is a core helper, add it to the core LaunchAgent inventory instead of leaving it implicit",
+            "If it is retired, boot it out and remove its plist through the owning flow rather than editing plists by hand",
+        ],
+        escalation_prompt=(
+            "There are active or installed com.nexo LaunchAgents that NEXO cannot explain from the core manifest, "
+            "auxiliary core services, or the personal script registry."
+        ),
+    )
+
+
+def check_skill_health(fix: bool = False) -> DoctorCheck:
+    """Check executable skill consistency and approval state."""
+    try:
+        from db import get_skill_health_report
+        report = get_skill_health_report(fix=fix)
+    except Exception as e:
+        return DoctorCheck(
+            id="runtime.skills",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary=f"Skill health check failed: {e}",
+        )
+
+    issues = report.get("issues", [])
+    if not issues:
+        summary = f"Skills consistent ({report.get('checked', 0)} checked)"
+        if fix:
+            summary += " (fixed)"
+        return DoctorCheck(
+            id="runtime.skills",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary=summary,
+            fixed=fix,
+        )
+
+    errors = [issue for issue in issues if issue.get("severity") == "error"]
+    warnings = [issue for issue in issues if issue.get("severity") != "error"]
+    status = "critical" if errors else "degraded"
+    severity = "error" if errors else "warn"
+    evidence = [f"{issue['skill_id']}: {issue['message']}" for issue in issues[:10]]
+    return DoctorCheck(
+        id="runtime.skills",
+        tier="runtime",
+        status=status,
+        severity=severity,
+        summary=f"Skill issues detected in {len(issues)} item(s)",
+        evidence=evidence,
+        repair_plan=[
+            "Run nexo skills sync to reconcile filesystem definitions",
+            "Auto-reconcile execution metadata for executable skills",
+            "Fix or restore missing executable files for execute/hybrid skills",
+        ],
+        escalation_prompt="Skill metadata and filesystem artifacts are out of sync or an executable skill is missing artifacts.",
+    )
+
+
+def check_personal_script_registry(fix: bool = False) -> DoctorCheck:
+    """Check the DB-backed personal script registry against filesystem/plists."""
+    try:
+        from db import init_db, get_personal_script_health_report
+        from script_registry import (
+            archive_ignored_personal_script_artifacts,
+            repair_orphan_personal_schedule_metadata,
+            sync_personal_scripts,
+        )
+
+        init_db()
+        backup_cleanup = archive_ignored_personal_script_artifacts(dry_run=not fix)
+        if fix:
+            repair_orphan_personal_schedule_metadata(dry_run=False)
+        sync_personal_scripts(prune_missing=True)
+        report = get_personal_script_health_report(fix=fix)
+    except Exception as e:
+        return DoctorCheck(
+            id="runtime.personal_scripts",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary=f"Personal scripts registry check failed: {e}",
+        )
+
+    issues = list(report.get("issues", []))
+    backup_candidates = backup_cleanup.get("candidates", []) if isinstance(backup_cleanup, dict) else []
+    backup_archived = backup_cleanup.get("archived", []) if isinstance(backup_cleanup, dict) else []
+    if backup_candidates and not fix:
+        issues.append({
+            "severity": "warn",
+            "message": (
+                f"{len(backup_candidates)} ignored personal script backup artifact(s) still carry NEXO metadata; "
+                "doctor --fix will archive them outside personal/scripts"
+            ),
+        })
+    if not issues:
+        audit = report.get("schedule_audit", {}).get("summary", {})
+        summary = (
+            f"Personal scripts registered "
+            f"({report.get('scripts', 0)} scripts, {report.get('schedules', 0)} schedules"
+            f", {audit.get('healthy', report.get('schedules', 0))} managed)"
+        )
+        keep_alive = int(audit.get("keep_alive", 0) or 0)
+        if keep_alive:
+            summary += (
+                f", keep_alive {int(audit.get('runtime_alive', 0) or 0)}/{keep_alive} alive"
+            )
+        if fix:
+            summary += " (fixed)"
+        if backup_archived:
+            summary += f", archived {len(backup_archived)} stale backup artifact(s)"
+        return DoctorCheck(
+            id="runtime.personal_scripts",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary=summary,
+            fixed=fix,
+        )
+
+    errors = [issue for issue in issues if issue.get("severity") == "error"]
+    warnings = [issue for issue in issues if issue.get("severity") != "error"]
+    return DoctorCheck(
+        id="runtime.personal_scripts",
+        tier="runtime",
+        status="critical" if errors else "degraded",
+        severity="error" if errors else "warn",
+        summary=f"Personal scripts registry issues detected in {len(issues)} item(s)",
+        evidence=[issue["message"] for issue in issues[:10]],
+        repair_plan=[
+            "Run nexo scripts sync to reconcile filesystem scripts and personal LaunchAgents",
+            "Run nexo scripts reconcile so declared schedules are recreated through the official flow",
+            "Use nexo doctor --tier runtime --fix to apply the safe reconcile path for declared schedules",
+            "Keep personal scripts in NEXO_HOME/personal/scripts so updates do not collide with core",
+            "Prefer ps- prefixed filenames for new personal scripts so ownership stays obvious at a glance",
+        ],
+        escalation_prompt=(
+            "Personal script metadata, files, and personal cron schedules are out of sync. "
+            "Reconcile NEXO_HOME/personal/scripts with personal LaunchAgents without treating them as core crons."
+        ),
+    )
+
+
+def _truthy_metadata(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _metadata_int(value, fallback: int = 0) -> int:
+    try:
+        return int(str(value or "").strip())
+    except Exception:
+        return fallback
+
+
+def _resolve_personal_health_path(raw: str) -> Path:
+    path = Path(str(raw or "").strip()).expanduser()
+    if path.is_absolute():
+        return path
+    return NEXO_HOME / path
+
+
+def check_personal_automation_health_contracts() -> DoctorCheck:
+    """Check observable success contracts for scheduled personal automations."""
+    try:
+        from script_registry import list_scripts
+        scripts = list_scripts(include_core=False)
+    except Exception as exc:
+        return DoctorCheck(
+            id="runtime.personal_automation_health",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary=f"Personal automation health check failed: {exc}",
+        )
+
+    issues: list[str] = []
+    checked = 0
+    scheduled = 0
+    now = time.time()
+    for script in scripts:
+        metadata = script.get("metadata") if isinstance(script.get("metadata"), dict) else {}
+        declared = script.get("declared_schedule") if isinstance(script.get("declared_schedule"), dict) else {}
+        if not declared.get("required"):
+            continue
+        scheduled += 1
+        name = str(script.get("name") or metadata.get("name") or Path(str(script.get("path") or "")).name)
+        health_file_raw = str(metadata.get("health_file") or "").strip()
+        if not health_file_raw:
+            issues.append(f"{name}: scheduled automation has no health_file contract")
+            continue
+        checked += 1
+        health_file = _resolve_personal_health_path(health_file_raw)
+        if not health_file.is_file():
+            issues.append(f"{name}: health_file missing ({health_file})")
+            continue
+        try:
+            stat = health_file.stat()
+            content = health_file.read_text(errors="ignore")
+        except Exception as exc:
+            issues.append(f"{name}: health_file unreadable ({exc})")
+            continue
+        max_age = _metadata_int(metadata.get("health_max_age_seconds"), 0)
+        if max_age > 0 and now - stat.st_mtime > max_age:
+            issues.append(f"{name}: health_file stale ({int(now - stat.st_mtime)}s > {max_age}s)")
+        if _truthy_metadata(metadata.get("health_nonempty")) and not content.strip():
+            issues.append(f"{name}: health_file is empty")
+        must_contain = str(metadata.get("health_must_contain") or "").strip()
+        if must_contain and must_contain not in content:
+            issues.append(f"{name}: health_file does not contain required marker `{must_contain}`")
+
+    if not issues:
+        return DoctorCheck(
+            id="runtime.personal_automation_health",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary=f"Scheduled personal automation health contracts OK ({checked}/{scheduled} checked)",
+        )
+
+    return DoctorCheck(
+        id="runtime.personal_automation_health",
+        tier="runtime",
+        status="degraded",
+        severity="warn",
+        summary=f"Personal automation health contract issues detected in {len(issues)} item(s)",
+        evidence=issues[:12],
+        repair_plan=[
+            "Add `# nexo: health_file=...` to scheduled personal automations that must prove useful output",
+            "Use `health_max_age_seconds`, `health_nonempty=true`, or `health_must_contain=...` for semantic success checks",
+            "Run `nexo doctor --tier runtime` after updates to catch stale or missing automation outputs",
+        ],
+        escalation_prompt=(
+            "Scheduled personal automations need observable success contracts; a cron exit code alone is not enough "
+            "to know that useful work happened."
+        ),
+    )
+
+
+def check_client_backend_preferences(fix: bool = False) -> DoctorCheck:
+    schedule = {}
+    try:
+        if SCHEDULE_FILE.is_file():
+            schedule = _load_json(SCHEDULE_FILE)
+    except Exception:
+        schedule = {}
+
+    prefs = normalize_client_preferences(schedule)
+    detected = detect_installed_clients()
+
+    default_terminal = prefs["default_terminal_client"]
+    automation_enabled = bool(prefs["automation_enabled"])
+    automation_backend = prefs["automation_backend"]
+    default_profile = resolve_client_runtime_profile(default_terminal, preferences=prefs)
+    automation_profile = (
+        resolve_client_runtime_profile(automation_backend, preferences=prefs)
+        if automation_enabled and automation_backend != "none"
+        else {"model": "", "reasoning_effort": ""}
+    )
+
+    evidence: list[str] = []
+    repair_plan: list[str] = []
+    severity = "info"
+    status = "healthy"
+
+    if _desktop_product_requested(Path.home()):
+        managed_prefix = _managed_claude_prefix(Path.home())
+        managed_expected = managed_prefix / "bin" / "claude"
+        managed_path = _managed_claude_binary(Path.home())
+        if not managed_path:
+            status = "critical"
+            severity = "error"
+            evidence.append(
+                "desktop-managed Claude runtime missing or drifted "
+                f"(expected under `{managed_expected}`)"
+            )
+            repair_plan.append(
+                "Run `nexo update` or `nexo clients sync` from the Desktop-managed install "
+                "so the bundled Claude runtime is restored under "
+                "`~/.nexo/runtime/bootstrap/npm-global`"
+            )
+        else:
+            evidence.append(f"desktop-managed Claude runtime: {managed_path}")
+
+    default_info = detected.get(default_terminal, {})
+    if not default_info.get("installed"):
+        if status == "healthy":
+            status = "degraded"
+            severity = "warn"
+        evidence.append(f"default terminal client `{default_terminal}` is selected but not installed")
+        repair_plan.append(f"Install {default_terminal} or switch the default terminal client in schedule.json")
+
+    for client_key, enabled in prefs.get("interactive_clients", {}).items():
+        if not enabled:
+            continue
+        info = detected.get(client_key, {})
+        if not info.get("installed"):
+            if status == "healthy":
+                status = "degraded"
+                severity = "warn"
+            evidence.append(f"interactive client `{client_key}` is enabled but not installed")
+
+    if automation_enabled:
+        backend_info = detected.get(automation_backend, {})
+        if automation_backend == "none":
+            if status == "healthy":
+                status = "degraded"
+                severity = "warn"
+            evidence.append("automation is enabled but no automation backend is configured")
+        elif not backend_info.get("installed"):
+            if status == "healthy":
+                status = "degraded"
+                severity = "warn"
+            evidence.append(f"automation backend `{automation_backend}` is enabled but not installed")
+            repair_plan.append(f"Install {automation_backend} or disable automation in schedule.json")
+
+    if not repair_plan and status != "healthy":
+        repair_plan.append(
+            "Run `nexo doctor --tier runtime --fix` or `nexo update` so the selected client/backend is installed and re-synced where possible"
+        )
+
+    if fix and status != "healthy":
+        try:
+            from client_sync import sync_all_clients
+
+            sync_all_clients(
+                nexo_home=NEXO_HOME,
+                runtime_root=NEXO_CODE,
+                user_home=Path.home(),
+                preferences=prefs,
+                auto_install_missing_claude=True,
+            )
+        except Exception:
+            pass
+        post = check_client_backend_preferences(fix=False)
+        if post.status == "healthy":
+            post.fixed = True
+            post.summary += " (fixed)"
+        return post
+
+    def _profile_label(client_key: str, profile: dict[str, str]) -> str:
+        bits = [client_key]
+        if profile.get("model"):
+            bits.append(profile["model"])
+        if profile.get("reasoning_effort"):
+            bits.append(profile["reasoning_effort"])
+        return "/".join(bits)
+
+    terminal_label = f"chat={_profile_label(default_terminal, default_profile)}"
+    automation_label = (
+        f"automation={_profile_label(automation_backend, automation_profile)}"
+        if automation_enabled and automation_backend != "none"
+        else "automation=none"
+    )
+    return DoctorCheck(
+        id="runtime.clients",
+        tier="runtime",
+        status=status,
+        severity=severity,
+        summary=f"Client/backend preferences OK ({terminal_label}, {automation_label})" if status == "healthy" else f"Client/backend preferences need attention ({terminal_label}, {automation_label})",
+        evidence=evidence or [
+            f"default terminal client: {_profile_label(default_terminal, default_profile)}",
+            f"automation backend: {_profile_label(automation_backend, automation_profile) if automation_enabled and automation_backend != 'none' else 'none'}",
+        ],
+        repair_plan=repair_plan,
+        escalation_prompt=(
+            "The configured interactive client or automation backend is missing. "
+            "Align installed clients with schedule.json so `nexo chat` and background automation use the intended tools."
+        ) if status != "healthy" else "",
+    )
+
+
+def check_packaged_update_npm_toolchain(fix: bool = False) -> DoctorCheck:
+    """Verify the npm runtime used by packaged Brain updates can actually run."""
+    try:
+        from plugins.update import packaged_npm_toolchain_status
+        status = packaged_npm_toolchain_status(repair=fix)
+    except Exception as exc:
+        return DoctorCheck(
+            id="runtime.packaged_update_npm",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary=f"Packaged update npm check failed: {exc}",
+        )
+
+    attempts = status.get("attempts") if isinstance(status, dict) else []
+    evidence: list[str] = []
+    for item in (attempts[:6] if isinstance(attempts, list) else []):
+        cmd = " ".join(str(part) for part in (item.get("cmd") or []))
+        if item.get("ok"):
+            evidence.append(f"ok: {cmd}")
+        else:
+            evidence.append(f"failed: {cmd}: {item.get('error') or 'unknown error'}")
+
+    repaired = status.get("repaired") if isinstance(status, dict) else []
+    if status.get("ok"):
+        summary = "Packaged update npm runtime is healthy"
+        if repaired:
+            summary += f" (repaired wrappers: {', '.join(str(item) for item in repaired)})"
+        return DoctorCheck(
+            id="runtime.packaged_update_npm",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary=summary,
+            evidence=evidence,
+            fixed=bool(fix and repaired),
+        )
+
+    return DoctorCheck(
+        id="runtime.packaged_update_npm",
+        tier="runtime",
+        status="critical",
+        severity="error",
+        summary="Packaged update cannot find a healthy npm runtime",
+        evidence=evidence,
+        repair_plan=[
+            "Run `nexo doctor --tier runtime --fix` to repair NEXO npm/npx wrappers when a healthy Node/npm exists",
+            "Install Node.js or restore an nvm Node version if no healthy npm candidate exists",
+            "Retry `nexo update` after the npm runtime check is healthy",
+        ],
+        escalation_prompt="Packaged Brain update cannot run npm safely; repair the local Node/npm runtime before updating.",
+    )
+
+
+def check_client_bootstrap_parity(fix: bool = False) -> DoctorCheck:
+    """Check managed Claude/Codex bootstrap documents and CORE/USER markers."""
+    try:
+        from bootstrap_docs import get_bootstrap_status, sync_enabled_bootstraps
+    except Exception as e:
+        return DoctorCheck(
+            id="runtime.client_bootstrap",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary=f"Bootstrap check unavailable: {e}",
+        )
+
+    try:
+        schedule = _load_json(SCHEDULE_FILE) if SCHEDULE_FILE.is_file() else {}
+    except Exception:
+        schedule = {}
+    prefs = normalize_client_preferences(schedule)
+    detected = detect_installed_clients()
+
+    relevant: set[str] = set()
+    default_terminal = prefs["default_terminal_client"]
+    if default_terminal in {"claude_code", "codex"}:
+        relevant.add(default_terminal)
+    if prefs.get("automation_enabled", True):
+        backend = prefs.get("automation_backend")
+        if backend in {"claude_code", "codex"}:
+            relevant.add(backend)
+    for client_key, enabled in prefs.get("interactive_clients", {}).items():
+        if enabled and client_key in {"claude_code", "codex"}:
+            relevant.add(client_key)
+    if not relevant:
+        relevant.add("claude_code")
+
+    evidence: list[str] = []
+    repair_plan: list[str] = []
+    status = "healthy"
+    severity = "info"
+
+    def _evaluate() -> list[tuple[str, dict]]:
+        return [
+            (client_key, get_bootstrap_status(client_key, nexo_home=NEXO_HOME, user_home=Path.home()))
+            for client_key in sorted(relevant)
+        ]
+
+    evaluated = _evaluate()
+    for client_key, info in evaluated:
+        installed = detected.get(client_key, {}).get("installed", False)
+        if not installed and client_key in {default_terminal, prefs.get("automation_backend")}:
+            status = "degraded"
+            severity = "warn"
+            evidence.append(f"`{client_key}` selected but not installed; bootstrap parity cannot be verified")
+            continue
+        if not info.get("exists"):
+            status = "degraded"
+            severity = "warn"
+            evidence.append(f"`{client_key}` bootstrap missing at {info.get('path')}")
+            repair_plan.append("Run `nexo clients sync` or `nexo update` to regenerate client bootstrap files")
+            continue
+        if not info.get("markers_ok"):
+            status = "degraded"
+            severity = "warn"
+            evidence.append(f"`{client_key}` bootstrap lacks CORE/USER markers")
+            repair_plan.append("Migrate bootstrap files so NEXO owns CORE and preserves USER")
+            continue
+        if info.get("template_version") and info.get("version") != info.get("template_version"):
+            status = "degraded"
+            severity = "warn"
+            evidence.append(
+                f"`{client_key}` bootstrap version {info.get('version') or 'unknown'} != template {info.get('template_version')}"
+            )
+            repair_plan.append("Refresh bootstrap files from the current NEXO templates")
+        if client_key == "codex":
+            codex_config = _codex_bootstrap_config_status()
+            codex_hooks = _codex_hooks_config_status()
+            if codex_config.get("error"):
+                status = "degraded"
+                severity = "warn"
+                evidence.append(f"codex config TOML invalid at {codex_config.get('path')}: {codex_config.get('error')}")
+                repair_plan.append("Repair ~/.codex/config.toml so NEXO can manage Codex bootstrap and model defaults")
+            elif codex_config.get("exists") and not codex_config.get("bootstrap_managed"):
+                status = "degraded"
+                severity = "warn"
+                evidence.append(f"codex config missing managed bootstrap injection at {codex_config.get('path')}")
+                repair_plan.append("Run `nexo clients sync` or `nexo update` so plain Codex sessions inherit the NEXO bootstrap")
+            elif codex_config.get("exists") and not codex_config.get("has_mcp_server"):
+                status = "degraded"
+                severity = "warn"
+                evidence.append(f"codex config missing managed `mcp_servers.nexo` at {codex_config.get('path')}")
+                repair_plan.append("Re-sync Codex so manual sessions keep the shared brain even if `codex mcp add` state drifts")
+            elif codex_config.get("exists") and codex_config.get("has_initial_messages"):
+                status = "degraded"
+                severity = "warn"
+                evidence.append(f"codex config still has legacy `initial_messages` at {codex_config.get('path')}")
+                repair_plan.append("Run `nexo clients sync --client codex` so Codex uses the AGENTS.md bootstrap without legacy system-role startup messages")
+            elif codex_config.get("exists"):
+                evidence.append(
+                    "codex config bootstrap managed"
+                    + (
+                        f" ({codex_config.get('model') or 'default'}, {codex_config.get('reasoning_effort') or 'default'})"
+                    )
+                )
+            if codex_hooks.get("error"):
+                status = "degraded"
+                severity = "warn"
+                evidence.append(f"codex hooks JSON invalid at {codex_hooks.get('path')}: {codex_hooks.get('error')}")
+                repair_plan.append("Repair ~/.codex/hooks.json so NEXO can manage Codex PreToolUse enforcement")
+            elif not codex_hooks.get("pretool_managed"):
+                status = "degraded"
+                severity = "warn"
+                evidence.append(f"codex PreToolUse hook missing at {codex_hooks.get('path')}")
+                repair_plan.append("Run `nexo clients sync --client codex` to install the managed PreToolUse guard")
+            else:
+                evidence.append(
+                    f"codex PreToolUse hook managed ({codex_hooks.get('pretool_matcher') or '*'})"
+                )
+
+    if fix and status != "healthy":
+        try:
+            from client_sync import sync_all_clients
+            sync_all_clients(
+                nexo_home=NEXO_HOME,
+                runtime_root=NEXO_CODE,
+                user_home=Path.home(),
+                preferences=prefs,
+            )
+        except Exception:
+            sync_enabled_bootstraps(
+                nexo_home=NEXO_HOME,
+                user_home=Path.home(),
+                preferences=prefs,
+            )
+        post = check_client_bootstrap_parity(fix=False)
+        if post.status == "healthy":
+            post.fixed = True
+            post.summary += " (fixed)"
+            return post
+
+    return DoctorCheck(
+        id="runtime.client_bootstrap",
+        tier="runtime",
+        status=status,
+        severity=severity,
+        summary="Client bootstrap parity OK" if status == "healthy" else "Client bootstrap parity needs attention",
+        evidence=evidence or [
+            f"{client_key}: {info.get('path')}"
+            for client_key, info in evaluated
+        ],
+        repair_plan=repair_plan,
+        escalation_prompt=(
+            "Claude/Codex startup bootstrap files are missing, outdated, or lack the CORE/USER contract. "
+            "Repair them so updates can refresh product rules without clobbering operator-specific instructions."
+        ) if status != "healthy" else "",
+    )
+
+
+def check_codex_session_parity() -> DoctorCheck:
+    try:
+        schedule = _load_json(SCHEDULE_FILE) if SCHEDULE_FILE.is_file() else {}
+    except Exception:
+        schedule = {}
+    prefs = normalize_client_preferences(schedule)
+    wants_codex = bool(
+        prefs.get("interactive_clients", {}).get("codex")
+        or prefs.get("default_terminal_client") == "codex"
+        or (prefs.get("automation_enabled", True) and prefs.get("automation_backend") == "codex")
+    )
+    if not wants_codex:
+        return DoctorCheck(
+            id="runtime.codex_sessions",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary="Codex session parity check skipped (Codex not selected)",
+            category="operator_history",
+        )
+
+    audit = _recent_codex_session_parity_status()
+    if audit["files"] == 0:
+        return DoctorCheck(
+            id="runtime.codex_sessions",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary="No recent Codex sessions found to verify startup discipline",
+            repair_plan=[
+                "Start Codex through `nexo chat` at least once so doctor can verify recent NEXO startup behavior",
+            ],
+            escalation_prompt=(
+                "Codex is selected, but there are no recent durable Codex sessions to inspect. "
+                "NEXO cannot prove that manual Codex sessions are entering the shared-brain startup flow."
+            ),
+            category="operator_history",
+        )
+
+    evidence = [
+        f"recent codex sessions inspected: {audit['files']}",
+        f"bootstrap markers seen in {audit['bootstrap_sessions']}/{audit['files']}",
+        f"nexo_startup seen in {audit['startup_sessions']}/{audit['files']}",
+        f"nexo_heartbeat seen in {audit['heartbeat_sessions']}/{audit['files']}",
+        f"bootstrap sessions with Tool uses: 0: {audit.get('zero_tool_bootstrap_sessions', 0)}",
+    ]
+    if audit["origins"]:
+        evidence.append(f"origins: {', '.join(audit['origins'])}")
+
+    status = "healthy"
+    severity = "info"
+    repair_plan: list[str] = []
+    missing_bootstrap = max(0, audit["files"] - audit["bootstrap_sessions"])
+    missing_startup = max(0, audit["files"] - audit["startup_sessions"])
+    missing_heartbeat = max(0, audit["files"] - audit["heartbeat_sessions"])
+    zero_tool_bootstrap = int(audit.get("zero_tool_bootstrap_sessions") or 0)
+    if missing_bootstrap:
+        status = "degraded"
+        severity = "warn"
+        repair_plan.append(
+            "Run `nexo update` or `nexo clients sync` so every Codex session inherits the managed bootstrap, not just a subset"
+        )
+    if missing_startup:
+        status = "critical"
+        severity = "error"
+        repair_plan.append(
+            "Use `nexo chat` or keep the global Codex bootstrap intact so every Codex session actually calls `nexo_startup`"
+        )
+    if missing_heartbeat:
+        if status == "healthy":
+            status = "degraded"
+            severity = "warn"
+        repair_plan.append("Keep `nexo_heartbeat` on every user turn so restored/plain Codex sessions do not drift off-protocol")
+    if zero_tool_bootstrap:
+        status = "critical"
+        severity = "error"
+        repair_plan.append("Fail soak/parity checks when a Codex transcript contains NEXO bootstrap text but `Tool uses: 0`")
+    if missing_bootstrap or missing_startup or missing_heartbeat or zero_tool_bootstrap:
+        evidence.append(
+            "session drift: "
+            f"{missing_bootstrap} missing bootstrap, "
+            f"{missing_startup} missing startup, "
+            f"{missing_heartbeat} missing heartbeat, "
+            f"{zero_tool_bootstrap} bootstrap with Tool uses: 0"
+        )
+
+    return DoctorCheck(
+        id="runtime.codex_sessions",
+        tier="runtime",
+        status=status,
+        severity=severity,
+        summary="Recent Codex sessions show NEXO startup discipline" if status == "healthy" else "Recent Codex sessions need stronger NEXO startup discipline",
+        evidence=evidence,
+        repair_plan=repair_plan,
+        escalation_prompt=(
+            "Codex is selected, but recent durable Codex sessions are not consistently showing NEXO bootstrap markers or `nexo_startup`. "
+            "Manual Codex sessions may still be starting too plain."
+        ) if status != "healthy" else "",
+        category="operator_history",
+    )
+
+
+def check_bootstrap_reached_startup() -> DoctorCheck:
+    """installation_live: every recent Codex session must reach nexo_startup."""
+    try:
+        schedule = _load_json(SCHEDULE_FILE) if SCHEDULE_FILE.is_file() else {}
+    except Exception:
+        schedule = {}
+    prefs = normalize_client_preferences(schedule)
+    wants_codex = bool(
+        prefs.get("interactive_clients", {}).get("codex")
+        or prefs.get("default_terminal_client") == "codex"
+        or (prefs.get("automation_enabled", True) and prefs.get("automation_backend") == "codex")
+    )
+    if not wants_codex:
+        return DoctorCheck(
+            id="installation_live.bootstrap_reached_startup",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary="Startup reachability skipped (Codex not selected)",
+            category="operator_history",
+        )
+
+    audit = _recent_codex_session_parity_status(days=1, max_files=48)
+    files = int(audit.get("files") or 0)
+    startup_sessions = int(audit.get("startup_sessions") or 0)
+    missing = max(0, files - startup_sessions)
+    evidence = [
+        f"window=24h",
+        f"nexo_startup reached: {startup_sessions}/{files}",
+        f"missing_startup={missing}",
+    ]
+    for sample in (audit.get("samples") or [])[:5]:
+        if not sample.get("startup"):
+            evidence.append(f"missing startup: {sample.get('file')}")
+
+    if files <= 0:
+        return DoctorCheck(
+            id="installation_live.bootstrap_reached_startup",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary="No Codex sessions in the last 24h to verify startup reachability",
+            evidence=evidence,
+            repair_plan=["Start Codex through the managed NEXO launcher and re-run doctor"],
+            escalation_prompt="NEXO cannot prove recent Codex sessions reached startup.",
+            category="operator_history",
+        )
+
+    status = "healthy" if missing == 0 else "critical"
+    severity = "info" if status == "healthy" else "error"
+    return DoctorCheck(
+        id="installation_live.bootstrap_reached_startup",
+        tier="runtime",
+        status=status,
+        severity=severity,
+        summary=(
+            "All recent Codex sessions reached NEXO startup"
+            if status == "healthy"
+            else "Some recent Codex sessions did not reach NEXO startup"
+        ),
+        evidence=evidence,
+        repair_plan=[
+            "Ensure SessionStart preload resolves deferred NEXO tools before the first assistant response",
+            "Start Codex through `nexo chat` or run `nexo clients sync --client codex`",
+        ] if status != "healthy" else [],
+        escalation_prompt=(
+            "Codex sessions are starting without the shared-brain startup step, so memory/guard continuity is not guaranteed."
+        ) if status != "healthy" else "",
+        category="operator_history",
+    )
+
+
+def check_codex_conditioned_file_discipline() -> DoctorCheck:
+    try:
+        schedule = _load_json(SCHEDULE_FILE) if SCHEDULE_FILE.is_file() else {}
+    except Exception:
+        schedule = {}
+    prefs = normalize_client_preferences(schedule)
+    wants_codex = bool(
+        prefs.get("interactive_clients", {}).get("codex")
+        or prefs.get("default_terminal_client") == "codex"
+        or (prefs.get("automation_enabled", True) and prefs.get("automation_backend") == "codex")
+    )
+    if not wants_codex:
+        return DoctorCheck(
+            id="runtime.codex_conditioned_files",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary="Codex conditioned-file discipline check skipped (Codex not selected)",
+            category="operator_history",
+        )
+
+    audit = _recent_codex_conditioned_file_discipline_status()
+    debt_summary = _open_protocol_debt_summary(
+        "codex_conditioned_read_without_protocol",
+        "codex_conditioned_write_without_protocol",
+        "codex_conditioned_write_without_guard_ack",
+        "codex_conditioned_delete_without_protocol",
+        "codex_conditioned_delete_without_guard_ack",
+    )
+    evidence = [
+        f"active conditioned file rules: {audit['conditioned_rules']}",
+        f"recent codex sessions inspected: {audit['files']}",
+    ]
+
+    if audit["conditioned_rules"] == 0:
+        return DoctorCheck(
+            id="runtime.codex_conditioned_files",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary="No active conditioned-file learnings defined for Codex session audits",
+            evidence=evidence,
+            category="operator_history",
+        )
+
+    if audit["files"] == 0 or audit["conditioned_sessions"] == 0:
+        return DoctorCheck(
+            id="runtime.codex_conditioned_files",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary="No conditioned-file touches seen in recent Codex sessions",
+            evidence=evidence + [f"conditioned touches: {audit['conditioned_touches']}"],
+            category="operator_history",
+        )
+
+    evidence.extend([
+        f"conditioned sessions: {audit['conditioned_sessions']}",
+        f"conditioned touches: {audit['conditioned_touches']}",
+        f"read touches without protocol/guard review: {audit['read_without_protocol']}",
+        f"write touches without protocol task: {audit['write_without_protocol']}",
+        f"write touches without guard acknowledgement: {audit['write_without_guard_ack']}",
+        f"delete touches without protocol task: {audit['delete_without_protocol']}",
+        f"delete touches without guard acknowledgement: {audit['delete_without_guard_ack']}",
+    ])
+    if audit.get("latest_violation_age_seconds") is not None:
+        age_hours = round(float(audit["latest_violation_age_seconds"]) / 3600, 2)
+        evidence.append(f"latest violation age hours: {age_hours}")
+    if debt_summary["available"]:
+        evidence.append(f"open conditioned protocol debt: {debt_summary['open_total']}")
+    for sample in audit["samples"][:5]:
+        evidence.append(f"{sample['kind']}: {sample['file']} via {sample['tool']}")
+
+    repair_plan: list[str] = []
+    if audit["read_without_protocol"]:
+        repair_plan.append("Run nexo_task_open or nexo_guard_check before reading conditioned files in Codex sessions")
+    if audit["write_without_protocol"]:
+        repair_plan.append("Open work with nexo_task_open before editing conditioned files from Codex")
+    if audit["write_without_guard_ack"]:
+        repair_plan.append("Acknowledge blocking guard rules before writing conditioned files from Codex")
+    if audit["delete_without_protocol"]:
+        repair_plan.append("Open work with nexo_task_open before deleting conditioned files from Codex")
+    if audit["delete_without_guard_ack"]:
+        repair_plan.append("Acknowledge blocking guard rules before deleting conditioned files from Codex")
+    if not repair_plan:
+        repair_plan.append("Keep using managed Codex bootstrap so conditioned-file discipline remains visible in transcripts")
+
+    no_open_conditioned_debt = debt_summary["available"] and debt_summary["open_total"] == 0
+    historical_no_open_debt_drift = (
+        no_open_conditioned_debt
+        and audit.get("latest_violation_age_seconds") is not None
+        and float(audit["latest_violation_age_seconds"]) >= LIVE_PROTOCOL_SESSION_FRESHNESS
+    )
+    historical_read_only = (
+        no_open_conditioned_debt
+        and audit["read_without_protocol"] > 0
+        and audit["write_without_protocol"] == 0
+        and audit["write_without_guard_ack"] == 0
+        and audit["delete_without_protocol"] == 0
+        and audit["delete_without_guard_ack"] == 0
+    )
+    tracked_mutation_without_open_debt = (
+        no_open_conditioned_debt
+        and audit["write_without_protocol"] > 0
+        and audit["write_without_guard_ack"] == 0
+        and audit["delete_without_guard_ack"] == 0
+    )
+
+    if audit["write_without_protocol"] or audit["write_without_guard_ack"]:
+        if historical_no_open_debt_drift:
+            status = "healthy"
+            severity = "info"
+        elif tracked_mutation_without_open_debt:
+            status = "healthy"
+            severity = "info"
+        else:
+            status = "critical"
+            severity = "error"
+    elif historical_no_open_debt_drift or historical_read_only:
+        status = "healthy"
+        severity = "info"
+    elif audit["read_without_protocol"]:
+        status = "degraded"
+        severity = "warn"
+    else:
+        status = "healthy"
+        severity = "info"
+
+    return DoctorCheck(
+        id="runtime.codex_conditioned_files",
+        tier="runtime",
+        status=status,
+        severity=severity,
+        summary=(
+            "Historical Codex conditioned-file drift has no open protocol debt"
+            if historical_no_open_debt_drift or historical_read_only
+            else "Tracked Codex conditioned-file mutation drift has no open protocol debt"
+            if tracked_mutation_without_open_debt
+            else "Recent Codex sessions respect conditioned-file discipline"
+            if status == "healthy"
+            else "Recent Codex sessions are bypassing conditioned-file discipline"
+        ),
+        evidence=evidence,
+        repair_plan=repair_plan,
+        escalation_prompt=(
+            "Codex sessions are touching conditioned files without the expected protocol/guard sequence. "
+            "Until this is clean, parity with Claude hooks is still incomplete."
+        ) if status != "healthy" else "",
+        category="operator_history",
+    )
+
+
+def check_codex_protocol_compliance(include_history: bool = True) -> DoctorCheck:
+    try:
+        schedule = _load_json(SCHEDULE_FILE) if SCHEDULE_FILE.is_file() else {}
+    except Exception:
+        schedule = {}
+    prefs = normalize_client_preferences(schedule)
+    wants_codex = bool(
+        prefs.get("interactive_clients", {}).get("codex")
+        or prefs.get("default_terminal_client") == "codex"
+        or (prefs.get("automation_enabled", True) and prefs.get("automation_backend") == "codex")
+    )
+    if not wants_codex:
+        return DoctorCheck(
+            id="installation_live.codex_protocol_compliance",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary="Codex protocol compliance skipped (Codex not selected)",
+        )
+
+    hooks = _codex_hooks_config_status()
+    if hooks.get("error"):
+        return DoctorCheck(
+            id="installation_live.codex_protocol_compliance",
+            tier="runtime",
+            status="critical",
+            severity="error",
+            summary="Codex live protocol enforcement is not readable",
+            evidence=[f"codex hooks JSON invalid at {hooks.get('path')}: {hooks.get('error')}"],
+            repair_plan=["Repair ~/.codex/hooks.json or run `nexo clients sync --client codex`"],
+            escalation_prompt=(
+                "Codex cannot be treated as protocol-compliant while its live PreToolUse hook config is unreadable."
+            ),
+        )
+    if not hooks.get("pretool_managed"):
+        return DoctorCheck(
+            id="installation_live.codex_protocol_compliance",
+            tier="runtime",
+            status="critical",
+            severity="error",
+            summary="Codex live PreToolUse enforcement is not installed",
+            evidence=[f"missing managed PreToolUse hook at {hooks.get('path')}"],
+            repair_plan=["Run `nexo clients sync --client codex` so shell/exec_command calls are checked before execution"],
+            escalation_prompt=(
+                "Codex can still execute shell commands without the live NEXO guard; this is not functional parity."
+            ),
+        )
+
+    if not include_history:
+        return DoctorCheck(
+            id="installation_live.codex_protocol_compliance",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary="Codex live protocol enforcement is installed",
+            evidence=[f"codex PreToolUse hook: managed ({hooks.get('pretool_matcher') or '*'})"],
+        )
+
+    startup = _recent_codex_session_parity_status(days=1)
+    conditioned = _recent_codex_conditioned_file_discipline_status(days=1)
+    sessions = int(startup.get("files") or conditioned.get("files") or 0)
+    if sessions <= 0:
+        return DoctorCheck(
+            id="installation_live.codex_protocol_compliance",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary="No Codex sessions in the last 24h to verify protocol compliance",
+            repair_plan=[
+                "Run Codex through the managed NEXO bootstrap so doctor can verify live protocol compliance",
+            ],
+            category="operator_history",
+        )
+
+    startup_violation_sessions = 0
+    for sample in startup.get("samples", []):
+        if not sample.get("bootstrap") or not sample.get("startup") or not sample.get("heartbeat"):
+            startup_violation_sessions += 1
+    conditioned_violations = (
+        int(conditioned.get("read_without_protocol") or 0)
+        + int(conditioned.get("write_without_protocol") or 0)
+        + int(conditioned.get("write_without_guard_ack") or 0)
+        + int(conditioned.get("delete_without_protocol") or 0)
+        + int(conditioned.get("delete_without_guard_ack") or 0)
+    )
+    violation_units = startup_violation_sessions + conditioned_violations
+    violation_rate = round((violation_units / max(1, sessions)) * 100, 1)
+    status = "critical" if violation_rate > 5.0 else "healthy"
+    severity = "error" if status == "critical" else "info"
+    evidence = [
+        f"codex PreToolUse hook: managed ({hooks.get('pretool_matcher') or '*'})",
+        f"codex sessions inspected 24h: {sessions}",
+        f"startup/protocol violating sessions: {startup_violation_sessions}",
+        f"conditioned-file violations: {conditioned_violations}",
+        f"violation rate: {violation_rate}%",
+        "threshold: 5.0%",
+    ]
+    for sample in (startup.get("samples") or [])[:3]:
+        if not sample.get("bootstrap") or not sample.get("startup") or not sample.get("heartbeat"):
+            evidence.append(f"startup drift: {sample.get('file')}")
+    for sample in (conditioned.get("samples") or [])[:3]:
+        evidence.append(f"conditioned drift: {sample.get('kind')} {sample.get('file')}")
+
+    return DoctorCheck(
+        id="installation_live.codex_protocol_compliance",
+        tier="runtime",
+        status=status,
+        severity=severity,
+        summary=(
+            "Codex protocol compliance is within the 5% live threshold"
+            if status == "healthy"
+            else "Codex protocol compliance exceeds the 5% live violation threshold"
+        ),
+        evidence=evidence,
+        repair_plan=[
+            "Start Codex via `nexo chat` so SessionStart bootstrap is injected",
+            "Keep nexo_startup and nexo_heartbeat visible in every Codex session",
+            "Run nexo_guard_check before conditioned-file reads/writes and acknowledge blocking rules before mutation",
+        ] if status != "healthy" else [],
+        escalation_prompt=(
+            "Codex CLI parity is not clean: recent sessions miss startup/heartbeat or bypass conditioned-file guard discipline."
+        ) if status != "healthy" else "",
+        category="operator_history",
+    )
+
+
+def check_claude_desktop_shared_brain() -> DoctorCheck:
+    try:
+        schedule = _load_json(SCHEDULE_FILE) if SCHEDULE_FILE.is_file() else {}
+    except Exception:
+        schedule = {}
+    prefs = normalize_client_preferences(schedule)
+    wants_desktop = bool(prefs.get("interactive_clients", {}).get("claude_desktop"))
+    installed = detect_installed_clients().get("claude_desktop", {}).get("installed", False)
+    status_info = _claude_desktop_shared_brain_status()
+
+    if not wants_desktop and not installed:
+        return DoctorCheck(
+            id="runtime.claude_desktop",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary="Claude Desktop shared-brain check skipped (client not installed)",
+        )
+
+    evidence = [
+        f"config: {status_info.get('path')}",
+        f"shared brain mode: {status_info.get('shared_brain_mode') or 'mcp_only'}",
+    ]
+    if status_info.get("managed_runtime_home"):
+        evidence.append(f"runtime home: {status_info.get('managed_runtime_home')}")
+
+    if status_info.get("error"):
+        return DoctorCheck(
+            id="runtime.claude_desktop",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary="Claude Desktop config is unreadable",
+            evidence=evidence + [status_info["error"]],
+            repair_plan=["Repair Claude Desktop config JSON and re-run `nexo clients sync`"],
+        )
+
+    if not status_info.get("exists") or not status_info.get("has_mcp_server"):
+        return DoctorCheck(
+            id="runtime.claude_desktop",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary="Claude Desktop is not pointed at the shared NEXO brain",
+            evidence=evidence,
+            repair_plan=["Run `nexo clients sync` so Claude Desktop shares the same local brain"],
+            escalation_prompt=(
+                "Claude Desktop is installed or enabled, but its MCP config does not show the shared `nexo` runtime."
+            ),
+        )
+
+    if not status_info.get("shared_brain_managed"):
+        return DoctorCheck(
+            id="runtime.claude_desktop",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary="Claude Desktop shares NEXO, but managed metadata is missing",
+            evidence=evidence,
+            repair_plan=["Re-sync Claude Desktop so doctor can verify the managed shared-brain contract"],
+        )
+
+    return DoctorCheck(
+        id="runtime.claude_desktop",
+        tier="runtime",
+        status="healthy",
+        severity="info",
+        summary="Claude Desktop shared-brain parity OK (MCP-only mode)",
+        evidence=evidence,
+    )
+
+
+def check_transcript_source_parity() -> DoctorCheck:
+    """Check whether Deep Sleep can see transcript sources for the selected clients."""
+    try:
+        schedule = _load_json(SCHEDULE_FILE) if SCHEDULE_FILE.is_file() else {}
+    except Exception:
+        schedule = {}
+    prefs = normalize_client_preferences(schedule)
+
+    wants_codex = bool(
+        prefs.get("interactive_clients", {}).get("codex")
+        or prefs.get("default_terminal_client") == "codex"
+        or (prefs.get("automation_enabled", True) and prefs.get("automation_backend") == "codex")
+    )
+    wants_claude = bool(
+        prefs.get("interactive_clients", {}).get("claude_code")
+        or prefs.get("default_terminal_client") == "claude_code"
+        or (prefs.get("automation_enabled", True) and prefs.get("automation_backend") == "claude_code")
+    )
+
+    claude_root = Path.home() / ".claude" / "projects"
+    codex_roots = [
+        Path.home() / ".codex" / "sessions",
+        Path.home() / ".codex" / "archived_sessions",
+    ]
+
+    evidence = []
+    status = "healthy"
+    severity = "info"
+    if wants_claude:
+        evidence.append(f"claude_code transcripts: {'present' if claude_root.exists() else 'missing'} at {claude_root}")
+    if wants_codex:
+        codex_present = any(root.exists() for root in codex_roots)
+        evidence.append(
+            "codex transcripts: "
+            + ("present" if codex_present else "missing")
+            + f" at {', '.join(str(root) for root in codex_roots)}"
+        )
+        if not codex_present:
+            status = "degraded"
+            severity = "warn"
+
+    summary = "Deep Sleep transcript sources available"
+    repair_plan = []
+    escalation_prompt = ""
+    if status != "healthy":
+        summary = "Deep Sleep transcript source parity needs attention"
+        repair_plan = [
+            "Start at least one Codex session so ~/.codex/sessions is created",
+            "If Codex sessions already exist elsewhere, update the collector before relying on Codex-only transcript analysis",
+        ]
+        escalation_prompt = (
+            "Codex is selected, but no durable Codex session store is visible under ~/.codex. "
+            "Deep Sleep can still use DB artifacts, but transcript-level overnight analysis will be limited until Codex session files exist."
+        )
+
+    return DoctorCheck(
+        id="runtime.transcript_sources",
+        tier="runtime",
+        status=status,
+        severity=severity,
+        summary=summary,
+        evidence=evidence,
+        repair_plan=repair_plan,
+        escalation_prompt=escalation_prompt,
+    )
+
+
+def check_client_assumption_regressions() -> DoctorCheck:
+    offenders = _client_assumption_regressions()
+    if not offenders:
+        return DoctorCheck(
+            id="runtime.client_assumptions",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary="No new Claude-only runtime path assumptions detected",
+        )
+    return DoctorCheck(
+        id="runtime.client_assumptions",
+        tier="runtime",
+        status="critical",
+        severity="error",
+        summary=f"Detected {len(offenders)} client-parity regression(s) in runtime source",
+        evidence=offenders[:10],
+        repair_plan=[
+            "Replace Claude-only transcript or hook assumptions with shared client abstractions",
+            "Keep Deep Sleep and startup flows aware of both Claude Code and Codex surfaces",
+        ],
+        escalation_prompt=(
+            "A runtime source file drifted back to a Claude-only assumption. "
+            "Audit the offending file and restore client-agnostic parity before shipping."
+        ),
+    )
+
+
+def check_protocol_compliance() -> DoctorCheck:
+    try:
+        import sqlite3
+
+        db_path = paths.db_path()
+        if db_path.is_file():
+            conn = sqlite3.connect(str(db_path), timeout=2)
+            try:
+                conn.row_factory = sqlite3.Row
+                tables = {
+                    row["name"]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('protocol_tasks', 'protocol_debt', 'sessions')"
+                    ).fetchall()
+                }
+                tasks = None
+                debt_rows = None
+                if {"protocol_tasks", "protocol_debt"}.issubset(tables):
+                    window = "-7 days"
+                    history_floor = _history_baseline_sqlite()
+                    task_floor_clause = " AND opened_at >= ?" if history_floor else ""
+                    task_params = (window, history_floor) if history_floor else (window,)
+                    tasks = conn.execute(
+                        f"""SELECT * FROM protocol_tasks
+                           WHERE opened_at >= datetime('now', ?){task_floor_clause}
+                           ORDER BY opened_at DESC""",
+                        task_params,
+                    ).fetchall()
+                    protocol_debt_cols = {
+                        row["name"] for row in conn.execute("PRAGMA table_info(protocol_debt)").fetchall()
+                    }
+                    protocol_task_cols = {
+                        row["name"] for row in conn.execute("PRAGMA table_info(protocol_tasks)").fetchall()
+                    }
+                    session_cols = set()
+                    if "sessions" in tables:
+                        session_cols = {
+                            row["name"] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+                        }
+                    active_session_ids: set[str] = set()
+                    if {"sid", "last_update_epoch"}.issubset(session_cols):
+                        active_cutoff = time.time() - LIVE_PROTOCOL_SESSION_FRESHNESS
+                        active_session_ids = {
+                            str(row["sid"] or "")
+                            for row in conn.execute(
+                                "SELECT sid FROM sessions WHERE last_update_epoch >= ?",
+                                (active_cutoff,),
+                            ).fetchall()
+                        }
+                    live_guard_task_ids: set[str] = set()
+                    if {
+                        "task_id", "session_id", "status", "guard_has_blocking"
+                    }.issubset(protocol_task_cols):
+                        has_guard_ack = "guard_acknowledged" in protocol_task_cols
+                        for row in tasks:
+                            if str(row["status"] or "") != "open":
+                                continue
+                            if str(row["session_id"] or "") not in active_session_ids:
+                                continue
+                            if not bool(row["guard_has_blocking"]):
+                                continue
+                            if has_guard_ack and bool(row["guard_acknowledged"]):
+                                continue
+                            live_guard_task_ids.add(str(row["task_id"] or ""))
+                    live_guard_debt = 0
+                    open_task_debt = 0
+                    if {"task_id", "session_id"}.issubset(protocol_debt_cols):
+                        task_status_expr = "'' AS task_status"
+                        if "status" in protocol_task_cols:
+                            task_status_expr = "pt.status AS task_status"
+                        debt_floor_clause = " AND pd.created_at >= ?" if history_floor else ""
+                        debt_params = (window, history_floor) if history_floor else (window,)
+                        open_debts = conn.execute(
+                            f"""SELECT
+                                    pd.severity,
+                                    pd.debt_type,
+                                    pd.session_id,
+                                    pd.task_id,
+                                    pd.created_at,
+                                    {task_status_expr}
+                                FROM protocol_debt pd
+                                LEFT JOIN protocol_tasks pt ON pt.task_id = pd.task_id
+                                WHERE pd.status = 'open' AND pd.created_at >= datetime('now', ?){debt_floor_clause}
+                                ORDER BY pd.created_at DESC""",
+                            debt_params,
+                        ).fetchall()
+                        debt_counter: dict[tuple[str, str], int] = {}
+                        for row in open_debts:
+                            severity = str(row["severity"] or "warn")
+                            debt_type = str(row["debt_type"] or "unknown")
+                            session_id = str(row["session_id"] or "")
+                            task_id = str(row["task_id"] or "")
+                            task_status = str(row["task_status"] or "")
+                            if task_status == "open":
+                                open_task_debt += 1
+                                if (
+                                    debt_type == "unacknowledged_guard_blocking"
+                                    and session_id in active_session_ids
+                                ):
+                                    live_guard_task_ids.add(task_id or f"debt:{session_id}:{row['created_at']}")
+                                continue
+                            debt_counter[(severity, debt_type)] = debt_counter.get((severity, debt_type), 0) + 1
+                        live_guard_debt = len(live_guard_task_ids)
+                        debt_rows = [
+                            {"severity": severity, "debt_type": debt_type, "total": total}
+                            for (severity, debt_type), total in sorted(
+                                debt_counter.items(),
+                                key=lambda item: (-item[1], item[0][1], item[0][0]),
+                            )
+                        ]
+                    else:
+                        debt_rows = [
+                            dict(row) for row in conn.execute(
+                                f"""SELECT severity, debt_type, COUNT(*) AS total
+                                   FROM protocol_debt
+                                   WHERE status = 'open' AND created_at >= datetime('now', ?)
+                                   {"AND created_at >= ?" if history_floor else ""}
+                                   GROUP BY severity, debt_type
+                                   ORDER BY total DESC, debt_type ASC""",
+                                (window, history_floor) if history_floor else (window,),
+                            ).fetchall()
+                        ]
+                    has_cortex_evaluations = bool(
+                        conn.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cortex_evaluations'"
+                        ).fetchone()
+                    )
+                    covered_tasks = set()
+                    first_cortex_eval_at = ""
+                    if has_cortex_evaluations:
+                        covered_tasks = {
+                            row["task_id"]
+                            for row in conn.execute(
+                                "SELECT DISTINCT task_id FROM cortex_evaluations WHERE task_id != ''"
+                            ).fetchall()
+                        }
+                        first_eval_row = conn.execute(
+                            f"""SELECT MIN(created_at) AS first_eval
+                               FROM cortex_evaluations
+                               WHERE created_at >= datetime('now', ?)
+                               {"AND created_at >= ?" if history_floor else ""}""",
+                            (window, history_floor) if history_floor else (window,),
+                        ).fetchone()
+                        if first_eval_row and first_eval_row["first_eval"]:
+                            first_cortex_eval_at = str(first_eval_row["first_eval"])
+            finally:
+                conn.close()
+
+            history_floor = _history_baseline_sqlite()
+            if tasks is not None and debt_rows is not None and not tasks and not debt_rows and history_floor:
+                return DoctorCheck(
+                    id="runtime.protocol_compliance",
+                    tier="runtime",
+                    status="healthy",
+                    severity="info",
+                    summary="No protocol drift after the last verified runtime repair",
+                    evidence=[
+                        "live protocol window: 7d",
+                        f"post-update repair baseline: {history_floor}",
+                        "no protocol tasks or open debt after repair baseline",
+                    ],
+                    category="operator_history",
+                )
+
+            if tasks is not None and debt_rows is not None and (tasks or debt_rows):
+                    closed_tasks = [row for row in tasks if row["status"] != "open"]
+                    verify_required = [row for row in closed_tasks if row["must_verify"] and row["status"] == "done"]
+                    verify_ok = [row for row in verify_required if (row["close_evidence"] or "").strip()]
+                    change_required = [
+                        row for row in closed_tasks
+                        if row["must_change_log"] and row["status"] in {"done", "partial", "failed"}
+                    ]
+                    change_ok = [row for row in change_required if row["change_log_id"]]
+                    learning_required = [row for row in closed_tasks if row["correction_happened"]]
+                    learning_ok = [row for row in learning_required if row["learning_id"]]
+                    action_tasks = [row for row in tasks if row["task_type"] in ("edit", "execute", "delegate")]
+                    cortex_ok = [row for row in action_tasks if str(row["cortex_mode"] or "") in {"act", "propose"}]
+                    has_response_high_stakes = bool(tasks) and "response_high_stakes" in tasks[0].keys()
+                    high_stakes_action_tasks = [row for row in action_tasks if row["response_high_stakes"]] if has_response_high_stakes else []
+                    decision_eligible = high_stakes_action_tasks
+                    if first_cortex_eval_at:
+                        decision_eligible = [
+                            row for row in high_stakes_action_tasks
+                            if str(row["opened_at"] or "") >= first_cortex_eval_at
+                        ]
+                    decision_ok = [row for row in decision_eligible if row["task_id"] in covered_tasks]
+                    decision_metric_ready = bool(first_cortex_eval_at) and len(decision_eligible) >= 3
+
+                    score_parts = []
+                    if verify_required:
+                        score_parts.append((len(verify_ok) / len(verify_required)) * 100)
+                    if change_required:
+                        score_parts.append((len(change_ok) / len(change_required)) * 100)
+                    if learning_required:
+                        score_parts.append((len(learning_ok) / len(learning_required)) * 100)
+                    if action_tasks:
+                        score_parts.append((len(cortex_ok) / len(action_tasks)) * 100)
+                    if decision_metric_ready:
+                        score_parts.append((len(decision_ok) / len(decision_eligible)) * 100)
+
+                    base_score = (sum(score_parts) / len(score_parts)) if score_parts else (100.0 if tasks else 0.0)
+                    warn_debt = sum(row["total"] for row in debt_rows if row["severity"] == "warn")
+                    error_debt = sum(row["total"] for row in debt_rows if row["severity"] == "error")
+                    overall = max(0.0, round(base_score - min(60, (warn_debt * 5) + (error_debt * 20)), 1))
+
+                    evidence = [f"live protocol window: 7d", f"protocol tasks: {len(tasks)} total / {len(closed_tasks)} closed"]
+                    evidence.append(f"overall live protocol compliance: {overall:.1f}%")
+                    if verify_required:
+                        evidence.append(f"verified closures: {len(verify_ok)}/{len(verify_required)}")
+                    if change_required:
+                        evidence.append(f"change_log coverage: {len(change_ok)}/{len(change_required)}")
+                    if learning_required:
+                        evidence.append(f"learning-after-correction: {len(learning_ok)}/{len(learning_required)}")
+                    if action_tasks:
+                        evidence.append(f"action tasks Cortex-cleared: {len(cortex_ok)}/{len(action_tasks)}")
+                    if high_stakes_action_tasks:
+                        if decision_metric_ready:
+                            evidence.append(
+                                f"high-stakes action tasks with alternative evaluation: {len(decision_ok)}/{len(decision_eligible)}"
+                            )
+                        elif first_cortex_eval_at:
+                            evidence.append(
+                                f"high-stakes decision-eval rollout warming up: {len(decision_eligible)}/{len(high_stakes_action_tasks)} eligible since {first_cortex_eval_at}"
+                            )
+                        else:
+                            evidence.append("high-stakes decision-eval rollout not yet seeded in the live window")
+                    for row in debt_rows[:5]:
+                        evidence.append(f"open {row['severity']} debt — {row['debt_type']}: {row['total']}")
+                    if open_task_debt:
+                        evidence.append(f"in-progress task protocol debt pending: {open_task_debt}")
+                    if live_guard_debt:
+                        evidence.append(f"live in-progress guard acknowledgements pending: {live_guard_debt}")
+
+                    repair_plan: list[str] = []
+                    if verify_required and len(verify_ok) != len(verify_required):
+                        repair_plan.append("Close tasks with nexo_task_close evidence before claiming completion")
+                    if change_required and len(change_ok) != len(change_required):
+                        repair_plan.append("Use nexo_task_close or nexo_change_log for edit/execute tasks")
+                    if learning_required and len(learning_ok) != len(learning_required):
+                        repair_plan.append("Capture reusable learnings whenever a correction happened")
+                    if high_stakes_action_tasks and not decision_metric_ready:
+                        repair_plan.append("Keep using nexo_cortex_decide on high-stakes actions until the live window has enough samples")
+                    if error_debt or warn_debt:
+                        repair_plan.append("Resolve open protocol debt before treating the runtime as healthy")
+
+                    if error_debt > 0 or overall < 45:
+                        status = "critical"
+                        severity = "error"
+                    elif warn_debt > 0 or overall < 70:
+                        status = "degraded"
+                        severity = "warn"
+                    else:
+                        status = "healthy"
+                        severity = "info"
+
+                    return DoctorCheck(
+                        id="runtime.protocol_compliance",
+                        tier="runtime",
+                        status=status,
+                        severity=severity,
+                        summary="Live protocol compliance looks healthy" if status == "healthy" else "Live protocol compliance needs hardening",
+                        evidence=evidence,
+                        repair_plan=repair_plan,
+                        escalation_prompt=(
+                            "Task discipline is drifting in live runtime data. NEXO is still skipping verification, change logging, or correction capture."
+                        ) if status != "healthy" else "",
+                        category="operator_history",
+                    )
+    except Exception:
+        pass
+
+    summary = _latest_periodic_summary("weekly")
+    if not summary:
+        return DoctorCheck(
+            id="runtime.protocol_compliance",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary="No weekly Deep Sleep protocol summary found",
+            repair_plan=[
+                "Run the Deep Sleep pipeline so weekly summaries include protocol compliance again",
+            ],
+            escalation_prompt=(
+                "NEXO cannot verify heartbeat / guard_check / change_log compliance because the latest weekly Deep Sleep summary is missing."
+            ),
+            category="operator_history",
+        )
+
+    protocol = summary.get("protocol_summary") or {}
+    overall = protocol.get("overall_compliance_pct")
+    guard = protocol.get("guard_check") or {}
+    heartbeat = protocol.get("heartbeat") or {}
+    change_log = protocol.get("change_log") or {}
+    evidence = [f"weekly summary: {summary.get('label', 'unknown')}"]
+    if overall is not None:
+        evidence.append(f"overall protocol compliance: {overall:.1f}%")
+    if guard.get("compliance_pct") is not None:
+        evidence.append(
+            f"guard_check: {guard.get('executed', 0)}/{guard.get('required', 0)} ({guard['compliance_pct']:.1f}%)"
+        )
+    if heartbeat.get("compliance_pct") is not None:
+        evidence.append(
+            f"heartbeat with context: {heartbeat.get('with_context', 0)}/{heartbeat.get('total', 0)} ({heartbeat['compliance_pct']:.1f}%)"
+        )
+    if change_log.get("compliance_pct") is not None:
+        evidence.append(
+            f"change_log after edits: {change_log.get('logged', 0)}/{change_log.get('edits', 0)} ({change_log['compliance_pct']:.1f}%)"
+        )
+
+    status = "healthy"
+    severity = "info"
+    repair_plan: list[str] = []
+    if overall is None:
+        status = "degraded"
+        severity = "warn"
+        repair_plan.append("Ensure Deep Sleep extractions keep writing protocol_summary data")
+    elif overall < 45:
+        status = "critical"
+        severity = "error"
+    elif overall < 70:
+        status = "degraded"
+        severity = "warn"
+
+    if status != "healthy":
+        repair_plan.extend(
+            [
+                "Reinforce heartbeat discipline on every user message",
+                "Call nexo_guard_check before production/shared edits",
+                "Record production changes with nexo_change_log after editing",
+            ]
+        )
+
+    return DoctorCheck(
+        id="runtime.protocol_compliance",
+        tier="runtime",
+        status=status,
+        severity=severity,
+        summary="Protocol compliance looks healthy" if status == "healthy" else "Protocol compliance needs hardening",
+        evidence=evidence,
+        repair_plan=repair_plan,
+        escalation_prompt=(
+            "Heartbeat / guard_check / change_log discipline is drifting. NEXO is at risk of repeating known errors and hiding change history."
+        ) if status != "healthy" else "",
+        category="operator_history",
+    )
+
+
+def check_release_artifact_sync() -> DoctorCheck:
+    version = _package_version()
+    changelog_version = _top_changelog_version()
+    evidence = []
+    status = "healthy"
+    severity = "info"
+    repair_plan: list[str] = []
+
+    if version:
+        evidence.append(f"package version: {version}")
+    if changelog_version:
+        evidence.append(f"top changelog version: {changelog_version}")
+
+    release_root = _release_root()
+    if not _has_release_publish_context(release_root):
+        if version:
+            evidence.append(f"package version: {version}")
+        evidence.append(f"release root: {release_root}")
+        evidence.append("packaged runtime without source repo; release artifact audit skipped")
+        return DoctorCheck(
+            id="runtime.release_artifacts",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary="Release artifact audit skipped for packaged runtime",
+            evidence=evidence,
+        )
+
+    if version and changelog_version and version != changelog_version:
+        status = "critical"
+        severity = "error"
+        evidence.append("package/changelog release version mismatch")
+        repair_plan.append("Bump or align CHANGELOG.md before publishing")
+
+    sync_script = release_root / "scripts" / "sync_release_artifacts.py"
+    if not sync_script.is_file():
+        status = "critical"
+        severity = "error"
+        evidence.append(f"missing release artifact sync script at {sync_script}")
+        repair_plan.append("Restore scripts/sync_release_artifacts.py")
+    else:
+        try:
+            result = subprocess.run(
+                [sys.executable, str(sync_script), "--check"],
+                cwd=str(release_root),
+                capture_output=True,
+                text=True,
+            )
+        except Exception as exc:
+            status = "degraded" if status == "healthy" else status
+            severity = "warn" if severity == "info" else severity
+            evidence.append(f"artifact sync check failed to run: {exc}")
+            repair_plan.append("Run scripts/sync_release_artifacts.py manually and inspect the local environment")
+        else:
+            if result.returncode != 0:
+                status = "degraded" if status == "healthy" else status
+                severity = "warn" if severity == "info" else severity
+                detail = result.stderr.strip() or result.stdout.strip() or "artifact sync check failed"
+                evidence.append(detail.splitlines()[0])
+                repair_plan.append("Run scripts/sync_release_artifacts.py before publishing")
+            else:
+                evidence.append("release artifacts in sync")
+
+    return DoctorCheck(
+        id="runtime.release_artifacts",
+        tier="runtime",
+        status=status,
+        severity=severity,
+        summary="Release artifact discipline OK" if status == "healthy" else "Release artifact discipline needs attention",
+        evidence=evidence,
+        repair_plan=repair_plan,
+        escalation_prompt=(
+            "Release-facing artifacts drifted away from the source version contract. Publishing now risks another hotfix release."
+        ) if status != "healthy" else "",
+    )
+
+
+def check_release_trace_hygiene() -> DoctorCheck:
+    db_path = paths.db_path()
+    if not db_path.is_file():
+        return DoctorCheck(
+            id="runtime.release_trace_hygiene",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary="Release trace hygiene unavailable (no DB)",
+            evidence=[],
+            repair_plan=[],
+            escalation_prompt="",
+            category="operator_history",
+        )
+
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=2)
+        conn.row_factory = sqlite3.Row
+        try:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('workflow_goals', 'workflow_runs')"
+                ).fetchall()
+            }
+            if "workflow_goals" not in tables or "workflow_runs" not in tables:
+                return DoctorCheck(
+                    id="runtime.release_trace_hygiene",
+                    tier="runtime",
+                    status="healthy",
+                    severity="info",
+                    summary="Release trace hygiene unavailable (workflow tables absent)",
+                    evidence=[],
+                    repair_plan=[],
+                    escalation_prompt="",
+                    category="operator_history",
+                )
+
+            stale_run_samples: list[str] = []
+            stale_goal_samples: list[str] = []
+            now = dt.datetime.now(dt.timezone.utc)
+            stale_after_hours = 6
+
+            run_rows = conn.execute(
+                """SELECT run_id, goal, updated_at
+                   FROM workflow_runs
+                   WHERE workflow_kind = 'audit-phase'
+                     AND status NOT IN ('completed', 'failed', 'cancelled')
+                   ORDER BY updated_at DESC"""
+            ).fetchall()
+            for row in run_rows:
+                updated_at = _parse_timestamp(row["updated_at"] or "")
+                if updated_at is None:
+                    stale_run_samples.append(f"{row['run_id']}: unreadable updated_at")
+                    continue
+                if updated_at.tzinfo is None:
+                    updated_at = updated_at.replace(tzinfo=dt.timezone.utc)
+                age_hours = (now - updated_at).total_seconds() / 3600
+                if age_hours >= stale_after_hours:
+                    stale_run_samples.append(
+                        f"{row['run_id']}: {age_hours:.1f}h stale ({str(row['goal'] or '')[:72]})"
+                    )
+
+            goal_rows = conn.execute(
+                """SELECT g.goal_id, g.title, g.updated_at,
+                          COALESCE((SELECT COUNT(*) FROM workflow_runs r WHERE r.goal_id = g.goal_id), 0) AS run_count,
+                          COALESCE((SELECT COUNT(*) FROM workflow_runs r WHERE r.goal_id = g.goal_id
+                                    AND r.status NOT IN ('completed', 'failed', 'cancelled')), 0) AS open_run_count
+                   FROM workflow_goals g
+                   WHERE g.status = 'active'
+                     AND (g.goal_id LIKE 'WG-AUDIT-%' OR g.title LIKE 'NEXO-AUDIT-%')
+                   ORDER BY g.updated_at DESC"""
+            ).fetchall()
+            for row in goal_rows:
+                if int(row["open_run_count"] or 0) > 0:
+                    continue
+                updated_at = _parse_timestamp(row["updated_at"] or "")
+                if updated_at is None:
+                    stale_goal_samples.append(f"{row['goal_id']}: unreadable updated_at")
+                    continue
+                if updated_at.tzinfo is None:
+                    updated_at = updated_at.replace(tzinfo=dt.timezone.utc)
+                age_hours = (now - updated_at).total_seconds() / 3600
+                if age_hours >= stale_after_hours:
+                    stale_goal_samples.append(
+                        f"{row['goal_id']}: {age_hours:.1f}h stale ({str(row['title'] or '')[:72]})"
+                    )
+        finally:
+            conn.close()
+    except Exception as exc:
+        return DoctorCheck(
+            id="runtime.release_trace_hygiene",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary="Release trace hygiene check failed",
+            evidence=[str(exc)],
+            repair_plan=["Inspect workflow_goals/workflow_runs state manually"],
+            escalation_prompt="Release traces could not be audited, so stale audit artifacts may be hiding in the runtime.",
+            category="operator_history",
+        )
+
+    evidence = [
+        f"stale audit workflows: {len(stale_run_samples)}",
+        f"stale audit goals: {len(stale_goal_samples)}",
+    ]
+    evidence.extend(stale_run_samples[:3])
+    evidence.extend(stale_goal_samples[:3])
+    if stale_run_samples or stale_goal_samples:
+        return DoctorCheck(
+            id="runtime.release_trace_hygiene",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary="Release trace hygiene needs cleanup",
+            evidence=evidence,
+            repair_plan=[
+                "Close or complete stale audit-phase workflows and active audit goals",
+                "Keep workflow/goal state aligned with the real shipped state after releases",
+            ],
+            escalation_prompt="Audit/release traces drifted away from reality, which makes shipping state look ambiguous.",
+            category="operator_history",
+        )
+    return DoctorCheck(
+        id="runtime.release_trace_hygiene",
+        tier="runtime",
+        status="healthy",
+        severity="info",
+        summary="Release trace hygiene OK",
+        evidence=evidence,
+        repair_plan=[],
+        escalation_prompt="",
+        category="operator_history",
+    )
+
+
+def check_state_watchers() -> DoctorCheck:
+    db_path = paths.db_path()
+    summary_path = paths.operations_dir() / "state-watchers-status.json"
+    active_watchers = 0
+    if db_path.is_file():
+        try:
+            conn = sqlite3.connect(str(db_path))
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM state_watchers WHERE status = 'active'"
+                ).fetchone()
+                active_watchers = int(row[0] or 0) if row else 0
+            finally:
+                conn.close()
+        except Exception:
+            active_watchers = 0
+
+    if active_watchers == 0:
+        return DoctorCheck(
+            id="runtime.state_watchers",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary="No active state watchers configured",
+            evidence=[],
+            repair_plan=[],
+            escalation_prompt="",
+        )
+
+    if not summary_path.is_file():
+        return DoctorCheck(
+            id="runtime.state_watchers",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary="State watchers configured but no fresh summary exists",
+            evidence=[f"active_watchers={active_watchers}", str(summary_path)],
+            repair_plan=["Run nexo_state_watcher_run or wait for daily self-audit to refresh watcher status"],
+            escalation_prompt="State watchers exist but their health summary is missing, so drift and expiry signals may be going dark.",
+        )
+
+    try:
+        payload = json.loads(summary_path.read_text())
+    except Exception as exc:
+        return DoctorCheck(
+            id="runtime.state_watchers",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary="State watchers summary is unreadable",
+            evidence=[str(exc)],
+            repair_plan=["Re-run nexo_state_watcher_run to regenerate operations/state-watchers-status.json"],
+            escalation_prompt="State watcher health cannot be trusted until the summary is readable again.",
+        )
+
+    generated_at = payload.get("generated_at")
+    evidence = [f"active_watchers={active_watchers}", f"generated_at={generated_at or 'missing'}"]
+    counts = payload.get("counts") or {}
+    if counts:
+        evidence.append(
+            "counts="
+            + ",".join(f"{key}:{int(value)}" for key, value in sorted(counts.items()))
+        )
+
+    status = "healthy"
+    severity = "info"
+    repair_plan: list[str] = []
+    generated_dt = None
+    if generated_at:
+        try:
+            generated_dt = dt.datetime.fromisoformat(str(generated_at).replace("Z", "+00:00"))
+        except Exception:
+            generated_dt = None
+    if not generated_dt or (dt.datetime.now(dt.timezone.utc) - generated_dt).total_seconds() > 36 * 3600:
+        status = "degraded"
+        severity = "warn"
+        repair_plan.append("Refresh state watchers daily so repo/API/expiry drift stays explicit")
+
+    if int(counts.get("critical") or 0) > 0:
+        status = "critical"
+        severity = "error"
+        repair_plan.append("Resolve the critical state watchers immediately")
+    elif int(counts.get("degraded") or 0) > 0 and status == "healthy":
+        status = "degraded"
+        severity = "warn"
+        repair_plan.append("Resolve degraded state watchers before they become hard failures")
+
+    return DoctorCheck(
+        id="runtime.state_watchers",
+        tier="runtime",
+        status=status,
+        severity=severity,
+        summary="State watchers look healthy" if status == "healthy" else "State watchers need attention",
+        evidence=evidence,
+        repair_plan=repair_plan,
+        escalation_prompt=(
+            "State watchers detected live drift or expiry risk across repo/cron/API/environment surfaces."
+        ) if status != "healthy" else "",
+    )
+
+
+def check_automation_telemetry(days: int = 7) -> DoctorCheck:
+    db_path = paths.db_path()
+    if not db_path.is_file():
+        return DoctorCheck(
+            id="runtime.automation_telemetry",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary="Automation telemetry DB is missing",
+            evidence=[str(db_path)],
+            repair_plan=["Run NEXO once so migrations create the shared runtime DB"],
+            escalation_prompt="Cost and parity telemetry cannot be trusted until the runtime DB exists.",
+        )
+
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=2)
+        try:
+            conn.row_factory = sqlite3.Row
+            table = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='automation_runs'"
+            ).fetchone()
+            if not table:
+                return DoctorCheck(
+                    id="runtime.automation_telemetry",
+                    tier="runtime",
+                    status="degraded",
+                    severity="warn",
+                    summary="Automation telemetry schema is missing",
+                    evidence=["table automation_runs not found"],
+                    repair_plan=["Run NEXO migrations before trusting automation cost/parity metrics"],
+                    escalation_prompt="Shared automation runs are happening without the telemetry table that release metrics depend on.",
+                )
+            columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(automation_runs)").fetchall()
+            }
+            schema_has_status = {
+                "status",
+                "input_tokens",
+                "cached_input_tokens",
+                "output_tokens",
+                "total_cost_usd",
+                "cost_source",
+                "backend",
+                "created_at",
+            }.issubset(columns)
+            if schema_has_status:
+                interactive_expr = "0"
+                if "session_type" in columns:
+                    interactive_expr = "COALESCE(session_type, '') LIKE 'interactive%'"
+                headless_unmetered_expr = (
+                    f"status = 'ok' AND NOT ({interactive_expr}) "
+                    "AND (input_tokens + cached_input_tokens + output_tokens) = 0 "
+                    "AND COALESCE(total_cost_usd, 0) <= 0 "
+                    "AND COALESCE(cost_source, '') IN ('', 'backend', 'missing')"
+                )
+                row = conn.execute(
+                    f"""
+                    SELECT
+                        COUNT(*) AS runs,
+                        SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS successful_runs,
+                        SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END) AS failed_runs,
+                        SUM(CASE WHEN status = 'ok' AND NOT ({interactive_expr}) AND NOT ({headless_unmetered_expr}) THEN 1 ELSE 0 END) AS scored_successful_runs,
+                        SUM(CASE WHEN status = 'ok' AND NOT ({interactive_expr}) AND (input_tokens + cached_input_tokens + output_tokens) > 0 THEN 1 ELSE 0 END) AS usage_runs,
+                        SUM(CASE WHEN status = 'ok' AND NOT ({interactive_expr}) AND total_cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS cost_runs,
+                        SUM(CASE WHEN status = 'ok' AND NOT ({interactive_expr}) AND cost_source = 'pricing_unavailable' THEN 1 ELSE 0 END) AS pricing_gaps,
+                        SUM(CASE WHEN {headless_unmetered_expr} THEN 1 ELSE 0 END) AS headless_unmetered_runs,
+                        SUM(CASE WHEN status = 'ok' AND ({interactive_expr}) AND ((input_tokens + cached_input_tokens + output_tokens) = 0 OR total_cost_usd IS NULL) THEN 1 ELSE 0 END) AS interactive_unmetered_runs,
+                        GROUP_CONCAT(DISTINCT backend) AS backends
+                    FROM automation_runs
+                    WHERE created_at >= datetime('now', ?)
+                    """,
+                    (f"-{days} days",),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS runs,
+                        COUNT(*) AS successful_runs,
+                        0 AS failed_runs,
+                        COUNT(*) AS scored_successful_runs,
+                        SUM(CASE WHEN (input_tokens + cached_input_tokens + output_tokens) > 0 THEN 1 ELSE 0 END) AS usage_runs,
+                        SUM(CASE WHEN total_cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS cost_runs,
+                        SUM(CASE WHEN cost_source = 'pricing_unavailable' THEN 1 ELSE 0 END) AS pricing_gaps,
+                        0 AS interactive_unmetered_runs,
+                        GROUP_CONCAT(DISTINCT backend) AS backends
+                    FROM automation_runs
+                    WHERE created_at >= datetime('now', ?)
+                    """,
+                    (f"-{days} days",),
+                ).fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        return DoctorCheck(
+            id="runtime.automation_telemetry",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary="Automation telemetry is unreadable",
+            evidence=[str(exc)],
+            repair_plan=["Inspect the runtime DB and restore the automation_runs table"],
+            escalation_prompt="Automation cost and parity metrics are unreadable, so release numbers may be lying by omission.",
+        )
+
+    total_runs = int((row["runs"] if row else 0) or 0)
+    if total_runs == 0:
+        return DoctorCheck(
+            id="runtime.automation_telemetry",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary="No recent automation runs to score",
+            evidence=[f"window={days}d", "runs=0"],
+            repair_plan=[],
+            escalation_prompt="",
+        )
+
+    successful_runs = int((row["successful_runs"] if row else 0) or 0)
+    failed_runs = int((row["failed_runs"] if row else 0) or 0)
+    scored_successful_runs = int((row["scored_successful_runs"] if row and "scored_successful_runs" in row.keys() else successful_runs) or 0)
+    usage_runs = int((row["usage_runs"] if row else 0) or 0)
+    cost_runs = int((row["cost_runs"] if row else 0) or 0)
+    pricing_gaps = int((row["pricing_gaps"] if row else 0) or 0)
+    headless_unmetered_runs = int((row["headless_unmetered_runs"] if row and "headless_unmetered_runs" in row.keys() else 0) or 0)
+    interactive_unmetered_runs = int((row["interactive_unmetered_runs"] if row and "interactive_unmetered_runs" in row.keys() else 0) or 0)
+    usage_denominator = scored_successful_runs or (successful_runs if not interactive_unmetered_runs and not headless_unmetered_runs else 0)
+    cost_denominator = scored_successful_runs or (successful_runs if not interactive_unmetered_runs and not headless_unmetered_runs else 0)
+    missing_usage_runs = max(0, usage_denominator - usage_runs) if usage_denominator else 0
+    usage_coverage = round((usage_runs / usage_denominator) * 100, 1) if usage_denominator else 100.0
+    cost_coverage = round((cost_runs / cost_denominator) * 100, 1) if cost_denominator else 100.0
+    evidence = [
+        f"window={days}d",
+        f"runs={total_runs}",
+        f"successful_runs={successful_runs}",
+        f"failed_runs={failed_runs}",
+        f"scored_successful_runs={scored_successful_runs}",
+        f"usage_coverage={usage_coverage}%",
+        f"cost_coverage={cost_coverage}%",
+        f"pricing_gaps={pricing_gaps}",
+    ]
+    if missing_usage_runs:
+        evidence.append(f"missing_usage_runs={missing_usage_runs}")
+    if headless_unmetered_runs:
+        evidence.append(f"headless_unmetered_runs_excluded={headless_unmetered_runs}")
+    if interactive_unmetered_runs:
+        evidence.append(f"interactive_unmetered_runs_excluded={interactive_unmetered_runs}")
+    backends = str((row["backends"] if row else "") or "").strip()
+    if backends:
+        evidence.append(f"backends={backends}")
+
+    status = "healthy"
+    severity = "info"
+    repair_plan: list[str] = []
+    if usage_coverage < AUTOMATION_TELEMETRY_USAGE_WARN_COVERAGE and missing_usage_runs > 1:
+        status = "degraded"
+        severity = "warn"
+        repair_plan.append("Restore backend usage parsing so automation runs always emit token telemetry")
+    if cost_coverage < 90.0:
+        status = "critical" if total_runs >= 3 else "degraded"
+        severity = "error" if status == "critical" else "warn"
+        repair_plan.append("Restore explicit backend cost or pricing coverage before trusting cost-per-task metrics")
+    if pricing_gaps:
+        status = "critical" if status != "critical" and total_runs >= 3 else status
+        severity = "error" if status == "critical" else severity
+        repair_plan.append("Add pricing coverage for new automation models or switch to backend-reported cost")
+
+    return DoctorCheck(
+        id="runtime.automation_telemetry",
+        tier="runtime",
+        status=status,
+        severity=severity,
+        summary="Automation telemetry looks healthy" if status == "healthy" else "Automation telemetry needs attention",
+        evidence=evidence,
+        repair_plan=repair_plan,
+        escalation_prompt=(
+            "Shared automation is running without enough telemetry coverage to defend parity/cost claims."
+        ) if status != "healthy" else "",
+    )
+
+
+def check_automation_caller_coverage(days: int = 7) -> DoctorCheck:
+    """Compare core cron activity with caller-attributed automation rows.
+
+    This is a support signal, not proof of failure: a cron can legitimately
+    have no model call when there is no work. It still catches the regression
+    class where a runner branch records rows without caller/session context.
+    """
+    db_path = paths.db_path()
+    if not db_path.is_file():
+        return DoctorCheck(
+            id="runtime.automation_caller_coverage",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary="Automation caller coverage DB is missing",
+            evidence=[str(db_path)],
+            repair_plan=["Run NEXO once so migrations create the shared runtime DB"],
+            escalation_prompt="Support cannot compare core cron activity with automation caller traces.",
+        )
+
+    expected_crons = tuple(CORE_AUTOMATION_CALLERS_BY_CRON)
+    placeholders = ",".join("?" for _ in expected_crons)
+
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=2)
+        conn.row_factory = sqlite3.Row
+        try:
+            tables = {
+                row["name"]
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            }
+            missing_tables = [name for name in ("cron_runs", "automation_runs") if name not in tables]
+            if missing_tables:
+                return DoctorCheck(
+                    id="runtime.automation_caller_coverage",
+                    tier="runtime",
+                    status="degraded",
+                    severity="warn",
+                    summary="Automation caller coverage schema is incomplete",
+                    evidence=[f"missing_tables={','.join(missing_tables)}"],
+                    repair_plan=["Run NEXO migrations before trusting automation caller coverage"],
+                    escalation_prompt="Core automation activity cannot be matched to caller-attributed model runs.",
+                )
+            cron_rows = conn.execute(
+                f"""
+                SELECT cron_id, COUNT(*) AS runs, MAX(started_at) AS last_started
+                FROM cron_runs
+                WHERE started_at >= datetime('now', ?)
+                  AND cron_id IN ({placeholders})
+                GROUP BY cron_id
+                ORDER BY cron_id
+                """,
+                (f"-{days} days", *expected_crons),
+            ).fetchall()
+            caller_rows = conn.execute(
+                """
+                SELECT caller, COUNT(*) AS runs,
+                       MAX(COALESCE(started_at, created_at)) AS last_seen
+                FROM automation_runs
+                WHERE COALESCE(started_at, created_at) >= datetime('now', ?)
+                GROUP BY caller
+                """,
+                (f"-{days} days",),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception as exc:
+        return DoctorCheck(
+            id="runtime.automation_caller_coverage",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary="Automation caller coverage is unreadable",
+            evidence=[str(exc)],
+            repair_plan=["Inspect runtime DB cron_runs and automation_runs tables"],
+            escalation_prompt="Support cannot verify whether core automations are leaving caller traces.",
+        )
+
+    caller_counts = {str(row["caller"] or ""): int(row["runs"] or 0) for row in caller_rows}
+    caller_last_seen = {str(row["caller"] or ""): str(row["last_seen"] or "") for row in caller_rows}
+    cron_rows = list(cron_rows)
+
+    evidence = [f"window={days}d", f"core_crons_seen={len(cron_rows)}"]
+    missing_matches: list[str] = []
+    for row in cron_rows:
+        cron_id = str(row["cron_id"] or "")
+        expected_callers = CORE_AUTOMATION_CALLERS_BY_CRON.get(cron_id, ())
+        matched = [caller for caller in expected_callers if caller_counts.get(caller, 0) > 0]
+        if matched:
+            evidence.append(
+                f"{cron_id}: cron_runs={int(row['runs'] or 0)} caller_runs="
+                + ",".join(f"{caller}:{caller_counts[caller]}" for caller in matched)
+            )
+        else:
+            expected = "|".join(expected_callers)
+            missing_matches.append(cron_id)
+            evidence.append(
+                f"{cron_id}: cron_runs={int(row['runs'] or 0)} no_matching_caller={expected} "
+                f"last_started={row['last_started']}"
+            )
+
+    empty_caller_runs = caller_counts.get("", 0)
+    if empty_caller_runs:
+        evidence.append(f"empty_caller_runs={empty_caller_runs}")
+    for caller in sorted(caller_counts):
+        if caller:
+            evidence.append(f"caller_seen={caller}:{caller_counts[caller]} last={caller_last_seen.get(caller, '')}")
+
+    if not cron_rows:
+        return DoctorCheck(
+            id="runtime.automation_caller_coverage",
+            tier="runtime",
+            status="healthy",
+            severity="info",
+            summary="No recent core automation cron activity to match",
+            evidence=evidence,
+            repair_plan=[],
+            escalation_prompt="",
+        )
+
+    status = "healthy"
+    severity = "info"
+    repair_plan: list[str] = []
+    if empty_caller_runs or missing_matches:
+        status = "degraded"
+        severity = "warn"
+        repair_plan.append(
+            "If the cron had work, inspect run_automation_prompt caller attribution; if it was a no-op tick, no user action is needed"
+        )
+
+    return DoctorCheck(
+        id="runtime.automation_caller_coverage",
+        tier="runtime",
+        status=status,
+        severity=severity,
+        summary=(
+            "Core automation caller coverage looks healthy"
+            if status == "healthy"
+            else "Core automation caller coverage needs review"
+        ),
+        evidence=evidence,
+        repair_plan=repair_plan,
+        escalation_prompt=(
+            "A core automation cron ran without a matching caller-attributed automation row in the selected window."
+        ) if status != "healthy" else "",
+    )
+
+
+def check_local_index_hygiene(fix: bool = False) -> DoctorCheck:
+    try:
+        from local_context import api as local_context_api
+
+        result = None
+        for attempt in range(3):
+            try:
+                try:
+                    result = local_context_api.local_index_hygiene(fix=fix, quick=not fix)
+                except TypeError:
+                    result = local_context_api.local_index_hygiene(fix=fix)
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt >= 2:
+                    raise
+                time.sleep(0.2 * (attempt + 1))
+        if result is None:
+            raise RuntimeError("local_index_hygiene returned no result")
+
+        residue = result.get("residue") or {}
+        cleanup = result.get("cleanup") or {}
+        privacy = result.get("privacy") or {}
+        privacy_residue = privacy.get("residue") or {}
+        privacy_cleanup = privacy.get("cleanup") or {}
+        privacy_truncated = bool(privacy.get("truncated") or privacy_residue.get("truncated"))
+        suspect_roots = [str(path) for path in result.get("removed_roots") or []]
+        residue_total = sum(int(residue.get(key, 0) or 0) for key in ("assets", "jobs", "errors", "dirs", "checkpoints"))
+        cleanup_total = sum(int(cleanup.get(key, 0) or 0) for key in ("assets", "jobs", "errors", "dirs", "checkpoints"))
+        privacy_residue_total = sum(int(privacy_residue.get(key, 0) or 0) for key in ("assets", "dirs", "content_secret_assets"))
+        privacy_cleanup_total = sum(int(privacy_cleanup.get(key, 0) or 0) for key in ("assets", "jobs", "errors", "chunks", "embeddings", "entities", "relations", "versions", "dirs", "content_secret_assets"))
+        evidence = [
+            "suspect_installer_roots=" + str(len(suspect_roots)),
+            "residue=" + json.dumps(residue, sort_keys=True),
+            "cleanup=" + json.dumps(cleanup, sort_keys=True),
+            "privacy_residue=" + json.dumps(privacy_residue, sort_keys=True),
+            "privacy_cleanup=" + json.dumps(privacy_cleanup, sort_keys=True),
+            "quick_scan=" + str(bool(result.get("quick") or privacy.get("quick"))),
+            "privacy_truncated=" + str(privacy_truncated),
+        ]
+        evidence.extend(f"root={path}" for path in suspect_roots[:5])
+        if residue_total == 0 and privacy_residue_total == 0 and not suspect_roots:
+            summary = (
+                "Local memory index quick scan found no residue"
+                if privacy_truncated
+                else "Local memory index hygiene is clean"
+            )
+            return DoctorCheck(
+                id="runtime.local_index_hygiene",
+                tier="runtime",
+                status="healthy",
+                severity="info",
+                summary=summary,
+                evidence=evidence,
+                repair_plan=[],
+            )
+        if fix:
+            return DoctorCheck(
+                id="runtime.local_index_hygiene",
+                tier="runtime",
+                status="healthy",
+                severity="info",
+                summary="Local memory index hygiene repaired",
+                evidence=evidence,
+                repair_plan=[],
+                fixed=cleanup_total > 0 or privacy_cleanup_total > 0 or bool(suspect_roots),
+            )
+        return DoctorCheck(
+            id="runtime.local_index_hygiene",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary="Local memory index has stale or private residue",
+            evidence=evidence,
+            repair_plan=["Run `nexo doctor --tier runtime --fix` to purge stale local memory roots/private residue, or run a full local_index_hygiene scan outside release readiness"],
+            escalation_prompt="Local memory may contain stale or private index payloads that should be purged before indexing continues.",
+        )
+    except Exception as exc:
+        return DoctorCheck(
+            id="runtime.local_index_hygiene",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary="Local memory index hygiene could not be checked",
+            evidence=[str(exc)],
+            repair_plan=["Inspect local_context.api.local_index_hygiene and runtime DB tables"],
+            escalation_prompt="Support cannot verify local memory index residue.",
+        )
+
+
+def check_memory_fabric_health(fix: bool = False) -> DoctorCheck:
+    try:
+        import memory_fabric
+
+        repair = None
+        if fix:
+            repair = memory_fabric.repair_memory_fabric(
+                transcript_hours=720,
+                transcript_limit=1000,
+                backup_limit=5000,
+            )
+        report = memory_fabric.memory_fabric_health(include_backup_scan=True)
+        issues = report.get("issues") or []
+        evidence = [
+            "transcripts=" + json.dumps(report.get("transcripts") or {}, sort_keys=True),
+            "historical_diaries=" + json.dumps(report.get("historical_diaries") or {}, sort_keys=True),
+            "local_context=" + json.dumps(report.get("local_context") or {}, sort_keys=True),
+            "knowledge_graph=" + json.dumps(report.get("knowledge_graph") or {}, sort_keys=True),
+        ]
+        evidence.extend(
+            f"issue={item.get('severity')}:{item.get('code')}:{item.get('message')}"
+            for item in issues[:6]
+            if isinstance(item, dict)
+        )
+        if repair:
+            evidence.append("repair=" + json.dumps({
+                "transcripts_indexed": (repair.get("transcripts") or {}).get("indexed"),
+                "historical_diaries_inserted": (repair.get("backups") or {}).get("inserted"),
+            }, sort_keys=True))
+        blocking = [
+            item for item in issues
+            if isinstance(item, dict) and item.get("code") in {"transcript_index_empty", "backup_diaries_not_reconciled"}
+        ]
+        if not blocking:
+            return DoctorCheck(
+                id="runtime.memory_fabric",
+                tier="runtime",
+                status="healthy",
+                severity="info",
+                summary="Memory Fabric coverage is queryable",
+                evidence=evidence,
+                repair_plan=[],
+                fixed=bool(repair),
+            )
+        return DoctorCheck(
+            id="runtime.memory_fabric",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary="Memory Fabric coverage needs repair",
+            evidence=evidence,
+            repair_plan=["Run `nexo doctor --tier runtime --fix` or `nexo update` to warm transcript and historical backup indexes"],
+            escalation_prompt="Some memory sources exist outside the active query indexes, so exact historical lookup may fall back to slow raw scans.",
+            fixed=bool(repair),
+        )
+    except Exception as exc:
+        return DoctorCheck(
+            id="runtime.memory_fabric",
+            tier="runtime",
+            status="degraded",
+            severity="warn",
+            summary="Memory Fabric health could not be checked",
+            evidence=[str(exc)],
+            repair_plan=["Inspect memory_fabric.py and DB migrations"],
+            escalation_prompt="Support cannot verify unified memory coverage.",
+        )
+
+
+def _filter_runtime_checks_for_plane(checks: list[DoctorCheck], plane: str = "") -> list[DoctorCheck]:
+    if plane == "installation_live":
+        return [check for check in checks if check.category != "operator_history"]
+    return checks
+
+
+def run_runtime_checks(fix: bool = False, plane: str = "") -> list[DoctorCheck]:
+    """Run all runtime-tier checks. Read-only by default."""
+    checks = [
+        safe_check(check_immune_status),
+        safe_check(check_watchdog_status),
+        safe_check(check_runner_health_status),
+        safe_check(check_stale_sessions),
+        safe_check(check_cron_freshness),
+        safe_check(check_client_backend_preferences, fix=fix),
+        safe_check(check_packaged_update_npm_toolchain, fix=fix),
+        safe_check(check_client_bootstrap_parity, fix=fix),
+        safe_check(check_codex_session_parity),
+        safe_check(check_bootstrap_reached_startup),
+        safe_check(check_codex_conditioned_file_discipline),
+        safe_check(check_codex_protocol_compliance, include_history=plane != "installation_live"),
+        safe_check(check_claude_desktop_shared_brain),
+        safe_check(check_transcript_source_parity),
+        safe_check(check_client_assumption_regressions),
+        safe_check(check_protocol_compliance),
+        safe_check(check_automation_telemetry),
+        safe_check(check_automation_caller_coverage),
+        safe_check(check_state_watchers),
+        safe_check(check_local_index_hygiene, fix=fix),
+        safe_check(check_memory_fabric_health, fix=fix),
+        safe_check(check_release_artifact_sync),
+        safe_check(check_release_trace_hygiene),
+        safe_check(check_launchagent_inventory),
+        safe_check(check_launchagent_integrity, fix=fix),
+        safe_check(check_personal_script_registry, fix=fix),
+        safe_check(check_personal_automation_health_contracts),
+        safe_check(check_skill_health, fix=fix),
+    ]
+    return _filter_runtime_checks_for_plane(checks, plane=plane)

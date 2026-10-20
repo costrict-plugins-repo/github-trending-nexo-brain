@@ -1,0 +1,281 @@
+"""Lifecycle Events MCP plugin — nexo_lifecycle_event tool (v7.4.0).
+
+Exposes the canonical handler as an MCP tool so nexo-desktop's
+ConversationLifecycleService can relay close/delete/archive/app-exit/
+window-close intents to Brain and get a formal acknowledgement.
+
+See src/lifecycle_events.py for the handler contract and
+guardian-claude-desktop-plan.md for the overall architecture.
+"""
+from __future__ import annotations
+
+import json
+from typing import Any
+
+import lifecycle_events
+
+
+def handle_nexo_lifecycle_event(
+    event_id: str,
+    action: str,
+    conversation_id: str,
+    session_id: str = "",
+    reason: str = "user_action",
+    payload_snapshot: str = "",
+    source: str = "desktop",
+    schema_version: int = 1,
+) -> str:
+    """Record a durable lifecycle event and return the canonical ack.
+
+    Desktop (or any future client) MUST persist the event locally first
+    (NDJSON queue) before calling this tool. The handler is idempotent:
+    re-delivery of the same event_id returns ``already_processed``.
+
+    Args:
+        event_id: UUID minted by the client. Primary idempotency key.
+        action: One of ``close`` / ``delete`` / ``archive`` / ``switch``
+            / ``app-exit`` / ``window-close``.
+        conversation_id: Client-side conversation identifier.
+        session_id: Claude session id that backs the conversation, when
+            known. Optional.
+        reason: Free-form origin tag. Default ``user_action``.
+        payload_snapshot: JSON-encoded snapshot of the conversation at
+            the moment of the click (title, last_message_at, is_active,
+            etc). Accepts an empty string if nothing was snapped.
+        source: Client identifier. Default ``desktop``.
+        schema_version: Event schema version the client emitted. Default 1.
+
+    Returns:
+        JSON string ``{status, event_id, ...}``. ``status`` is one of
+        ``processed`` / ``already_processed`` / ``accepted`` /
+        ``rejected`` / ``retryable_error``.
+    """
+    payload_obj: Any = {}
+    if payload_snapshot:
+        try:
+            parsed = json.loads(payload_snapshot)
+            if isinstance(parsed, dict):
+                payload_obj = parsed
+        except Exception:
+            payload_obj = {"_raw": str(payload_snapshot)[:4096]}
+
+    try:
+        result = lifecycle_events.record_lifecycle_event(
+            event_id=event_id,
+            action=action,
+            conversation_id=conversation_id,
+            session_id=session_id or None,
+            reason=reason or "user_action",
+            payload_snapshot=payload_obj,
+            source=source or "desktop",
+            schema_version=int(schema_version or 1),
+        )
+    except Exception as exc:
+        return json.dumps({
+            "status": "retryable_error",
+            "reason": f"{type(exc).__name__}: {exc}",
+            "handler_threw": True,
+        }, ensure_ascii=False)
+
+    return json.dumps(result, ensure_ascii=False)
+
+
+def handle_nexo_lifecycle_status(event_id: str) -> str:
+    """Read the current delivery_status of a lifecycle event.
+
+    Primarily used by reconciliation at Desktop boot: for each
+    still-pending or retryable event in the local NDJSON queue, ask
+    Brain whether it already processed it (Desktop crashed between the
+    append and the ack) or whether we need to re-submit.
+    """
+    if not event_id:
+        return json.dumps({"status": "rejected", "reason": "missing-event-id"})
+    try:
+        row = lifecycle_events.get_lifecycle_event(event_id)
+    except Exception as exc:
+        return json.dumps({"status": "retryable_error", "reason": f"{type(exc).__name__}: {exc}"})
+    if row is None:
+        return json.dumps({"status": "not_found", "event_id": event_id})
+    return json.dumps(row, ensure_ascii=False)
+
+
+def handle_nexo_lifecycle_complete_canonical(
+    event_id: str,
+    canonical_plan_id: str,
+    results: str = "",
+) -> str:
+    """Close the v7.5 canonical-authority 2-call contract.
+
+    Desktop calls this tool after executing every action Brain returned
+    in the ``canonical_actions`` array from ``nexo_lifecycle_event``.
+    Brain then records ``canonical_done_at`` and flips the row status
+    to ``canonical_done`` (or ``retryable_error`` if any action
+    failed).
+
+    Args:
+        event_id: UUID of the original lifecycle event.
+        canonical_plan_id: The plan id Brain returned. Mismatch → rejected.
+        results: JSON-encoded array of per-action outcomes:
+            ``[{"action_id": "a1", "status": "ok"|"failed", ...}, ...]``
+
+    Returns:
+        JSON ack with the effective row status.
+    """
+    parsed_results: list = []
+    if results:
+        try:
+            parsed = json.loads(results)
+            if isinstance(parsed, list):
+                parsed_results = parsed
+            else:
+                parsed_results = [{"status": "failed", "reason": "results-not-array", "raw": str(results)[:200]}]
+        except Exception as exc:
+            parsed_results = [{"status": "failed", "reason": f"malformed-results:{exc}"}]
+
+    try:
+        ack = lifecycle_events.record_complete_canonical(
+            event_id=str(event_id or ""),
+            canonical_plan_id=str(canonical_plan_id or ""),
+            results=parsed_results,
+        )
+    except Exception as exc:
+        return json.dumps({
+            "status": "retryable_error",
+            "reason": f"{type(exc).__name__}: {exc}",
+            "handler_threw": True,
+        }, ensure_ascii=False)
+    return json.dumps(ack, ensure_ascii=False)
+
+
+def handle_nexo_lifecycle_wait_for_diary(
+    event_id: str,
+    timeout_ms: int = 45_000,
+    poll_ms: int = 500,
+) -> str:
+    """Wait until a canonical lifecycle event has real diary evidence."""
+    try:
+        ack = lifecycle_events.wait_for_canonical_diary(
+            event_id=str(event_id or ""),
+            timeout_ms=int(timeout_ms or 0),
+            poll_ms=int(poll_ms or 500),
+        )
+    except Exception as exc:
+        return json.dumps({
+            "status": "retryable_error",
+            "reason": f"{type(exc).__name__}: {exc}",
+            "handler_threw": True,
+        }, ensure_ascii=False)
+    return json.dumps(ack, ensure_ascii=False)
+
+
+def handle_nexo_lifecycle_write_fallback_diary(
+    event_id: str,
+    reason: str = "",
+    source: str = "desktop-lifecycle-fallback",
+) -> str:
+    """Write emergency diary evidence for a lifecycle event."""
+    try:
+        ack = lifecycle_events.write_fallback_diary_for_lifecycle_event(
+            event_id=str(event_id or ""),
+            reason=str(reason or ""),
+            source=str(source or "desktop-lifecycle-fallback"),
+        )
+    except Exception as exc:
+        return json.dumps({
+            "status": "retryable_error",
+            "reason": f"{type(exc).__name__}: {exc}",
+            "handler_threw": True,
+        }, ensure_ascii=False)
+    return json.dumps(ack, ensure_ascii=False)
+
+
+def handle_nexo_lifecycle_wait_for_stop(
+    event_id: str,
+    timeout_ms: int = 10_000,
+    poll_ms: int = 500,
+) -> str:
+    """Wait until a canonical lifecycle event no longer has an active NEXO session."""
+    try:
+        ack = lifecycle_events.wait_for_canonical_stop(
+            event_id=str(event_id or ""),
+            timeout_ms=int(timeout_ms or 0),
+            poll_ms=int(poll_ms or 500),
+        )
+    except Exception as exc:
+        return json.dumps({
+            "status": "retryable_error",
+            "reason": f"{type(exc).__name__}: {exc}",
+            "handler_threw": True,
+        }, ensure_ascii=False)
+    return json.dumps(ack, ensure_ascii=False)
+
+
+def handle_nexo_lifecycle_stop_nexo_session(
+    sid: str,
+) -> str:
+    """Best-effort explicit stop of a NEXO SID for Desktop lifecycle cleanup."""
+    try:
+        from tools_sessions import handle_stop
+
+        raw_sid = str(sid or "").strip()
+        stop_sids = lifecycle_events.registered_stop_session_ids(raw_sid)
+        if not stop_sids:
+            return json.dumps({
+                "status": "ok",
+                "sid": raw_sid,
+                "stopped_session_ids": [],
+                "skipped": True,
+                "reason": "no-registered-nexo-session",
+            }, ensure_ascii=False)
+        messages = [handle_stop(stop_sid) for stop_sid in stop_sids]
+        return json.dumps({
+            "status": "ok",
+            "sid": raw_sid,
+            "stopped_session_ids": stop_sids,
+            "message": " ".join(messages),
+        }, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({
+            "status": "retryable_error",
+            "sid": str(sid or ""),
+            "reason": f"{type(exc).__name__}: {exc}",
+        }, ensure_ascii=False)
+
+
+TOOLS = [
+    (
+        handle_nexo_lifecycle_event,
+        "nexo_lifecycle_event",
+        "Record a durable lifecycle event (close/delete/archive/switch/app-exit/window-close). In v7.5 Brain returns a canonical_actions plan for diary-triggering actions with a live session_id.",
+    ),
+    (
+        handle_nexo_lifecycle_status,
+        "nexo_lifecycle_status",
+        "Read the current delivery_status of a lifecycle event. Used by Desktop boot reconciliation.",
+    ),
+    (
+        handle_nexo_lifecycle_complete_canonical,
+        "nexo_lifecycle_complete_canonical",
+        "Confirm that Desktop finished executing the canonical_actions Brain handed out in a prior nexo_lifecycle_event call. Brain marks canonical_done_at only on this confirmation.",
+    ),
+    (
+        handle_nexo_lifecycle_wait_for_diary,
+        "nexo_lifecycle_wait_for_diary",
+        "Wait for concrete session_diary evidence for a canonical lifecycle event before Desktop stops the session.",
+    ),
+    (
+        handle_nexo_lifecycle_write_fallback_diary,
+        "nexo_lifecycle_write_fallback_diary",
+        "Write emergency session_diary evidence when Desktop cannot get a live agent-authored close diary.",
+    ),
+    (
+        handle_nexo_lifecycle_wait_for_stop,
+        "nexo_lifecycle_wait_for_stop",
+        "Wait until the linked NEXO session is no longer active for a canonical lifecycle event.",
+    ),
+    (
+        handle_nexo_lifecycle_stop_nexo_session,
+        "nexo_lifecycle_stop_nexo_session",
+        "Best-effort explicit nexo_stop by SID for Desktop lifecycle cleanup.",
+    ),
+]

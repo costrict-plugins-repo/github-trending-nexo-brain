@@ -1,0 +1,1135 @@
+from __future__ import annotations
+"""Runtime power policy helpers.
+
+Manages the optional "prevent sleep" helper as an explicit, persisted runtime
+preference. The policy is stored in config/schedule.json to avoid introducing a
+second user-facing config surface.
+
+Important semantic note:
+- ``always_on`` means "enable the platform power helper" for best-effort
+  background availability.
+- It does not replace wake recovery or catchup.
+- On laptops, especially with the lid closed, behavior remains platform and
+  setup dependent.
+"""
+
+import json
+import os
+import paths
+import platform
+import plistlib
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+
+NEXO_HOME = Path(os.environ.get("NEXO_HOME", str(Path.home() / ".nexo")))
+NEXO_CODE = Path(os.environ.get("NEXO_CODE", str(Path(__file__).resolve().parent)))
+CONFIG_DIR = paths.config_dir()
+SCHEDULE_FILE = CONFIG_DIR / "schedule.json"
+POWER_POLICY_KEY = "power_policy"
+POWER_POLICY_VERSION_KEY = "power_policy_version"
+POWER_POLICY_VERSION = 2
+POWER_POLICY_ALWAYS_ON = "always_on"
+POWER_POLICY_DISABLED = "disabled"
+POWER_POLICY_UNSET = "unset"
+VALID_POWER_POLICIES = {
+    POWER_POLICY_ALWAYS_ON,
+    POWER_POLICY_DISABLED,
+    POWER_POLICY_UNSET,
+}
+FULL_DISK_ACCESS_STATUS_KEY = "full_disk_access_status"
+FULL_DISK_ACCESS_STATUS_VERSION_KEY = "full_disk_access_status_version"
+FULL_DISK_ACCESS_REASONS_KEY = "full_disk_access_reasons"
+FULL_DISK_ACCESS_STATUS_VERSION = 1
+FULL_DISK_ACCESS_UNSET = "unset"
+FULL_DISK_ACCESS_GRANTED = "granted"
+FULL_DISK_ACCESS_DECLINED = "declined"
+FULL_DISK_ACCESS_LATER = "later"
+FULL_DISK_ACCESS_STATE_FILE = NEXO_HOME / "runtime" / "state" / "full-disk-access-required.json"
+VALID_FULL_DISK_ACCESS_STATUSES = {
+    FULL_DISK_ACCESS_UNSET,
+    FULL_DISK_ACCESS_GRANTED,
+    FULL_DISK_ACCESS_DECLINED,
+    FULL_DISK_ACCESS_LATER,
+}
+LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
+LINUX_SYSTEMD_USER_DIR = Path.home() / ".config" / "systemd" / "user"
+MACOS_CAFFEINATE_PATH = Path("/usr/bin/caffeinate")
+MACOS_CLOSED_LID_BEHAVIOR = "best_effort"
+LINUX_CLOSED_LID_BEHAVIOR = "host_policy"
+MACOS_FDA_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+MACOS_FDA_PROBE_PATHS = (
+    Path.home() / "Library" / "Application Support" / "com.apple.TCC" / "TCC.db",
+    Path.home() / "Library" / "Mail",
+    Path.home() / "Library" / "Messages",
+    Path.home() / "Library" / "Safari",
+    Path.home() / "Library" / "Application Support" / "AddressBook",
+)
+# Model defaults loaded from src/model_defaults.json (single source of truth).
+from model_defaults import client_default as _model_client_default
+
+_CLAUDE_DEFAULTS = _model_client_default("claude_code")
+_CODEX_DEFAULTS = _model_client_default("codex")
+
+DEFAULT_CLAUDE_CODE_MODEL = _CLAUDE_DEFAULTS["model"]
+DEFAULT_CLAUDE_CODE_REASONING_EFFORT = _CLAUDE_DEFAULTS["reasoning_effort"]
+DEFAULT_CODEX_MODEL = _CODEX_DEFAULTS["model"]
+DEFAULT_CODEX_REASONING_EFFORT = _CODEX_DEFAULTS["reasoning_effort"]
+
+
+def resolve_launchagent_path() -> str:
+    """Build a PATH string for LaunchAgent plists that includes nvm node if present."""
+    home = Path.home()
+    parts = [
+        str(home / ".nexo/runtime/bootstrap/npm-global/bin"),
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        str(home / ".local/bin"),
+        str(home / ".nexo/bin"),
+    ]
+    # Detect nvm node
+    nvm_dir = home / ".nvm/versions/node"
+    if nvm_dir.is_dir():
+        versions = sorted(nvm_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+        for v in versions:
+            node_bin = v / "bin"
+            if (node_bin / "node").exists():
+                parts.insert(0, str(node_bin))
+                break
+    return ":".join(parts)
+
+
+def launchagent_label_from_plist(plist_path: Path, label: str | None = None) -> str:
+    """Resolve a launchd label from a plist, falling back to the filename."""
+    if label:
+        return label
+    try:
+        with Path(plist_path).open("rb") as fh:
+            payload = plistlib.load(fh)
+        plist_label = payload.get("Label")
+        if plist_label:
+            return str(plist_label)
+    except Exception:
+        pass
+    name = Path(plist_path).stem
+    return name
+
+
+def _launchctl_text(proc: subprocess.CompletedProcess) -> str:
+    return (proc.stderr or proc.stdout or "").strip()
+
+
+def _normalize_runtime_probe_path(candidate: str | os.PathLike[str] | None) -> str:
+    if not candidate:
+        return ""
+    try:
+        resolved = Path(candidate).expanduser().resolve(strict=False)
+    except Exception:
+        try:
+            resolved = Path(candidate).expanduser()
+        except Exception:
+            return ""
+    return str(resolved).replace("\\", "/").rstrip("/")
+
+
+def _is_within_path(candidate: str, root: str) -> bool:
+    return bool(candidate) and bool(root) and (candidate == root or candidate.startswith(f"{root}/"))
+
+
+def launchctl_side_effects_allowed() -> bool:
+    """Return False for pytest/CI temp homes that must never touch launchd."""
+    if str(os.environ.get("NEXO_ALLOW_EPHEMERAL_INSTALL", "")).strip() == "1":
+        return True
+
+    temp_roots: set[str] = set()
+    for root in (
+        tempfile.gettempdir(),
+        "/tmp",
+        "/private/tmp",
+        "/var/folders",
+        "/private/var/folders",
+    ):
+        normalized = _normalize_runtime_probe_path(root)
+        if not normalized:
+            continue
+        temp_roots.add(normalized)
+        if normalized == "/tmp":
+            temp_roots.add("/private/tmp")
+        elif normalized == "/private/tmp":
+            temp_roots.add("/tmp")
+        elif normalized.startswith("/var/"):
+            temp_roots.add(f"/private{normalized}")
+        elif normalized.startswith("/private/var/"):
+            temp_roots.add(normalized.removeprefix("/private"))
+
+    candidates = (
+        _normalize_runtime_probe_path(os.environ.get("HOME", str(Path.home()))),
+        _normalize_runtime_probe_path(os.environ.get("NEXO_HOME", str(NEXO_HOME))),
+    )
+    return not any(
+        _is_within_path(candidate, root)
+        for candidate in candidates
+        for root in temp_roots
+    )
+
+
+def _launchctl_print(label: str, timeout: int = 5) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def launchagent_loaded_from_plist(plist_path: Path, label: str | None = None) -> bool:
+    """Return True when launchd has the label loaded from this exact plist."""
+    plist_path = Path(plist_path)
+    resolved_label = launchagent_label_from_plist(plist_path, label)
+    try:
+        proc = _launchctl_print(resolved_label)
+    except Exception:
+        return False
+    if proc.returncode != 0:
+        return False
+    stdout = proc.stdout or ""
+    candidates = {
+        str(plist_path),
+        str(plist_path.expanduser()),
+        str(plist_path.resolve(strict=False)),
+    }
+    return any(f"path = {candidate}" in stdout or candidate in stdout for candidate in candidates)
+
+
+def unload_launchagent_plist(
+    plist_path: Path,
+    label: str | None = None,
+    timeout: int = 10,
+    wait_seconds: float = 0.25,
+) -> dict:
+    """Best-effort unload using modern and legacy launchctl forms.
+
+    macOS can report a generic bootstrap error when a job is still loaded.
+    We therefore boot out by label, boot out by plist path, and finally call
+    the legacy unload form for older installs.
+    """
+    plist_path = Path(plist_path)
+    resolved_label = launchagent_label_from_plist(plist_path, label)
+    if not launchctl_side_effects_allowed():
+        return {
+            "ok": True,
+            "label": resolved_label,
+            "action": "skipped-ephemeral-runtime",
+            "errors": [],
+        }
+    domain = f"gui/{os.getuid()}"
+    commands = [
+        ["launchctl", "bootout", f"{domain}/{resolved_label}"],
+        ["launchctl", "bootout", domain, str(plist_path)],
+        ["launchctl", "unload", str(plist_path)],
+    ]
+    evidence: list[str] = []
+    for command in commands:
+        try:
+            proc = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+            if proc.returncode != 0:
+                text = _launchctl_text(proc)
+                if text:
+                    evidence.append(text[:300])
+        except subprocess.TimeoutExpired:
+            evidence.append("launchctl timeout")
+        except Exception as exc:
+            evidence.append(str(exc)[:300])
+
+    deadline = time.monotonic() + max(0.0, wait_seconds)
+    while time.monotonic() < deadline:
+        if not launchagent_loaded_from_plist(plist_path, resolved_label):
+            return {"ok": True, "label": resolved_label, "errors": evidence}
+        time.sleep(0.05)
+
+    still_loaded = launchagent_loaded_from_plist(plist_path, resolved_label)
+    return {"ok": not still_loaded, "label": resolved_label, "errors": evidence}
+
+
+def reload_launchagent_plist(
+    plist_path: Path,
+    label: str | None = None,
+    timeout: int = 10,
+) -> dict:
+    """Reload one LaunchAgent and tolerate already-loaded launchd races."""
+    plist_path = Path(plist_path)
+    resolved_label = launchagent_label_from_plist(plist_path, label)
+    if not plist_path.is_file():
+        return {"ok": False, "label": resolved_label, "error": "plist missing"}
+    if not launchctl_side_effects_allowed():
+        return {"ok": True, "label": resolved_label, "action": "skipped-ephemeral-runtime"}
+
+    unload_launchagent_plist(plist_path, resolved_label, timeout=timeout)
+    domain = f"gui/{os.getuid()}"
+    try:
+        bootstrap = subprocess.run(
+            ["launchctl", "bootstrap", domain, str(plist_path)],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "label": resolved_label, "error": "launchctl timeout"}
+    except Exception as exc:
+        return {"ok": False, "label": resolved_label, "error": str(exc)[:300]}
+
+    if bootstrap.returncode == 0:
+        return {"ok": True, "label": resolved_label, "action": "bootstrap"}
+
+    bootstrap_error = _launchctl_text(bootstrap) or "bootstrap failed"
+    if launchagent_loaded_from_plist(plist_path, resolved_label):
+        return {
+            "ok": True,
+            "label": resolved_label,
+            "action": "already-loaded",
+            "warning": bootstrap_error[:300],
+        }
+
+    try:
+        fallback = subprocess.run(
+            ["launchctl", "load", "-w", str(plist_path)],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "label": resolved_label, "error": "launchctl timeout"}
+    except Exception as exc:
+        return {"ok": False, "label": resolved_label, "error": str(exc)[:300]}
+
+    if fallback.returncode == 0 or launchagent_loaded_from_plist(plist_path, resolved_label):
+        return {
+            "ok": True,
+            "label": resolved_label,
+            "action": "legacy-load",
+            "warning": bootstrap_error[:300],
+        }
+
+    fallback_error = _launchctl_text(fallback) or "load failed"
+    return {
+        "ok": False,
+        "label": resolved_label,
+        "error": fallback_error[:300],
+        "bootstrap_error": bootstrap_error[:300],
+    }
+
+
+def _schedule_defaults() -> dict:
+    return {
+        "timezone": "UTC",
+        "auto_update": True,
+        "interactive_clients": {
+            "claude_code": True,
+            "codex": False,
+            "claude_desktop": False,
+        },
+        "default_terminal_client": "claude_code",
+        "automation_enabled": True,
+        "automation_backend": "claude_code",
+        "provider_runtime": {
+            "schema_version": 1,
+            "selected_chat_provider": "anthropic",
+            "automation_provider": "anthropic",
+            "automation_backend": "claude_code",
+            "providers": {
+                "anthropic": {"client": "claude_code"},
+                "openai": {"client": "codex"},
+            },
+            "fallback_policy": {"chat": "ask", "automation": "fail_closed"},
+            "last_provider_change": {
+                "changed_at": None,
+                "from_provider": None,
+                "to_provider": None,
+                "source": None,
+            },
+        },
+        "client_runtime_profiles": {
+            "claude_code": {
+                "model": DEFAULT_CLAUDE_CODE_MODEL,
+                "reasoning_effort": DEFAULT_CLAUDE_CODE_REASONING_EFFORT,
+            },
+            "codex": {
+                "model": DEFAULT_CODEX_MODEL,
+                "reasoning_effort": DEFAULT_CODEX_REASONING_EFFORT,
+            },
+        },
+        "client_install_preferences": {
+            "claude_code": "ask",
+            "codex": "ask",
+            "claude_desktop": "manual",
+        },
+        POWER_POLICY_KEY: POWER_POLICY_UNSET,
+        POWER_POLICY_VERSION_KEY: POWER_POLICY_VERSION,
+        FULL_DISK_ACCESS_STATUS_KEY: FULL_DISK_ACCESS_UNSET,
+        FULL_DISK_ACCESS_STATUS_VERSION_KEY: FULL_DISK_ACCESS_STATUS_VERSION,
+        FULL_DISK_ACCESS_REASONS_KEY: [],
+        "processes": {},
+    }
+
+
+def _load_schedule_payload(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _legacy_schedule_file() -> Path:
+    return NEXO_HOME / "config" / "schedule.json"
+
+
+def load_schedule_config() -> dict:
+    data: dict | None = None
+    if SCHEDULE_FILE.is_file():
+        data = _load_schedule_payload(SCHEDULE_FILE)
+    else:
+        legacy_file = _legacy_schedule_file()
+        if legacy_file != SCHEDULE_FILE and legacy_file.is_file():
+            data = _load_schedule_payload(legacy_file)
+    if data is None:
+        return _schedule_defaults()
+    defaults = _schedule_defaults()
+    if "provider_runtime" not in data:
+        defaults.pop("provider_runtime", None)
+    merged = defaults
+    merged.update(data)
+    merged.setdefault("processes", {})
+    return merged
+
+
+def save_schedule_config(schedule: dict) -> Path:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    payload = dict(_schedule_defaults())
+    payload.update(schedule or {})
+    payload.setdefault("processes", {})
+    payload[POWER_POLICY_KEY] = normalize_power_policy(payload.get(POWER_POLICY_KEY))
+    payload[POWER_POLICY_VERSION_KEY] = POWER_POLICY_VERSION
+    payload[FULL_DISK_ACCESS_STATUS_KEY] = normalize_full_disk_access_status(
+        payload.get(FULL_DISK_ACCESS_STATUS_KEY)
+    )
+    payload[FULL_DISK_ACCESS_STATUS_VERSION_KEY] = FULL_DISK_ACCESS_STATUS_VERSION
+    payload[FULL_DISK_ACCESS_REASONS_KEY] = normalize_full_disk_access_reasons(
+        payload.get(FULL_DISK_ACCESS_REASONS_KEY)
+    )
+    SCHEDULE_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+    return SCHEDULE_FILE
+
+
+def normalize_power_policy(value: str | None) -> str:
+    candidate = str(value or "").strip().lower()
+    if candidate in {"enabled", "yes", "on", "true", "1"}:
+        return POWER_POLICY_ALWAYS_ON
+    if candidate in {"disabled", "no", "off", "false", "0"}:
+        return POWER_POLICY_DISABLED
+    if candidate in VALID_POWER_POLICIES:
+        return candidate
+    return POWER_POLICY_UNSET
+
+
+def _detect_linux_power_helper() -> tuple[str | None, str | None]:
+    if shutil.which("systemd-inhibit"):
+        return "systemd-inhibit", shutil.which("systemd-inhibit")
+    if shutil.which("caffeine"):
+        return "caffeine", shutil.which("caffeine")
+    return None, None
+
+
+def describe_power_policy(policy: str | None = None, *, system: str | None = None) -> dict:
+    policy = normalize_power_policy(policy or get_power_policy())
+    system = system or platform.system()
+    base = {
+        "policy": policy,
+        "platform": system,
+        "helper": None,
+        "helper_path": None,
+        "helper_available": False,
+        "closed_lid_behavior": "n/a",
+        "requires_wake_recovery": True,
+        "summary": "",
+        "prompt_note": "",
+    }
+
+    if policy != POWER_POLICY_ALWAYS_ON:
+        state = "disabled" if policy == POWER_POLICY_DISABLED else "unset"
+        base["summary"] = f"Power helper {state}."
+        base["prompt_note"] = "Wake recovery and catchup remain available."
+        return base
+
+    if system == "Darwin":
+        available = MACOS_CAFFEINATE_PATH.is_file()
+        base.update({
+            "helper": "caffeinate",
+            "helper_path": str(MACOS_CAFFEINATE_PATH),
+            "helper_available": available,
+            "closed_lid_behavior": MACOS_CLOSED_LID_BEHAVIOR,
+            "summary": (
+                "Enable the native macOS caffeinate helper for best-effort "
+                "background availability."
+            ),
+            "prompt_note": (
+                "macOS uses the native caffeinate helper. Closed-lid operation "
+                "depends on your hardware/setup, so wake recovery remains active."
+            ),
+        })
+        return base
+
+    if system == "Linux":
+        helper, helper_path = _detect_linux_power_helper()
+        base.update({
+            "helper": helper,
+            "helper_path": helper_path,
+            "helper_available": bool(helper_path),
+            "closed_lid_behavior": LINUX_CLOSED_LID_BEHAVIOR,
+            "summary": (
+                "Enable the Linux power helper for best-effort background "
+                "availability."
+            ),
+            "prompt_note": (
+                "Linux uses systemd-inhibit or caffeine when available. "
+                "Closed-lid behavior depends on host power settings, so wake "
+                "recovery remains active."
+            ),
+        })
+        return base
+
+    base.update({
+        "summary": f"No power helper integration is available on {system}.",
+        "prompt_note": "Wake recovery and catchup remain available.",
+    })
+    return base
+
+
+def _protected_macos_roots(home: Path | None = None) -> tuple[Path, ...]:
+    home = home or Path.home()
+    return (
+        home / "Documents",
+        home / "Desktop",
+        home / "Downloads",
+        home / "Library" / "Mobile Documents",
+    )
+
+
+def _is_protected_macos_path(candidate: str | os.PathLike[str] | Path | None) -> bool:
+    if not candidate:
+        return False
+    if platform.system() != "Darwin":
+        return False
+    resolved = Path(candidate).expanduser().resolve(strict=False)
+    return any(resolved == root or root in resolved.parents for root in _protected_macos_roots())
+
+
+def normalize_full_disk_access_status(value: str | None) -> str:
+    candidate = str(value or "").strip().lower()
+    if candidate in {"enabled", "yes", "approved", "ok", "true", "1"}:
+        return FULL_DISK_ACCESS_GRANTED
+    if candidate in {"no", "disabled", "off", "false", "0"}:
+        return FULL_DISK_ACCESS_DECLINED
+    if candidate in VALID_FULL_DISK_ACCESS_STATUSES:
+        return candidate
+    return FULL_DISK_ACCESS_UNSET
+
+
+def normalize_full_disk_access_reasons(value) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    reasons: list[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if text and text not in reasons:
+            reasons.append(text)
+    return reasons
+
+
+def get_full_disk_access_status(schedule: dict | None = None) -> str:
+    schedule = schedule or load_schedule_config()
+    return normalize_full_disk_access_status(schedule.get(FULL_DISK_ACCESS_STATUS_KEY))
+
+
+def format_full_disk_access_label(status: str | None = None, *, system: str | None = None) -> str:
+    status = normalize_full_disk_access_status(status or get_full_disk_access_status())
+    system = system or platform.system()
+    if system != "Darwin":
+        return "not_applicable"
+    if status == FULL_DISK_ACCESS_GRANTED:
+        return "granted"
+    if status == FULL_DISK_ACCESS_DECLINED:
+        return "declined"
+    if status == FULL_DISK_ACCESS_LATER:
+        return "later"
+    return "unset"
+
+
+def _tail_has_permission_denial(log_file: Path) -> bool:
+    if not log_file.is_file():
+        return False
+    try:
+        with log_file.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(size - 4096, 0))
+            tail = fh.read().decode("utf-8", errors="ignore")
+        lowered = tail.lower()
+        return (
+            "operation not permitted" in lowered
+            or "authorization denied" in lowered
+            or "unable to open database" in lowered and "com.apple.tcc/tcc.db" in lowered
+        )
+    except Exception:
+        return False
+
+
+def detect_full_disk_access_reasons(*, system: str | None = None) -> list[str]:
+    system = system or platform.system()
+    if system != "Darwin":
+        return []
+
+    try:
+        probe = probe_full_disk_access()
+        if probe.get("granted") is True:
+            clear_full_disk_access_required_state()
+            return []
+    except Exception:
+        pass
+
+    reasons: list[str] = []
+    if _is_protected_macos_path(NEXO_HOME):
+        reasons.append(
+            f"NEXO_HOME is inside a protected macOS folder: {NEXO_HOME}"
+        )
+
+    logs_dir = paths.logs_dir()
+    if logs_dir.is_dir():
+        log_files = list(logs_dir.glob("*-stderr.log"))
+        log_files.extend(logs_dir.glob("tcc-auto-approve.log"))
+        for log_file in sorted(log_files):
+            if _tail_has_permission_denial(log_file):
+                reasons.append(
+                    f"Recent background job hit a macOS privacy denial ({log_file.name})"
+                )
+                break
+    return reasons
+
+
+def _runtime_python_candidates() -> list[str]:
+    candidates: list[str] = []
+    runtime_python = NEXO_HOME / ".venv" / "bin" / "python3"
+    if runtime_python.is_file():
+        candidates.append(str(runtime_python))
+    if sys.executable:
+        candidates.append(sys.executable)
+    python3_path = shutil.which("python3")
+    if python3_path:
+        candidates.append(python3_path)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in candidates:
+        if item and item not in seen:
+            seen.add(item)
+            ordered.append(item)
+    return ordered
+
+
+def full_disk_access_targets() -> list[str]:
+    targets = ["/bin/bash", *(_runtime_python_candidates())]
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in targets:
+        if item and item not in seen:
+            seen.add(item)
+            ordered.append(item)
+    return ordered
+
+
+def open_full_disk_access_settings() -> dict:
+    if platform.system() != "Darwin":
+        return {"ok": False, "opened": False, "message": "Full Disk Access setup is macOS-only."}
+    try:
+        result = subprocess.run(
+            ["open", MACOS_FDA_SETTINGS_URL],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        ok = result.returncode == 0
+        return {
+            "ok": ok,
+            "opened": ok,
+            "message": "" if ok else (result.stderr.strip() or result.stdout.strip()),
+        }
+    except Exception as e:
+        return {"ok": False, "opened": False, "message": str(e)}
+
+
+def _probe_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    for path_candidate in MACOS_FDA_PROBE_PATHS:
+        expanded = path_candidate.expanduser()
+        if expanded.exists():
+            candidates.append(expanded)
+    if _is_protected_macos_path(NEXO_HOME):
+        candidates.append(NEXO_HOME)
+    return candidates
+
+
+def probe_full_disk_access() -> dict:
+    if platform.system() != "Darwin":
+        return {"checked": False, "granted": None, "probe_path": None, "message": "macOS-only"}
+
+    candidates = _probe_candidates()
+    if not candidates:
+        return {
+            "checked": False,
+            "granted": None,
+            "probe_path": None,
+            "message": "No local probe path available for verification.",
+        }
+
+    script = 'TARGET="$1"; if [ -d "$TARGET" ]; then ls "$TARGET" >/dev/null 2>&1; else head -c 1 "$TARGET" >/dev/null 2>&1; fi'
+    last_error = ""
+    for candidate in candidates:
+        try:
+            result = subprocess.run(
+                ["/bin/bash", "-lc", script, "_", str(candidate)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception as e:
+            last_error = str(e)
+            continue
+        if result.returncode == 0:
+            return {
+                "checked": True,
+                "granted": True,
+                "probe_path": str(candidate),
+                "message": "",
+            }
+        last_error = result.stderr.strip() or result.stdout.strip()
+    return {
+        "checked": True,
+        "granted": False,
+        "probe_path": str(candidates[0]),
+        "message": last_error,
+    }
+
+
+def prompt_for_full_disk_access(
+    *,
+    reason: str = "install",
+    reasons: list[str] | None = None,
+    input_fn=input,
+    output_fn=print,
+    open_fn=open_full_disk_access_settings,
+    probe_fn=probe_full_disk_access,
+) -> dict:
+    reasons = normalize_full_disk_access_reasons(reasons)
+    output_fn(
+        "[NEXO] Some macOS background automations may need Full Disk Access. "
+        "macOS does not allow granting it automatically."
+    )
+    if reasons:
+        output_fn("[NEXO] Reason(s) detected:")
+        for item in reasons:
+            output_fn(f"[NEXO] - {item}")
+    output_fn("[NEXO] If you continue, NEXO will open the correct System Settings screen.")
+    output_fn("[NEXO] Add your terminal app and, if needed for background jobs, these binaries:")
+    for target in full_disk_access_targets():
+        output_fn(f"[NEXO] - {target}")
+
+    prompt = "[NEXO] Open Full Disk Access setup now? [y]es / [n]o / [l]ater: "
+    while True:
+        answer = str(input_fn(prompt)).strip().lower()
+        if answer in {"y", "yes"}:
+            open_result = open_fn()
+            if open_result.get("opened"):
+                output_fn("[NEXO] System Settings opened at Privacy & Security → Full Disk Access.")
+            elif open_result.get("message"):
+                output_fn(f"[NEXO] Could not open System Settings automatically: {open_result['message']}")
+            output_fn("[NEXO] Grant the permission, then press Enter to verify.")
+            follow_up = str(
+                input_fn("[NEXO] Press Enter after granting it, or type later to skip for now: ")
+            ).strip().lower()
+            if follow_up in {"later", "l"}:
+                return {
+                    "status": FULL_DISK_ACCESS_LATER,
+                    "settings_opened": bool(open_result.get("opened")),
+                    "verified": False,
+                    "message": "Full Disk Access setup deferred for later.",
+                }
+            probe = probe_fn()
+            if probe.get("granted") is True:
+                return {
+                    "status": FULL_DISK_ACCESS_GRANTED,
+                    "settings_opened": bool(open_result.get("opened")),
+                    "verified": True,
+                    "message": f"Full Disk Access verified via {probe.get('probe_path')}.",
+                }
+            return {
+                "status": FULL_DISK_ACCESS_LATER,
+                "settings_opened": bool(open_result.get("opened")),
+                "verified": False,
+                "message": (
+                    "Could not verify Full Disk Access yet. NEXO will remind you later if "
+                    "background jobs still hit TCC."
+                ),
+            }
+        if answer in {"n", "no"}:
+            return {
+                "status": FULL_DISK_ACCESS_DECLINED,
+                "settings_opened": False,
+                "verified": False,
+                "message": "Full Disk Access was declined.",
+            }
+        if answer in {"l", "later", ""}:
+            return {
+                "status": FULL_DISK_ACCESS_LATER,
+                "settings_opened": False,
+                "verified": False,
+                "message": "Full Disk Access setup deferred for later.",
+            }
+        output_fn("[NEXO] Reply with yes, no, or later.")
+
+
+def format_power_policy_label(policy: str | None = None, *, system: str | None = None) -> str:
+    details = describe_power_policy(policy=policy, system=system)
+    policy = details["policy"]
+    if policy == POWER_POLICY_ALWAYS_ON and details["platform"] == "Darwin":
+        return "always_on (macOS caffeinate, closed-lid best effort)"
+    if policy == POWER_POLICY_ALWAYS_ON and details["platform"] == "Linux":
+        helper = details["helper"] or "power helper"
+        return f"always_on ({helper}, closed-lid depends on host policy)"
+    return policy
+
+
+def get_power_policy(schedule: dict | None = None) -> str:
+    schedule = schedule or load_schedule_config()
+    return normalize_power_policy(schedule.get(POWER_POLICY_KEY))
+
+
+def is_power_policy_configured(schedule: dict | None = None) -> bool:
+    return get_power_policy(schedule) != POWER_POLICY_UNSET
+
+
+def set_power_policy(policy: str) -> dict:
+    schedule = load_schedule_config()
+    schedule[POWER_POLICY_KEY] = normalize_power_policy(policy)
+    schedule[POWER_POLICY_VERSION_KEY] = POWER_POLICY_VERSION
+    save_schedule_config(schedule)
+    return schedule
+
+
+def set_full_disk_access_status(status: str, *, reasons: list[str] | None = None) -> dict:
+    schedule = load_schedule_config()
+    normalized = normalize_full_disk_access_status(status)
+    schedule[FULL_DISK_ACCESS_STATUS_KEY] = normalized
+    schedule[FULL_DISK_ACCESS_STATUS_VERSION_KEY] = FULL_DISK_ACCESS_STATUS_VERSION
+    if normalized == FULL_DISK_ACCESS_GRANTED:
+        reasons = []
+        clear_full_disk_access_required_state()
+    if reasons is not None:
+        schedule[FULL_DISK_ACCESS_REASONS_KEY] = normalize_full_disk_access_reasons(reasons)
+    save_schedule_config(schedule)
+    return schedule
+
+
+def clear_full_disk_access_required_state() -> None:
+    try:
+        FULL_DISK_ACCESS_STATE_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def prompt_for_power_policy(
+    *,
+    reason: str = "install",
+    system: str | None = None,
+    input_fn=input,
+    output_fn=print,
+) -> str:
+    details = describe_power_policy(POWER_POLICY_ALWAYS_ON, system=system)
+    prompt = (
+        "[NEXO] Enable the background power helper for this machine? "
+        "[y]es / [n]o / [l]ater: "
+    )
+    output_fn(
+        "[NEXO] This controls the optional prevent-sleep helper. "
+        "It improves background availability but remains opt-in."
+    )
+    output_fn(f"[NEXO] {details['prompt_note']}")
+    while True:
+        answer = str(input_fn(prompt)).strip().lower()
+        if answer in {"y", "yes"}:
+            return POWER_POLICY_ALWAYS_ON
+        if answer in {"n", "no"}:
+            return POWER_POLICY_DISABLED
+        if answer in {"l", "later", ""}:
+            return POWER_POLICY_UNSET
+        output_fn("[NEXO] Reply with yes, no, or later.")
+
+
+def ensure_power_policy_choice(
+    *,
+    interactive: bool,
+    reason: str = "update",
+    input_fn=input,
+    output_fn=print,
+) -> dict:
+    schedule = load_schedule_config()
+    policy = get_power_policy(schedule)
+    prompted = False
+    if interactive and policy == POWER_POLICY_UNSET:
+        prompted = True
+        policy = prompt_for_power_policy(
+            reason=reason,
+            system=platform.system(),
+            input_fn=input_fn,
+            output_fn=output_fn,
+        )
+        schedule[POWER_POLICY_KEY] = policy
+        schedule[POWER_POLICY_VERSION_KEY] = POWER_POLICY_VERSION
+        save_schedule_config(schedule)
+    return {
+        "policy": policy,
+        "prompted": prompted,
+        "schedule_file": str(SCHEDULE_FILE),
+    }
+
+
+def ensure_full_disk_access_choice(
+    *,
+    interactive: bool,
+    reason: str = "update",
+    input_fn=input,
+    output_fn=print,
+    open_fn=open_full_disk_access_settings,
+    probe_fn=probe_full_disk_access,
+) -> dict:
+    schedule = load_schedule_config()
+    system = platform.system()
+    status = get_full_disk_access_status(schedule)
+    reasons = detect_full_disk_access_reasons(system=system)
+    prompted = False
+    verified = False
+    settings_opened = False
+    message = ""
+
+    if system != "Darwin":
+        return {
+            "status": status,
+            "prompted": False,
+            "verified": False,
+            "settings_opened": False,
+            "reasons": [],
+            "schedule_file": str(SCHEDULE_FILE),
+            "message": "",
+            "relevant": False,
+        }
+
+    schedule[FULL_DISK_ACCESS_REASONS_KEY] = reasons
+    schedule[FULL_DISK_ACCESS_STATUS_VERSION_KEY] = FULL_DISK_ACCESS_STATUS_VERSION
+
+    if not reasons:
+        save_schedule_config(schedule)
+        return {
+            "status": status,
+            "prompted": False,
+            "verified": False,
+            "settings_opened": False,
+            "reasons": [],
+            "schedule_file": str(SCHEDULE_FILE),
+            "message": "",
+            "relevant": False,
+        }
+
+    if status == FULL_DISK_ACCESS_GRANTED:
+        probe = probe_fn()
+        if probe.get("granted") is True:
+            verified = True
+            schedule[FULL_DISK_ACCESS_STATUS_KEY] = FULL_DISK_ACCESS_GRANTED
+            schedule[FULL_DISK_ACCESS_REASONS_KEY] = []
+            clear_full_disk_access_required_state()
+            save_schedule_config(schedule)
+            return {
+                "status": FULL_DISK_ACCESS_GRANTED,
+                "prompted": False,
+                "verified": True,
+                "settings_opened": False,
+                "reasons": [],
+                "schedule_file": str(SCHEDULE_FILE),
+                "message": "",
+                "relevant": False,
+            }
+        else:
+            status = FULL_DISK_ACCESS_LATER
+            message = (
+                "Full Disk Access was configured previously but could not be verified. "
+                "NEXO will remind you again on the next interactive update."
+            )
+
+    elif interactive and status in {FULL_DISK_ACCESS_UNSET, FULL_DISK_ACCESS_LATER}:
+        prompted = True
+        prompt_result = prompt_for_full_disk_access(
+            reason=reason,
+            reasons=reasons,
+            input_fn=input_fn,
+            output_fn=output_fn,
+            open_fn=open_fn,
+            probe_fn=probe_fn,
+        )
+        status = normalize_full_disk_access_status(prompt_result.get("status"))
+        verified = bool(prompt_result.get("verified"))
+        settings_opened = bool(prompt_result.get("settings_opened"))
+        message = str(prompt_result.get("message") or "")
+
+    elif status == FULL_DISK_ACCESS_DECLINED:
+        message = (
+            "Full Disk Access remains declined. Background jobs that touch protected "
+            "macOS folders may fail."
+        )
+
+    schedule[FULL_DISK_ACCESS_STATUS_KEY] = status
+    if status == FULL_DISK_ACCESS_GRANTED:
+        schedule[FULL_DISK_ACCESS_REASONS_KEY] = []
+        clear_full_disk_access_required_state()
+    save_schedule_config(schedule)
+    return {
+        "status": status,
+        "prompted": prompted,
+        "verified": verified,
+        "settings_opened": settings_opened,
+        "reasons": reasons,
+        "schedule_file": str(SCHEDULE_FILE),
+        "message": message,
+        "relevant": True,
+    }
+
+
+def _sync_core_crons_for_power_policy() -> None:
+    try:
+        from crons import sync as cron_sync
+    except Exception:
+        return
+
+    sync_fn = getattr(cron_sync, "sync", None)
+    if not callable(sync_fn):
+        return
+    sync_fn(dry_run=False)
+
+
+def apply_power_policy(policy: str | None = None) -> dict:
+    policy = normalize_power_policy(policy or get_power_policy())
+    system = platform.system()
+    logs_dir = paths.logs_dir()
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    details = describe_power_policy(policy=policy, system=system)
+
+    if system == "Darwin":
+        return _apply_macos_power_policy(policy, details=details)
+    if system == "Linux":
+        return _apply_linux_power_policy(policy, details=details)
+    return {
+        "ok": policy != POWER_POLICY_ALWAYS_ON,
+        "policy": policy,
+        "platform": system,
+        "action": "unsupported",
+        "message": f"Unsupported platform for prevent-sleep policy: {system}",
+        "details": details,
+    }
+
+
+def _apply_macos_power_policy(policy: str, *, details: dict | None = None) -> dict:
+    plist_path = LAUNCH_AGENTS_DIR / "com.nexo.prevent-sleep.plist"
+    if policy == POWER_POLICY_ALWAYS_ON:
+        details = details or describe_power_policy(policy, system="Darwin")
+        if not details.get("helper_available"):
+            return {
+                "ok": False,
+                "policy": policy,
+                "platform": "Darwin",
+                "action": "missing-helper",
+                "message": f"Required helper not found: {details.get('helper_path') or 'caffeinate'}",
+                "details": details,
+            }
+        try:
+            _sync_core_crons_for_power_policy()
+            ok = plist_path.exists()
+            message = ""
+        except Exception as exc:
+            ok = False
+            message = str(exc)
+        return {
+            "ok": ok,
+            "policy": policy,
+            "platform": "Darwin",
+            "action": "enabled",
+            "plist_path": str(plist_path),
+            "message": message,
+            "details": details,
+        }
+
+    _sync_core_crons_for_power_policy()
+    return {
+        "ok": True,
+        "policy": policy,
+        "platform": "Darwin",
+        "action": "disabled" if policy == POWER_POLICY_DISABLED else "deferred",
+        "plist_path": str(plist_path),
+        "details": details or describe_power_policy(policy, system="Darwin"),
+    }
+
+
+def _apply_linux_power_policy(policy: str, *, details: dict | None = None) -> dict:
+    service_path = LINUX_SYSTEMD_USER_DIR / "nexo-prevent-sleep.service"
+    if policy == POWER_POLICY_ALWAYS_ON:
+        details = details or describe_power_policy(policy, system="Linux")
+        if not details.get("helper_available"):
+            return {
+                "ok": False,
+                "policy": policy,
+                "platform": "Linux",
+                "action": "missing-helper",
+                "message": "No Linux power helper found. Install systemd-inhibit or caffeine.",
+                "details": details,
+            }
+        try:
+            _sync_core_crons_for_power_policy()
+            ok = service_path.exists()
+            message = ""
+        except Exception as exc:
+            ok = False
+            message = str(exc)
+        return {
+            "ok": ok,
+            "policy": policy,
+            "platform": "Linux",
+            "action": "enabled",
+            "service_path": str(service_path),
+            "message": message,
+            "details": details,
+        }
+
+    _sync_core_crons_for_power_policy()
+    return {
+        "ok": True,
+        "policy": policy,
+        "platform": "Linux",
+        "action": "disabled" if policy == POWER_POLICY_DISABLED else "deferred",
+        "service_path": str(service_path),
+        "details": details or describe_power_policy(policy, system="Linux"),
+    }

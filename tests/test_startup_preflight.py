@@ -1,0 +1,780 @@
+"""Tests for startup preflight orchestration."""
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
+
+
+def test_startup_preflight_defers_sync_update_when_runtime_busy(tmp_path, monkeypatch):
+    import auto_update
+    import runtime_power
+    import db
+    import script_registry
+
+    nexo_home = tmp_path / "nexo"
+    user_home = tmp_path / "home"
+    (nexo_home / "config").mkdir(parents=True)
+    (nexo_home / "logs").mkdir(parents=True)
+    user_home.mkdir(parents=True)
+    (nexo_home / "config" / "schedule.json").write_text(json.dumps({
+        "timezone": "UTC",
+        "auto_update": True,
+        "power_policy": "disabled",
+        "processes": {},
+    }))
+
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setenv("NEXO_HOME", str(nexo_home))
+
+    monkeypatch.setenv("NEXO_HOME", str(nexo_home))
+
+    monkeypatch.setenv("NEXO_HOME", str(nexo_home))
+    monkeypatch.setattr(auto_update, "NEXO_HOME", nexo_home)
+    monkeypatch.setattr(auto_update, "UPDATE_SUMMARY_FILE", nexo_home / "logs" / "update-last-summary.json")
+    monkeypatch.setattr(auto_update, "UPDATE_HISTORY_FILE", nexo_home / "logs" / "update-history.jsonl")
+    monkeypatch.setattr(auto_update, "CHECK_COOLDOWN_SECONDS", 0)
+    monkeypatch.setattr(auto_update, "_resolve_sync_source", lambda: (tmp_path / "repo" / "src", tmp_path / "repo"))
+    monkeypatch.setattr(auto_update, "_run_db_migrations", lambda: True)
+    monkeypatch.setattr(auto_update, "run_file_migrations", lambda: [])
+    monkeypatch.setattr(auto_update, "_migrate_claude_md", lambda: None)
+    monkeypatch.setattr(auto_update, "_sync_watchdog_hash_registry", lambda: None)
+    monkeypatch.setattr(auto_update, "_warn_protected_runtime_location", lambda: None)
+    monkeypatch.setattr(auto_update, "_ensure_runtime_cli_wrapper", lambda: None)
+    monkeypatch.setattr(auto_update, "_ensure_runtime_cli_in_shell", lambda: None)
+    monkeypatch.setattr(auto_update, "_runtime_busy_reason", lambda: "active sessions: 1")
+    monkeypatch.setattr(auto_update, "_source_repo_status", lambda repo: {
+        "is_git": True,
+        "dirty": False,
+        "diverged": False,
+        "behind": True,
+    })
+    monkeypatch.setattr(auto_update, "_read_last_check", lambda: {})
+    monkeypatch.setattr(auto_update, "_write_last_check", lambda data: None)
+    monkeypatch.setattr(auto_update, "manual_sync_update", lambda **kwargs: {"ok": True, "updated": True, "actions": ["unexpected"]})
+    monkeypatch.setattr(db, "init_db", lambda: None)
+    monkeypatch.setattr(script_registry, "reconcile_personal_scripts", lambda dry_run=False: {"ok": True})
+    monkeypatch.setattr(runtime_power, "ensure_power_policy_choice", lambda **kwargs: {"policy": "disabled", "prompted": False})
+    monkeypatch.setattr(runtime_power, "apply_power_policy", lambda policy=None: {"ok": True, "action": "disabled"})
+    monkeypatch.setattr(runtime_power, "get_power_policy", lambda schedule=None: "disabled")
+    monkeypatch.setattr(runtime_power, "ensure_full_disk_access_choice", lambda **kwargs: {"status": "unset", "prompted": False, "message": ""})
+    monkeypatch.setattr(runtime_power, "get_full_disk_access_status", lambda schedule=None: "unset")
+
+    result = auto_update.startup_preflight(entrypoint="chat", interactive=False)
+
+    assert result["deferred_reason"] == "active sessions: 1"
+    assert result["updated"] is False
+
+
+def test_runtime_cli_wrapper_text_probes_fastmcp_and_supports_override():
+    import auto_update
+
+    text = auto_update._runtime_cli_wrapper_text()
+
+    assert "NEXO_RUNTIME_PYTHON" in text
+    assert 'import fastmcp' in text
+    assert 'resolve_python()' in text
+    assert 'DEFAULT_NEXO_HOME=' in text
+    assert '$NEXO_HOME/core/cli.py' in text
+    assert '${HOME}/claude' in text
+    assert 'pwd -P' in text
+    assert 'PYTHONDONTWRITEBYTECODE=1' in text
+    assert '$NEXO_HOME/claude/cli.py' not in text
+
+
+def test_cleanup_legacy_root_db_stubs_archives_zero_byte_root_files(tmp_path, monkeypatch):
+    import auto_update
+
+    runtime_home = tmp_path / "runtime"
+    data_dir = runtime_home / "runtime" / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "nexo.db").write_text("sqlite")
+    (runtime_home / "nexo.db").write_text("")
+    (runtime_home / "brain.db").write_text("")
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+    monkeypatch.setattr(auto_update, "NEXO_HOME", runtime_home)
+
+    result = auto_update._cleanup_legacy_root_db_stubs(runtime_home)
+
+    assert result["ok"] is True
+    assert len(result["archived"]) == 2
+    assert not (runtime_home / "nexo.db").exists()
+    assert not (runtime_home / "brain.db").exists()
+    for item in result["archived"]:
+        assert Path(item["backup_path"]).is_file()
+
+
+def test_cleanup_empty_personal_brain_db_stubs_archives_only_empty_residue(tmp_path, monkeypatch):
+    import auto_update
+    import sqlite3
+
+    runtime_home = tmp_path / "runtime"
+    personal_brain = runtime_home / "personal" / "brain"
+    personal_brain.mkdir(parents=True, exist_ok=True)
+
+    (personal_brain / "brain.db").write_text("")
+    sqlite3.connect(str(personal_brain / "nexo.db")).close()
+    live = personal_brain / "runtime.db"
+    conn = sqlite3.connect(str(live))
+    try:
+        conn.execute("CREATE TABLE keep_me (id INTEGER)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+    monkeypatch.setattr(auto_update, "NEXO_HOME", runtime_home)
+
+    result = auto_update._cleanup_empty_personal_brain_db_stubs(runtime_home)
+
+    assert result["ok"] is True
+    assert len(result["archived"]) == 2
+    assert not (personal_brain / "brain.db").exists()
+    assert not (personal_brain / "nexo.db").exists()
+    assert live.exists()
+    assert any(item["reason"] == "has-tables" for item in result["skipped"])
+    for item in result["archived"]:
+        assert Path(item["backup_path"]).is_file()
+
+
+def test_resolve_sync_source_supports_hybrid_runtime_code_dir(tmp_path, monkeypatch):
+    import auto_update
+
+    runtime_home = tmp_path / "runtime"
+    runtime_code = runtime_home / "claude"
+    runtime_code.mkdir(parents=True)
+    (runtime_code / "db").mkdir()
+    (runtime_code / "package.json").write_text("{}")
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+    monkeypatch.setattr(auto_update, "NEXO_HOME", runtime_home)
+    monkeypatch.setattr(auto_update, "NEXO_CODE", runtime_code)
+
+    src_dir, repo_dir = auto_update._resolve_sync_source()
+
+    assert src_dir == runtime_code
+    assert repo_dir == runtime_code
+
+
+def test_resolve_sync_source_uses_packaged_updater_for_runtime_core_without_recorded_source(tmp_path, monkeypatch):
+    import auto_update
+
+    runtime_home = tmp_path / "runtime"
+    runtime_core = runtime_home / "core"
+    runtime_core.mkdir(parents=True)
+    (runtime_core / "db").mkdir()
+    (runtime_home / "package.json").write_text("{}\n")
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+    monkeypatch.setattr(auto_update, "NEXO_HOME", runtime_home)
+    monkeypatch.setattr(auto_update, "NEXO_CODE", runtime_core)
+
+    src_dir, repo_dir = auto_update._resolve_sync_source()
+
+    assert src_dir is None
+    assert repo_dir is None
+
+
+def test_resolve_sync_source_uses_recorded_source_for_runtime_core_when_present(tmp_path, monkeypatch):
+    import auto_update
+
+    runtime_home = tmp_path / "runtime"
+    runtime_core = runtime_home / "core"
+    recorded_repo = tmp_path / "repo"
+    (runtime_core / "db").mkdir(parents=True)
+    (runtime_home / "package.json").write_text("{}\n")
+    (recorded_repo / "src" / "db").mkdir(parents=True)
+    (recorded_repo / "package.json").write_text("{}\n")
+    (runtime_home / "version.json").write_text(
+        json.dumps({"version": "7.1.1", "source": str(recorded_repo)})
+    )
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+    monkeypatch.setattr(auto_update, "NEXO_HOME", runtime_home)
+    monkeypatch.setattr(auto_update, "NEXO_CODE", runtime_core)
+
+    src_dir, repo_dir = auto_update._resolve_sync_source()
+
+    assert src_dir == recorded_repo / "src"
+    assert repo_dir == recorded_repo
+
+
+def test_resolve_sync_source_uses_packaged_updater_for_versioned_runtime_snapshot_without_recorded_source(tmp_path, monkeypatch):
+    import auto_update
+
+    runtime_home = tmp_path / "runtime"
+    runtime_snapshot = runtime_home / "core" / "versions" / "7.9.6"
+    runtime_snapshot.mkdir(parents=True)
+    (runtime_snapshot / "db").mkdir()
+    (runtime_snapshot / "package.json").write_text('{"version":"7.9.6"}\n')
+    (runtime_home / "core" / "current").symlink_to(Path("versions") / "7.9.6")
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+    monkeypatch.setattr(auto_update, "NEXO_HOME", runtime_home)
+    monkeypatch.setattr(auto_update, "NEXO_CODE", runtime_home / "core" / "current")
+
+    src_dir, repo_dir = auto_update._resolve_sync_source()
+
+    assert src_dir is None
+    assert repo_dir is None
+
+
+def test_resolve_sync_source_uses_recorded_source_for_versioned_runtime_snapshot_when_present(tmp_path, monkeypatch):
+    import auto_update
+
+    runtime_home = tmp_path / "runtime"
+    runtime_snapshot = runtime_home / "core" / "versions" / "7.9.6"
+    recorded_repo = tmp_path / "repo"
+    runtime_snapshot.mkdir(parents=True)
+    (runtime_snapshot / "db").mkdir()
+    (runtime_snapshot / "package.json").write_text('{"version":"7.9.6"}\n')
+    (runtime_home / "core" / "current").symlink_to(Path("versions") / "7.9.6")
+    (recorded_repo / "src" / "db").mkdir(parents=True)
+    (recorded_repo / "package.json").write_text("{}\n")
+    (runtime_home / "version.json").write_text(
+        json.dumps({"version": "7.9.7", "source": str(recorded_repo)})
+    )
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+    monkeypatch.setattr(auto_update, "NEXO_HOME", runtime_home)
+    monkeypatch.setattr(auto_update, "NEXO_CODE", runtime_home / "core" / "current")
+
+    src_dir, repo_dir = auto_update._resolve_sync_source()
+
+    assert src_dir == recorded_repo / "src"
+    assert repo_dir == recorded_repo
+
+
+def test_copy_runtime_from_source_creates_skill_scaffold_dirs(tmp_path, monkeypatch):
+    import auto_update
+
+    src_dir = tmp_path / "src"
+    repo_dir = tmp_path / "repo"
+    dest = tmp_path / "runtime"
+
+    src_dir.mkdir()
+    repo_dir.mkdir()
+    (src_dir / "db").mkdir()
+    (src_dir / "presets").mkdir()
+    (src_dir / "scripts").mkdir()
+    (src_dir / "skills" / "demo-skill").mkdir(parents=True)
+    (repo_dir / "templates").mkdir()
+
+    (src_dir / "server.py").write_text("print('server')\n")
+    (src_dir / "cli.py").write_text("print('cli')\n")
+    (src_dir / "requirements.txt").write_text("fastmcp\n")
+    (src_dir / "presets" / "guardian_default.json").write_text("{}\n")
+    (src_dir / "skills" / "demo-skill" / "skill.json").write_text("{}\n")
+    (repo_dir / "templates" / "skill-template.md").write_text("# template\n")
+    (repo_dir / "package.json").write_text("{}\n")
+
+    monkeypatch.setattr(auto_update, "_installed_scripts_classification", lambda _dest: {})
+
+    result = auto_update._copy_runtime_from_source(src_dir, repo_dir, dest)
+
+    assert result["source"] == str(src_dir)
+    assert (dest / "bin").is_dir()
+    assert (dest / "skills").is_dir()
+    assert (dest / "skills-runtime").is_dir()
+    assert (dest / "skills-core" / "demo-skill" / "skill.json").is_file()
+    assert (dest / "presets" / "guardian_default.json").is_file()
+
+
+def test_copy_runtime_from_source_includes_runtime_package_directories(tmp_path, monkeypatch):
+    import auto_update
+
+    src_dir = tmp_path / "src"
+    repo_dir = tmp_path / "repo"
+    dest = tmp_path / "runtime"
+
+    (src_dir / "db").mkdir(parents=True)
+    (src_dir / "local_context").mkdir(parents=True)
+    (src_dir / "product_knowledge").mkdir(parents=True)
+    (src_dir / "disk_recovery").mkdir(parents=True)
+    (src_dir / "local_context" / "__init__.py").write_text("from .api import status\n")
+    (src_dir / "local_context" / "api.py").write_text("def status():\n    return {'ok': True}\n")
+    (src_dir / "product_knowledge" / "__init__.py").write_text("from .catalog import validate_catalog\n")
+    (src_dir / "product_knowledge" / "catalog.py").write_text("def validate_catalog():\n    return []\n")
+    (src_dir / "disk_recovery" / "__init__.py").write_text("def recover():\n    return True\n")
+    (repo_dir / "templates").mkdir(parents=True)
+    (repo_dir / "package.json").write_text("{}\n")
+
+    monkeypatch.setattr(auto_update, "_installed_scripts_classification", lambda _dest: {})
+
+    result = auto_update._copy_runtime_from_source(src_dir, repo_dir, dest)
+
+    assert result["packages"] >= 2
+    assert (dest / "local_context" / "__init__.py").is_file()
+    assert (dest / "local_context" / "api.py").read_text() == "def status():\n    return {'ok': True}\n"
+    assert (dest / "product_knowledge" / "__init__.py").is_file()
+    assert (dest / "product_knowledge" / "catalog.py").read_text() == "def validate_catalog():\n    return []\n"
+    assert (dest / "disk_recovery" / "__init__.py").read_text() == "def recover():\n    return True\n"
+
+
+def test_copy_runtime_from_source_replaces_f06_symlink_package_targets(tmp_path, monkeypatch):
+    import auto_update
+
+    src_dir = tmp_path / "src"
+    repo_dir = tmp_path / "repo"
+    dest = tmp_path / "runtime"
+
+    (src_dir / "db").mkdir(parents=True)
+    (src_dir / "cognitive").mkdir(parents=True)
+    (src_dir / "scripts").mkdir(parents=True)
+    (src_dir / "skills" / "demo-skill").mkdir(parents=True)
+    (src_dir / "db" / "__init__.py").write_text("# new db\n")
+    (src_dir / "cognitive" / "__init__.py").write_text("# new cognitive\n")
+    (src_dir / "skills" / "demo-skill" / "skill.json").write_text("{}\n")
+    (repo_dir / "templates").mkdir(parents=True)
+    (repo_dir / "package.json").write_text("{}\n")
+
+    (dest / "core" / "db").mkdir(parents=True)
+    (dest / "core" / "cognitive").mkdir(parents=True)
+    (dest / "core" / "skills").mkdir(parents=True)
+    (dest / "db").symlink_to(dest / "core" / "db", target_is_directory=True)
+    (dest / "cognitive").symlink_to(dest / "core" / "cognitive", target_is_directory=True)
+    (dest / "skills-core").symlink_to(dest / "core" / "skills", target_is_directory=True)
+
+    monkeypatch.setattr(auto_update, "_installed_scripts_classification", lambda _dest: {})
+
+    result = auto_update._copy_runtime_from_source(src_dir, repo_dir, dest)
+
+    assert result["packages"] >= 2
+    assert (dest / "db").is_dir()
+    assert not (dest / "db").is_symlink()
+    assert (dest / "db" / "__init__.py").read_text() == "# new db\n"
+    assert (dest / "cognitive").is_dir()
+    assert not (dest / "cognitive").is_symlink()
+    assert (dest / "cognitive" / "__init__.py").read_text() == "# new cognitive\n"
+    assert (dest / "skills-core").is_dir()
+    assert not (dest / "skills-core").is_symlink()
+    assert (dest / "skills-core" / "demo-skill" / "skill.json").is_file()
+
+
+def test_copy_runtime_from_source_replaces_f06_symlink_file_and_scripts_targets(tmp_path, monkeypatch):
+    import auto_update
+
+    src_dir = tmp_path / "src"
+    repo_dir = tmp_path / "repo"
+    dest = tmp_path / "runtime"
+
+    (src_dir / "db").mkdir(parents=True)
+    (src_dir / "scripts").mkdir(parents=True)
+    (src_dir / "plugins").mkdir(parents=True)
+    (src_dir / "agent_runner.py").write_text("# new runner\n")
+    (src_dir / "scripts" / "nexo-watchdog.sh").write_text("#!/bin/bash\necho updated\n")
+    (src_dir / "plugins" / "guard.py").write_text("# new plugin\n")
+    (repo_dir / "templates").mkdir(parents=True)
+    (repo_dir / "package.json").write_text('{"version":"7.1.1"}\n')
+
+    (dest / "core" / "scripts").mkdir(parents=True)
+    (dest / "core" / "plugins").mkdir(parents=True)
+    (dest / "core" / "agent_runner.py").write_text("# old runner\n")
+    (dest / "agent_runner.py").symlink_to(dest / "core" / "agent_runner.py")
+    (dest / "scripts").symlink_to(dest / "core" / "scripts", target_is_directory=True)
+    (dest / "plugins").symlink_to(dest / "core" / "plugins", target_is_directory=True)
+
+    monkeypatch.setattr(auto_update, "_installed_scripts_classification", lambda _dest: {})
+
+    result = auto_update._copy_runtime_from_source(src_dir, repo_dir, dest)
+
+    assert result["files"] >= 1
+    assert (dest / "agent_runner.py").is_file()
+    assert not (dest / "agent_runner.py").is_symlink()
+    assert (dest / "agent_runner.py").read_text() == "# new runner\n"
+    assert (dest / "scripts").is_dir()
+    assert not (dest / "scripts").is_symlink()
+    assert (dest / "scripts" / "nexo-watchdog.sh").is_file()
+    assert (dest / "plugins").is_dir()
+    assert not (dest / "plugins").is_symlink()
+    assert (dest / "plugins" / "guard.py").is_file()
+    assert (dest / "version.json").is_file()
+
+
+def test_reinstall_runtime_pip_deps_creates_venv_when_missing(tmp_path, monkeypatch):
+    import auto_update
+
+    runtime_home = tmp_path / "runtime"
+    runtime_home.mkdir(parents=True)
+    (runtime_home / "requirements.txt").write_text("fastmcp>=2.9.0\n")
+    calls = []
+
+    def fake_run(cmd, capture_output=True, text=True, timeout=120, env=None):
+        calls.append(cmd)
+        if cmd[:2] == [sys.executable, "-c"]:
+            version = ".".join(map(str, sys.version_info[:3]))
+            return subprocess.CompletedProcess(cmd, 0, version + "\n", "")
+        if cmd[:3] == [sys.executable, "-m", "venv"]:
+            venv_bin = runtime_home / ".venv" / "bin"
+            venv_bin.mkdir(parents=True, exist_ok=True)
+            (venv_bin / "python3").write_text("")
+            pip = venv_bin / "pip"
+            pip.write_text("#!/bin/sh\nexit 0\n")
+            pip.chmod(0o755)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(auto_update.subprocess, "run", fake_run)
+    monkeypatch.setattr(auto_update, "desktop_product_requested", lambda: False)
+
+    ok = auto_update._reinstall_runtime_pip_deps(runtime_home)
+
+    assert ok is True
+    assert any(cmd[:3] == [sys.executable, "-m", "venv"] for cmd in calls)
+
+
+def test_desktop_managed_venv_only_accepts_core_pinned_python(monkeypatch):
+    import auto_update
+
+    versions = {
+        "/tmp/python3.12": (3, 12, 9),
+        "/tmp/python3.11": (3, 11, 9),
+        "/tmp/python3.14": (3, 14, 0),
+    }
+
+    monkeypatch.setattr(auto_update, "desktop_product_requested", lambda: True)
+    monkeypatch.setattr(auto_update, "_python_version_tuple", lambda candidate: versions.get(str(candidate)))
+
+    assert auto_update._managed_venv_python_supported("/tmp/python3.12") is True
+    assert auto_update._managed_venv_python_supported("/tmp/python3.11") is False
+    assert auto_update._managed_venv_python_supported("/tmp/python3.14") is False
+
+
+def test_run_runtime_post_sync_uses_reconcile_personal_scripts(tmp_path, monkeypatch):
+    import auto_update
+    import client_sync
+
+    runtime_home = tmp_path / "runtime"
+    (runtime_home / "logs").mkdir(parents=True)
+    (runtime_home / "crons").mkdir(parents=True)
+    (runtime_home / "crons" / "sync.py").write_text("print('ok')\n")
+
+    calls = []
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+    monkeypatch.setattr(auto_update, "NEXO_HOME", runtime_home)
+    monkeypatch.setattr(auto_update, "_reinstall_runtime_pip_deps", lambda dest: True)
+    monkeypatch.setattr(auto_update.subprocess, "run", fake_run)
+    def fake_sync_all_clients(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True, "clients": {}}
+
+    monkeypatch.setattr(client_sync, "sync_all_clients", fake_sync_all_clients)
+
+    import runtime_power
+
+    monkeypatch.setattr(runtime_power, "apply_power_policy", lambda policy=None: {"ok": True, "action": "enabled"})
+    monkeypatch.setattr(runtime_power, "ensure_full_disk_access_choice", lambda **kwargs: {"status": "unset", "prompted": False, "message": ""})
+    monkeypatch.setattr(runtime_power, "get_full_disk_access_status", lambda schedule=None: "unset")
+
+    ok, actions = auto_update._run_runtime_post_sync(runtime_home)
+
+    assert ok is True
+    assert "db+personal-sync" in actions
+    assert "client-sync" in actions
+    init_call = next(cmd for cmd in calls if isinstance(cmd, list) and len(cmd) >= 3 and cmd[1] == "-c")
+    assert "reconcile_personal_scripts" in init_call[2]
+    assert captured["auto_install_missing_claude"] is True
+
+
+def test_run_runtime_post_sync_reports_personal_schedule_heal(tmp_path, monkeypatch):
+    import auto_update
+    import client_sync
+
+    runtime_home = tmp_path / "runtime"
+    (runtime_home / "logs").mkdir(parents=True)
+    (runtime_home / "crons").mkdir(parents=True)
+    (runtime_home / "crons" / "sync.py").write_text("print('ok')\n")
+
+    def fake_run(cmd, **kwargs):
+        if isinstance(cmd, list) and len(cmd) >= 3 and cmd[1] == "-c":
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                json.dumps({
+                    "ensure_schedules": {
+                        "created": [{"cron_id": "email-monitor"}],
+                        "repaired": [],
+                        "invalid": [],
+                    }
+                }),
+                "",
+            )
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+    monkeypatch.setattr(auto_update, "NEXO_HOME", runtime_home)
+    monkeypatch.setattr(auto_update, "_reinstall_runtime_pip_deps", lambda dest: True)
+    monkeypatch.setattr(auto_update.subprocess, "run", fake_run)
+    monkeypatch.setattr(client_sync, "sync_all_clients", lambda **kwargs: {"ok": True, "clients": {}})
+
+    import runtime_power
+
+    monkeypatch.setattr(runtime_power, "apply_power_policy", lambda policy=None: {"ok": True, "action": "enabled"})
+    monkeypatch.setattr(runtime_power, "ensure_full_disk_access_choice", lambda **kwargs: {"status": "unset", "prompted": False, "message": ""})
+    monkeypatch.setattr(runtime_power, "get_full_disk_access_status", lambda schedule=None: "unset")
+
+    ok, actions = auto_update._run_runtime_post_sync(runtime_home)
+
+    assert ok is True
+    assert "personal-schedules-healed:1" in actions
+
+
+def test_run_runtime_post_sync_reports_superseded_personal_script_retire(tmp_path, monkeypatch):
+    import auto_update
+    import client_sync
+
+    runtime_home = tmp_path / "runtime"
+    (runtime_home / "logs").mkdir(parents=True)
+    (runtime_home / "crons").mkdir(parents=True)
+    (runtime_home / "crons" / "sync.py").write_text("print('ok')\n")
+
+    def fake_run(cmd, **kwargs):
+        if isinstance(cmd, list) and len(cmd) >= 3 and cmd[1] == "-c":
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                json.dumps({
+                    "retired_superseded_scripts": {
+                        "archived": [{"name": "morning-agent"}],
+                    },
+                    "retired_superseded_skills": {
+                        "archived": [{"name": "Release Consolidated Brain Desktop"}],
+                    },
+                    "ensure_schedules": {
+                        "created": [],
+                        "repaired": [],
+                        "invalid": [],
+                    },
+                }),
+                "",
+            )
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+    monkeypatch.setattr(auto_update, "NEXO_HOME", runtime_home)
+    monkeypatch.setattr(auto_update, "_reinstall_runtime_pip_deps", lambda dest: True)
+    monkeypatch.setattr(auto_update.subprocess, "run", fake_run)
+    monkeypatch.setattr(client_sync, "sync_all_clients", lambda **kwargs: {"ok": True, "clients": {}})
+
+    import runtime_power
+
+    monkeypatch.setattr(runtime_power, "apply_power_policy", lambda policy=None: {"ok": True, "action": "enabled"})
+    monkeypatch.setattr(runtime_power, "ensure_full_disk_access_choice", lambda **kwargs: {"status": "unset", "prompted": False, "message": ""})
+    monkeypatch.setattr(runtime_power, "get_full_disk_access_status", lambda schedule=None: "unset")
+
+    ok, actions = auto_update._run_runtime_post_sync(runtime_home)
+
+    assert ok is True
+    assert "personal-scripts-retired:1" in actions
+    assert "personal-skills-retired:1" in actions
+
+
+def test_run_runtime_post_sync_reports_legacy_personal_filename_normalization(tmp_path, monkeypatch):
+    import auto_update
+    import client_sync
+
+    runtime_home = tmp_path / "runtime"
+    (runtime_home / "logs").mkdir(parents=True)
+    (runtime_home / "crons").mkdir(parents=True)
+    (runtime_home / "crons" / "sync.py").write_text("print('ok')\n")
+
+    def fake_run(cmd, **kwargs):
+        if isinstance(cmd, list) and len(cmd) >= 3 and cmd[1] == "-c":
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                json.dumps({
+                    "renamed_legacy_filenames": {
+                        "renamed": [{"name": "mail-poller"}],
+                    },
+                    "ensure_schedules": {
+                        "created": [],
+                        "repaired": [],
+                        "invalid": [],
+                    },
+                }),
+                "",
+            )
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+    monkeypatch.setattr(auto_update, "NEXO_HOME", runtime_home)
+    monkeypatch.setattr(auto_update, "_reinstall_runtime_pip_deps", lambda dest: True)
+    monkeypatch.setattr(auto_update.subprocess, "run", fake_run)
+    monkeypatch.setattr(client_sync, "sync_all_clients", lambda **kwargs: {"ok": True, "clients": {}})
+
+    import runtime_power
+
+    monkeypatch.setattr(runtime_power, "apply_power_policy", lambda policy=None: {"ok": True, "action": "enabled"})
+    monkeypatch.setattr(runtime_power, "ensure_full_disk_access_choice", lambda **kwargs: {"status": "unset", "prompted": False, "message": ""})
+    monkeypatch.setattr(runtime_power, "get_full_disk_access_status", lambda schedule=None: "unset")
+
+    ok, actions = auto_update._run_runtime_post_sync(runtime_home)
+
+    assert ok is True
+    assert "personal-script-filenames-renamed:1" in actions
+
+
+def test_startup_preflight_reports_personal_schedule_heal(tmp_path, monkeypatch):
+    import auto_update
+    import runtime_power
+    import db
+    import script_registry
+
+    nexo_home = tmp_path / "nexo"
+    user_home = tmp_path / "home"
+    (nexo_home / "config").mkdir(parents=True)
+    (nexo_home / "logs").mkdir(parents=True)
+    user_home.mkdir(parents=True)
+    (nexo_home / "config" / "schedule.json").write_text(json.dumps({
+        "timezone": "UTC",
+        "auto_update": True,
+        "power_policy": "disabled",
+        "processes": {},
+    }))
+
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setenv("NEXO_HOME", str(nexo_home))
+    monkeypatch.setattr(auto_update, "NEXO_HOME", nexo_home)
+    monkeypatch.setattr(auto_update, "UPDATE_SUMMARY_FILE", nexo_home / "logs" / "update-last-summary.json")
+    monkeypatch.setattr(auto_update, "UPDATE_HISTORY_FILE", nexo_home / "logs" / "update-history.jsonl")
+    monkeypatch.setattr(auto_update, "CHECK_COOLDOWN_SECONDS", 0)
+    monkeypatch.setattr(auto_update, "_resolve_sync_source", lambda: (tmp_path / "repo" / "src", tmp_path / "repo"))
+    monkeypatch.setattr(auto_update, "_run_db_migrations", lambda: True)
+    monkeypatch.setattr(auto_update, "run_file_migrations", lambda: [])
+    monkeypatch.setattr(auto_update, "_migrate_claude_md", lambda: None)
+    monkeypatch.setattr(auto_update, "_sync_watchdog_hash_registry", lambda: None)
+    monkeypatch.setattr(auto_update, "_warn_protected_runtime_location", lambda: None)
+    monkeypatch.setattr(auto_update, "_ensure_runtime_cli_wrapper", lambda: None)
+    monkeypatch.setattr(auto_update, "_ensure_runtime_cli_in_shell", lambda: None)
+    monkeypatch.setattr(auto_update, "_runtime_busy_reason", lambda: None)
+    monkeypatch.setattr(auto_update, "_source_repo_status", lambda repo: {
+        "is_git": True,
+        "dirty": False,
+        "diverged": False,
+        "behind": False,
+    })
+    monkeypatch.setattr(auto_update, "_read_last_check", lambda: {})
+    monkeypatch.setattr(auto_update, "_write_last_check", lambda data: None)
+    monkeypatch.setattr(db, "init_db", lambda: None)
+    monkeypatch.setattr(script_registry, "reconcile_personal_scripts", lambda dry_run=False: {
+        "ensure_schedules": {
+            "created": [{"cron_id": "email-monitor"}],
+            "repaired": [],
+            "invalid": [],
+        }
+    })
+    monkeypatch.setattr(runtime_power, "ensure_power_policy_choice", lambda **kwargs: {"policy": "disabled", "prompted": False})
+    monkeypatch.setattr(runtime_power, "apply_power_policy", lambda policy=None: {"ok": True, "action": "disabled"})
+    monkeypatch.setattr(runtime_power, "get_power_policy", lambda schedule=None: "disabled")
+    monkeypatch.setattr(runtime_power, "ensure_full_disk_access_choice", lambda **kwargs: {"status": "unset", "prompted": False, "message": ""})
+    monkeypatch.setattr(runtime_power, "get_full_disk_access_status", lambda schedule=None: "unset")
+
+    result = auto_update.startup_preflight(entrypoint="chat", interactive=False)
+
+    assert "db+personal-sync" in result["actions"]
+    assert "personal-schedules-healed:1" in result["actions"]
+
+
+def test_copy_runtime_from_source_preserves_personal_script_collision(tmp_path, monkeypatch):
+    import auto_update
+
+    runtime_home = tmp_path / "runtime"
+    src_dir = tmp_path / "repo" / "src"
+    repo_dir = tmp_path / "repo"
+    (runtime_home / "scripts").mkdir(parents=True)
+    (src_dir / "scripts").mkdir(parents=True)
+    (src_dir / "hooks").mkdir(parents=True)
+    (src_dir / "plugins").mkdir(parents=True)
+    (repo_dir / "templates").mkdir(parents=True)
+
+    personal_script = runtime_home / "scripts" / "email-triage-agent.py"
+    personal_script.write_text("# personal\n")
+    (runtime_home / "scripts" / "nexo-watchdog.sh").write_text("#!/bin/bash\necho ok\n")
+    (src_dir / "scripts" / "email-triage-agent.py").write_text("# core candidate\n")
+    (src_dir / "scripts" / "nexo-watchdog.sh").write_text("#!/bin/bash\necho core\n")
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+    monkeypatch.setattr(auto_update, "NEXO_HOME", runtime_home)
+    monkeypatch.setattr(
+        auto_update,
+        "_installed_scripts_classification",
+        lambda dest: {
+            "email-triage-agent.py": "personal",
+            "nexo-watchdog.sh": "ignored",
+        },
+    )
+
+    stats = auto_update._copy_runtime_from_source(src_dir, repo_dir, runtime_home)
+
+    assert personal_script.read_text() == "# personal\n"
+    assert stats["scripts"] == 1
+    assert len(stats["script_conflicts"]) == 1
+    assert stats["script_conflicts"][0]["name"] == "email-triage-agent.py"
+
+
+def test_copy_runtime_from_source_updates_core_script_through_f06_shim(tmp_path, monkeypatch):
+    import auto_update
+
+    runtime_home = tmp_path / "runtime"
+    src_dir = tmp_path / "repo" / "src"
+    repo_dir = tmp_path / "repo"
+    core_scripts = runtime_home / "core" / "scripts"
+    core_scripts.mkdir(parents=True)
+    (src_dir / "scripts").mkdir(parents=True)
+    (src_dir / "hooks").mkdir(parents=True)
+    (src_dir / "plugins").mkdir(parents=True)
+    (repo_dir / "templates").mkdir(parents=True)
+    (runtime_home / ".structure-version").write_text("F0.6\n")
+    (runtime_home / "scripts").symlink_to("core/scripts", target_is_directory=True)
+    (core_scripts / "nexo-watchdog.sh").write_text("#!/bin/bash\necho old\n")
+    (src_dir / "scripts" / "nexo-watchdog.sh").write_text("#!/bin/bash\necho new\n")
+
+    monkeypatch.setenv("NEXO_HOME", str(runtime_home))
+    monkeypatch.setattr(auto_update, "NEXO_HOME", runtime_home)
+    monkeypatch.setattr(auto_update, "_installed_scripts_classification", lambda dest: {"nexo-watchdog.sh": "non-script"})
+
+    stats = auto_update._copy_runtime_from_source(src_dir, repo_dir, runtime_home)
+
+    assert (runtime_home / "scripts").is_symlink()
+    assert (core_scripts / "nexo-watchdog.sh").read_text() == "#!/bin/bash\necho new\n"
+    assert stats["scripts"] == 1
+    assert stats["script_conflicts"] == []
+
+
+def test_restore_runtime_tree_replaces_symlink_targets(tmp_path):
+    import auto_update
+
+    backup_dir = tmp_path / "backup"
+    runtime_home = tmp_path / "runtime"
+    (backup_dir / "db").mkdir(parents=True)
+    (backup_dir / "db" / "__init__.py").write_text("# restored\n")
+    (runtime_home / "core" / "db").mkdir(parents=True)
+    (runtime_home / "db").symlink_to(runtime_home / "core" / "db", target_is_directory=True)
+
+    auto_update._restore_runtime_tree(str(backup_dir), runtime_home)
+
+    assert (runtime_home / "db").is_dir()
+    assert not (runtime_home / "db").is_symlink()
+    assert (runtime_home / "db" / "__init__.py").read_text() == "# restored\n"
